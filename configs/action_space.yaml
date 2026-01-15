@@ -1,0 +1,437 @@
+families:
+  - id: omp_threads
+    description: "Adjust OpenMP thread count."
+    expected_effect: ["compute_opt", "mem_locality"]
+  - id: omp_binding
+    description: "Adjust OpenMP binding policy."
+    expected_effect: ["mem_locality", "imbalance_reduce"]
+  - id: omp_places
+    description: "Adjust OpenMP places."
+    expected_effect: ["mem_locality"]
+  - id: omp_dynamic
+    description: "Toggle OpenMP dynamic threading."
+    expected_effect: ["imbalance_reduce"]
+  - id: omp_wait_policy
+    description: "Adjust OpenMP wait policy."
+    expected_effect: ["compute_opt"]
+  - id: lammps_flags
+    description: "Safe LAMMPS command-line flags."
+    expected_effect: ["compute_opt"]
+  - id: neigh_modify
+    description: "Neighbor list frequency adjustments."
+    expected_effect: ["mem_locality", "comm_reduce"]
+  - id: thermo_io
+    description: "Reduce I/O from thermo output."
+    expected_effect: ["io_reduce"]
+
+actions:
+  - action_id: omp_threads_1
+    family: omp_threads
+    description: "Set OMP_NUM_THREADS=1 (serial baseline)."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "1"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_threads_2
+    family: omp_threads
+    description: "Set OMP_NUM_THREADS=2."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "2"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_threads_4
+    family: omp_threads
+    description: "Set OMP_NUM_THREADS=4."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "4"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_threads_8
+    family: omp_threads
+    description: "Set OMP_NUM_THREADS=8."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "8"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_proc_bind_close
+    family: omp_binding
+    description: "Set OMP_PROC_BIND=close."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_PROC_BIND: "close"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_proc_bind_spread
+    family: omp_binding
+    description: "Set OMP_PROC_BIND=spread."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_PROC_BIND: "spread"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_proc_bind_true
+    family: omp_binding
+    description: "Set OMP_PROC_BIND=true."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_PROC_BIND: "true"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_proc_bind_false
+    family: omp_binding
+    description: "Set OMP_PROC_BIND=false."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_PROC_BIND: "false"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_places_cores
+    family: omp_places
+    description: "Set OMP_PLACES=cores."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_PLACES: "cores"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_places_threads
+    family: omp_places
+    description: "Set OMP_PLACES=threads."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_PLACES: "threads"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_places_sockets
+    family: omp_places
+    description: "Set OMP_PLACES=sockets."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_PLACES: "sockets"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_dynamic_on
+    family: omp_dynamic
+    description: "Enable OpenMP dynamic threads."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_DYNAMIC: "true"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_dynamic_off
+    family: omp_dynamic
+    description: "Disable OpenMP dynamic threads."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_DYNAMIC: "false"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_wait_active
+    family: omp_wait_policy
+    description: "Set OMP_WAIT_POLICY=active."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_WAIT_POLICY: "active"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: omp_wait_passive
+    family: omp_wait_policy
+    description: "Set OMP_WAIT_POLICY=passive."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_WAIT_POLICY: "passive"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: lammps_sf_omp
+    family: lammps_flags
+    description: "Enable OpenMP styles via -sf omp."
+    applies_to: ["run_config"]
+    parameters:
+      run_args:
+        set_flags:
+          - flag: "-sf"
+            values: ["omp"]
+            arg_count: 1
+    preconditions: ["app_is:lammps", "args_not_contains:-sf"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: lammps_pk_omp_1
+    family: lammps_flags
+    description: "Enable package omp with 1 thread via -pk omp 1."
+    applies_to: ["run_config"]
+    parameters:
+      run_args:
+        set_flags:
+          - flag: "-pk"
+            values: ["omp", "1"]
+            arg_count: 2
+    preconditions: ["app_is:lammps", "args_not_contains:-pk"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: lammps_pk_omp_2
+    family: lammps_flags
+    description: "Enable package omp with 2 threads via -pk omp 2."
+    applies_to: ["run_config"]
+    parameters:
+      run_args:
+        set_flags:
+          - flag: "-pk"
+            values: ["omp", "2"]
+            arg_count: 2
+    preconditions: ["app_is:lammps", "args_not_contains:-pk"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: thermo_1000
+    family: thermo_io
+    description: "Reduce thermo output frequency to 1000 steps."
+    applies_to: ["input_script"]
+    parameters:
+      input_edit:
+        directive: "thermo"
+        mode: "replace_line"
+        match: "^\\s*thermo\\s+\\d+\\s*$"
+        replace: "thermo 1000"
+    preconditions: ["input_contains:^\\s*thermo\\b"]
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: thermo_10000
+    family: thermo_io
+    description: "Reduce thermo output frequency to 10000 steps."
+    applies_to: ["input_script"]
+    parameters:
+      input_edit:
+        directive: "thermo"
+        mode: "replace_line"
+        match: "^\\s*thermo\\s+\\d+\\s*$"
+        replace: "thermo 10000"
+    preconditions: ["input_contains:^\\s*thermo\\b"]
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neigh_every_2
+    family: neigh_modify
+    description: "Set neigh_modify every 2 delay 0 check yes."
+    applies_to: ["input_script"]
+    parameters:
+      input_edit:
+        directive: "neigh_modify"
+        mode: "replace_line"
+        match: "^\\s*neigh_modify\\b.*$"
+        replace: "neigh_modify every 2 delay 0 check yes"
+    preconditions: ["input_contains:^\\s*neigh_modify\\b"]
+    constraints: ["input_contains:kspace_style|pppm|ewald|coul/long"]
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neigh_every_5
+    family: neigh_modify
+    description: "Set neigh_modify every 5 delay 0 check yes."
+    applies_to: ["input_script"]
+    parameters:
+      input_edit:
+        directive: "neigh_modify"
+        mode: "replace_line"
+        match: "^\\s*neigh_modify\\b.*$"
+        replace: "neigh_modify every 5 delay 0 check yes"
+    preconditions: ["input_contains:^\\s*neigh_modify\\b"]
+    constraints: ["input_contains:kspace_style|pppm|ewald|coul/long"]
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neigh_every_10
+    family: neigh_modify
+    description: "Set neigh_modify every 10 delay 0 check yes."
+    applies_to: ["input_script"]
+    parameters:
+      input_edit:
+        directive: "neigh_modify"
+        mode: "replace_line"
+        match: "^\\s*neigh_modify\\b.*$"
+        replace: "neigh_modify every 10 delay 0 check yes"
+    preconditions: ["input_contains:^\\s*neigh_modify\\b"]
+    constraints: ["input_contains:kspace_style|pppm|ewald|coul/long"]
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neigh_delay_10
+    family: neigh_modify
+    description: "Set neigh_modify every 1 delay 10 check yes."
+    applies_to: ["input_script"]
+    parameters:
+      input_edit:
+        directive: "neigh_modify"
+        mode: "replace_line"
+        match: "^\\s*neigh_modify\\b.*$"
+        replace: "neigh_modify every 1 delay 10 check yes"
+    preconditions: ["input_contains:^\\s*neigh_modify\\b"]
+    constraints: ["input_contains:kspace_style|pppm|ewald|coul/long"]
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05

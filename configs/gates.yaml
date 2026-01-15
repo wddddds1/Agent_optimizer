@@ -1,0 +1,12 @@
+runtime:
+  require_exit_code_zero: true
+  error_regex: "ERROR|Segmentation fault|SIGSEGV"
+correctness:
+  default_mode: "strict"
+  allow_skip_for_low_risk_run_config: true
+  scalar_thresholds:
+    abs: 1.0e-6
+    rel: 1.0e-5
+variance:
+  repeats: 2
+  cv_max: 0.03

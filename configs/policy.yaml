@@ -1,0 +1,22 @@
+version: 1
+input_edit_allowlist:
+  - "neigh_modify"
+  - "thermo"
+global_rules:
+  - id: single_action_only
+    description: "Exactly one action per experiment for attribution."
+    rule: "single_action_only"
+  - id: no_mixed_targets
+    description: "Do not change env/run_args and input_script in the same experiment."
+    rule: "no_mixed_targets"
+  - id: require_correctness_for_input_edits
+    description: "Input-script edits require correctness gate."
+    rule: "require_correctness_for_input_edits"
+  - id: forbid_rng_or_integrator_changes
+    description: "Do not modify RNG seeds or integrator time steps."
+    rule: "forbid_rng_or_integrator_changes"
+conditional_rules:
+  - id: no_neigh_if_long_range
+    description: "Avoid neighbor list changes when long-range electrostatics is present."
+    when: "input_contains:kspace_style|pppm|ewald|coul/long"
+    forbid_action_families: ["neigh_modify"]

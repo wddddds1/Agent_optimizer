@@ -1,0 +1,23 @@
+cases:
+  lj_small:
+    workdir: "third_party/lammps/examples/melt"
+    input_script: "third_party/lammps/examples/melt/in.melt"
+    run_args: ["-in", "in.melt", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 5
+      max_runs: 20
+      max_wall_seconds: 3600
+    tags: ["short", "melt"]
+  min_small:
+    workdir: "third_party/lammps/examples/min"
+    input_script: "third_party/lammps/examples/min/in.min"
+    run_args: ["-in", "in.min", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 5
+      max_runs: 20
+      max_wall_seconds: 3600
+    tags: ["short", "min"]

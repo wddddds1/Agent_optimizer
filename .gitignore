@@ -1,0 +1,14 @@
+# builds / artifacts
+build/
+artifacts/
+**/artifacts/
+*.log
+*.out
+*.err
+*.prof
+*.sqlite
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.env
