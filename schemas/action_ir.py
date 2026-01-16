@@ -5,7 +5,7 @@ from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-AppliesTo = Literal["run_config", "input_script", "build_config"]
+AppliesTo = Literal["run_config", "input_script", "build_config", "source_patch"]
 ExpectedEffect = Literal[
     "comm_reduce",
     "mem_locality",

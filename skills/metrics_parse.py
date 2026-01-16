@@ -6,9 +6,11 @@ from typing import Dict, List
 
 def parse_lammps_timing(log_text: str) -> Dict[str, float]:
     breakdown: Dict[str, float] = {}
-    loop_match = re.search(r"Loop time of\\s+([0-9.]+)\\s+on", log_text)
+    loop_total = None
+    loop_match = re.search(r"Loop time of\s+([0-9.]+)\s+on", log_text)
     if loop_match:
-        breakdown["total"] = float(loop_match.group(1))
+        loop_total = float(loop_match.group(1))
+        breakdown["total"] = loop_total
 
     lines = log_text.splitlines()
     in_table = False
@@ -31,7 +33,10 @@ def parse_lammps_timing(log_text: str) -> Dict[str, float]:
                 avg_time = float(cols[2])
             except ValueError:
                 continue
-            breakdown[section] = avg_time
+            if section == "total" and loop_total is not None:
+                breakdown["total_mpi"] = avg_time
+            else:
+                breakdown[section] = avg_time
     return breakdown
 
 
@@ -102,6 +107,40 @@ def parse_thermo_table(log_text: str) -> Dict[str, float]:
         except ValueError:
             continue
     return metrics
+
+
+def parse_thermo_series(log_text: str, max_rows: int = 0) -> Dict[str, List[float]]:
+    lines = [ln.strip() for ln in log_text.splitlines() if ln.strip()]
+    header_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("Step") and len(line.split()) > 2:
+            header_idx = i
+    if header_idx is None or header_idx + 1 >= len(lines):
+        return {}
+    header = lines[header_idx].split()
+    rows: List[List[float]] = []
+    for line in lines[header_idx + 1 :]:
+        cols = line.split()
+        if len(cols) != len(header):
+            continue
+        try:
+            float(cols[0])
+        except ValueError:
+            continue
+        try:
+            rows.append([float(value) for value in cols])
+        except ValueError:
+            continue
+    if not rows:
+        return {}
+    if max_rows and len(rows) > max_rows:
+        rows = rows[-max_rows:]
+    series: Dict[str, List[float]] = {}
+    for idx, key in enumerate(header):
+        if key == "Step":
+            continue
+        series[key] = [row[idx] for row in rows]
+    return series
 
 
 def extract_error_lines(log_text: str, error_regex: str) -> List[str]:

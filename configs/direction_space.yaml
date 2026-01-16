@@ -1,0 +1,238 @@
+directions:
+  - id: parallel_omp
+    description: "OpenMP parallel strategy (threads + suffix + affinity)."
+    applies_to: ["run_config"]
+    expected_effect: ["compute_opt", "mem_locality"]
+    risk_level: "low"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+    presets:
+      - id: t2_close_cores
+        description: "OMP=2, bind close, places cores, -sf omp."
+        env:
+          OMP_NUM_THREADS: "2"
+          OMP_PROC_BIND: "close"
+          OMP_PLACES: "cores"
+          OMP_DYNAMIC: "false"
+        run_args:
+          set_flags:
+            - flag: "-sf"
+              values: ["omp"]
+              arg_count: 1
+      - id: t4_close_cores
+        description: "OMP=4, bind close, places cores, -sf omp."
+        env:
+          OMP_NUM_THREADS: "4"
+          OMP_PROC_BIND: "close"
+          OMP_PLACES: "cores"
+          OMP_DYNAMIC: "false"
+        run_args:
+          set_flags:
+            - flag: "-sf"
+              values: ["omp"]
+              arg_count: 1
+      - id: t4_spread_cores
+        description: "OMP=4, bind spread, places cores, -sf omp."
+        env:
+          OMP_NUM_THREADS: "4"
+          OMP_PROC_BIND: "spread"
+          OMP_PLACES: "cores"
+          OMP_DYNAMIC: "false"
+        run_args:
+          set_flags:
+            - flag: "-sf"
+              values: ["omp"]
+              arg_count: 1
+      - id: t8_close_cores
+        description: "OMP=8, bind close, places cores, -sf omp."
+        env:
+          OMP_NUM_THREADS: "8"
+          OMP_PROC_BIND: "close"
+          OMP_PLACES: "cores"
+          OMP_DYNAMIC: "false"
+        run_args:
+          set_flags:
+            - flag: "-sf"
+              values: ["omp"]
+              arg_count: 1
+  - id: omp_pkg
+    description: "OpenMP package toggle with explicit thread count."
+    applies_to: ["run_config"]
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    preconditions: ["app_is:lammps", "args_not_contains:-pk"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+    presets:
+      - id: pk_omp_2
+        description: "Enable -pk omp 2 with OMP_NUM_THREADS=2."
+        env:
+          OMP_NUM_THREADS: "2"
+        run_args:
+          set_flags:
+            - flag: "-pk"
+              values: ["omp", "2"]
+              arg_count: 2
+  - id: affinity_tune
+    description: "Affinity tuning without changing thread count."
+    applies_to: ["run_config"]
+    expected_effect: ["mem_locality", "imbalance_reduce"]
+    risk_level: "low"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+    presets:
+      - id: bind_close
+        description: "Set OMP_PROC_BIND=close and OMP_PLACES=cores."
+        env:
+          OMP_PROC_BIND: "close"
+          OMP_PLACES: "cores"
+      - id: bind_spread
+        description: "Set OMP_PROC_BIND=spread and OMP_PLACES=cores."
+        env:
+          OMP_PROC_BIND: "spread"
+          OMP_PLACES: "cores"
+  - id: wait_policy
+    description: "OpenMP wait policy tuning."
+    applies_to: ["run_config"]
+    expected_effect: ["mem_locality", "imbalance_reduce"]
+    risk_level: "low"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+    presets:
+      - id: wait_active
+        description: "Set OMP_WAIT_POLICY=active."
+        env:
+          OMP_WAIT_POLICY: "active"
+      - id: wait_passive
+        description: "Set OMP_WAIT_POLICY=passive."
+        env:
+          OMP_WAIT_POLICY: "passive"
+  - id: sched_granularity
+    description: "OpenMP schedule/granularity tuning."
+    applies_to: ["run_config"]
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    preconditions: ["app_is:lammps"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+    presets:
+      - id: schedule_static
+        description: "Set OMP_SCHEDULE=static."
+        env:
+          OMP_SCHEDULE: "static"
+      - id: schedule_dynamic
+        description: "Set OMP_SCHEDULE=dynamic"
+        env:
+          OMP_SCHEDULE: "dynamic"
+  - id: comm_tune
+    description: "Neighbor/communication rebuild tuning."
+    applies_to: ["input_script"]
+    expected_effect: ["comm_reduce", "mem_locality"]
+    risk_level: "medium"
+    preconditions: ["app_is:lammps", "input_contains:^\\s*neigh_modify\\b", "case_tag:allow_comm"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+    presets:
+      - id: neigh_every_10
+        description: "Set neigh_modify every 10 delay 0 check yes."
+        input_edit:
+          directive: "neigh_modify"
+          mode: "replace_line"
+          match: "^\\s*neigh_modify\\b.*$"
+          replace: "neigh_modify every 10 delay 0 check yes"
+      - id: neigh_every_50
+        description: "Set neigh_modify every 50 delay 0 check yes."
+        input_edit:
+          directive: "neigh_modify"
+          mode: "replace_line"
+          match: "^\\s*neigh_modify\\b.*$"
+          replace: "neigh_modify every 50 delay 0 check yes"
+  - id: io_tune
+    description: "Thermo/log output frequency tuning."
+    applies_to: ["input_script"]
+    expected_effect: ["io_reduce"]
+    risk_level: "low"
+    preconditions: ["app_is:lammps", "input_contains:^\\s*thermo\\b", "case_tag:allow_io"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+    presets:
+      - id: thermo_200
+        description: "Set thermo output to every 200 steps."
+        input_edit:
+          directive: "thermo"
+          mode: "replace_line"
+          match: "^\\s*thermo\\s+\\d+\\b.*$"
+          replace: "thermo 200"
+      - id: thermo_500
+        description: "Set thermo output to every 500 steps."
+        input_edit:
+          directive: "thermo"
+          mode: "replace_line"
+          match: "^\\s*thermo\\s+\\d+\\b.*$"
+          replace: "thermo 500"
+  - id: accuracy_tune
+    description: "Kspace accuracy tuning (high risk)."
+    applies_to: ["input_script"]
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    preconditions: ["app_is:lammps", "input_contains:^\\s*kspace_style\\b", "case_tag:allow_accuracy"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+    presets:
+      - id: kspace_acc_1e4
+        description: "Set kspace_style accuracy to 1e-4."
+        input_edit:
+          directive: "kspace_style"
+          mode: "replace_line"
+          match: "^\\s*kspace_style\\s+(\\S+)\\s+\\S+\\b.*$"
+          replace: "kspace_style \\1 1.0e-4"
+      - id: kspace_acc_1e5
+        description: "Set kspace_style accuracy to 1e-5."
+        input_edit:
+          directive: "kspace_style"
+          mode: "replace_line"
+          match: "^\\s*kspace_style\\s+(\\S+)\\s+\\S+\\b.*$"
+          replace: "kspace_style \\1 1.0e-5"
+  - id: runtime_lib
+    description: "Runtime library/allocator tuning."
+    applies_to: ["run_config"]
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    preconditions: ["case_tag:allow_runtime_lib"]
+    constraints: []
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+    presets:
+      - id: disable_nanov2
+        description: "Disable macOS nano allocator for large allocations."
+        env:
+          MallocNanoZone: "0"

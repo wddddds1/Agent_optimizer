@@ -16,6 +16,8 @@ class GitPatchContext(AbstractContextManager):
         input_script: Path,
         input_edit: Optional[Dict[str, object]],
         allowlist: list[str],
+        patch_path: Optional[Path] = None,
+        patch_root: Optional[Path] = None,
     ) -> None:
         self.repo_root = repo_root
         self.exp_id = exp_id
@@ -23,6 +25,8 @@ class GitPatchContext(AbstractContextManager):
         self.input_script = input_script
         self.input_edit = input_edit
         self.allowlist = allowlist
+        self.patch_source_path = patch_path
+        self.patch_root = patch_root
         self.worktree_dir = artifacts_dir / "worktrees" / exp_id
         self.branch_name = f"exp/{exp_id}"
         self.patch_path = artifacts_dir / "patch.diff"
@@ -35,9 +39,18 @@ class GitPatchContext(AbstractContextManager):
         self._git(["worktree", "add", "-b", self.branch_name, str(self.worktree_dir), "HEAD"])
         self._git(["-C", str(self.worktree_dir), "submodule", "update", "--init", "--recursive"])
 
+        if self.input_edit and self.patch_source_path:
+            raise RuntimeError("input_edit and patch_path cannot be combined in one action")
+
+        patch_repo = self.repo_root
         if self.input_edit:
             self._apply_input_edit()
             patch_repo = self._repo_root_for_path(self.map_to_worktree(self.input_script))
+        elif self.patch_source_path:
+            patch_repo = self._resolve_patch_root()
+            self._apply_patch_file(patch_repo, self.patch_source_path)
+
+        if self.input_edit or self.patch_source_path:
             self.git_commit_before = self._git(["-C", str(patch_repo), "rev-parse", "HEAD"]).strip()
             diff = self._git(["-C", str(patch_repo), "diff", "--binary"])
             self.patch_path.write_text(diff, encoding="utf-8")
@@ -101,6 +114,30 @@ class GitPatchContext(AbstractContextManager):
         )
         return Path(result.stdout.strip())
 
+    def _apply_patch_file(self, patch_repo: Path, patch_path: Path) -> None:
+        if not patch_path.exists():
+            raise RuntimeError(f"Patch file not found: {patch_path}")
+        result = subprocess.run(
+            ["git", "-C", str(patch_repo), "apply", str(patch_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to apply patch: {patch_path}")
+
+    def _resolve_patch_root(self) -> Path:
+        if not self.patch_root:
+            return self.worktree_dir
+        patch_root = (self.worktree_dir / self.patch_root).resolve()
+        try:
+            patch_root.relative_to(self.worktree_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError(f"Patch root escapes worktree: {patch_root}") from exc
+        if not patch_root.exists():
+            raise RuntimeError(f"Patch root not found: {patch_root}")
+        return patch_root
+
 
 def get_git_head(repo_root: Path) -> Optional[str]:
     try:
@@ -113,3 +150,17 @@ def get_git_head(repo_root: Path) -> Optional[str]:
         return result.stdout.strip()
     except Exception:
         return None
+
+
+def get_git_status(repo_root: Path) -> Dict[str, Optional[bool]]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        dirty = bool(result.stdout.strip())
+        return {"dirty": dirty}
+    except Exception:
+        return {"dirty": None}

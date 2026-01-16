@@ -17,12 +17,12 @@ families:
   - id: lammps_flags
     description: "Safe LAMMPS command-line flags."
     expected_effect: ["compute_opt"]
-  - id: neigh_modify
-    description: "Neighbor list frequency adjustments."
-    expected_effect: ["mem_locality", "comm_reduce"]
-  - id: thermo_io
-    description: "Reduce I/O from thermo output."
-    expected_effect: ["io_reduce"]
+  - id: build_config
+    description: "CMake/build configuration changes."
+    expected_effect: ["compute_opt"]
+  - id: source_patch
+    description: "Source code patches (requires rebuild)."
+    expected_effect: ["compute_opt"]
 
 actions:
   - action_id: omp_threads_1
@@ -322,114 +322,17 @@ actions:
       thresholds:
         variance_cv_max: 0.05
 
-  - action_id: thermo_1000
-    family: thermo_io
-    description: "Reduce thermo output frequency to 1000 steps."
-    applies_to: ["input_script"]
+  - action_id: build_enable_pkg_omp
+    family: build_config
+    description: "Enable OpenMP package at build time."
+    applies_to: ["build_config"]
     parameters:
-      input_edit:
-        directive: "thermo"
-        mode: "replace_line"
-        match: "^\\s*thermo\\s+\\d+\\s*$"
-        replace: "thermo 1000"
-    preconditions: ["input_contains:^\\s*thermo\\b"]
+      build:
+        cmake_args_add:
+          - "-D PKG_OPENMP=on"
+    preconditions: ["app_is:lammps", "case_tag:allow_build"]
     constraints: []
-    expected_effect: ["io_reduce"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-
-  - action_id: thermo_10000
-    family: thermo_io
-    description: "Reduce thermo output frequency to 10000 steps."
-    applies_to: ["input_script"]
-    parameters:
-      input_edit:
-        directive: "thermo"
-        mode: "replace_line"
-        match: "^\\s*thermo\\s+\\d+\\s*$"
-        replace: "thermo 10000"
-    preconditions: ["input_contains:^\\s*thermo\\b"]
-    constraints: []
-    expected_effect: ["io_reduce"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-
-  - action_id: neigh_every_2
-    family: neigh_modify
-    description: "Set neigh_modify every 2 delay 0 check yes."
-    applies_to: ["input_script"]
-    parameters:
-      input_edit:
-        directive: "neigh_modify"
-        mode: "replace_line"
-        match: "^\\s*neigh_modify\\b.*$"
-        replace: "neigh_modify every 2 delay 0 check yes"
-    preconditions: ["input_contains:^\\s*neigh_modify\\b"]
-    constraints: ["input_contains:kspace_style|pppm|ewald|coul/long"]
-    expected_effect: ["mem_locality"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-
-  - action_id: neigh_every_5
-    family: neigh_modify
-    description: "Set neigh_modify every 5 delay 0 check yes."
-    applies_to: ["input_script"]
-    parameters:
-      input_edit:
-        directive: "neigh_modify"
-        mode: "replace_line"
-        match: "^\\s*neigh_modify\\b.*$"
-        replace: "neigh_modify every 5 delay 0 check yes"
-    preconditions: ["input_contains:^\\s*neigh_modify\\b"]
-    constraints: ["input_contains:kspace_style|pppm|ewald|coul/long"]
-    expected_effect: ["mem_locality"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-
-  - action_id: neigh_every_10
-    family: neigh_modify
-    description: "Set neigh_modify every 10 delay 0 check yes."
-    applies_to: ["input_script"]
-    parameters:
-      input_edit:
-        directive: "neigh_modify"
-        mode: "replace_line"
-        match: "^\\s*neigh_modify\\b.*$"
-        replace: "neigh_modify every 10 delay 0 check yes"
-    preconditions: ["input_contains:^\\s*neigh_modify\\b"]
-    constraints: ["input_contains:kspace_style|pppm|ewald|coul/long"]
-    expected_effect: ["mem_locality"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-
-  - action_id: neigh_delay_10
-    family: neigh_modify
-    description: "Set neigh_modify every 1 delay 10 check yes."
-    applies_to: ["input_script"]
-    parameters:
-      input_edit:
-        directive: "neigh_modify"
-        mode: "replace_line"
-        match: "^\\s*neigh_modify\\b.*$"
-        replace: "neigh_modify every 1 delay 10 check yes"
-    preconditions: ["input_contains:^\\s*neigh_modify\\b"]
-    constraints: ["input_contains:kspace_style|pppm|ewald|coul/long"]
-    expected_effect: ["mem_locality"]
+    expected_effect: ["compute_opt"]
     risk_level: "medium"
     verification_plan:
       gates: ["runtime", "correctness", "variance"]

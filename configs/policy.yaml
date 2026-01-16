@@ -2,6 +2,8 @@ version: 1
 input_edit_allowlist:
   - "neigh_modify"
   - "thermo"
+  - "kspace_style"
+  - "kspace_modify"
 global_rules:
   - id: single_action_only
     description: "Exactly one action per experiment for attribution."
@@ -20,3 +22,10 @@ conditional_rules:
     description: "Avoid neighbor list changes when long-range electrostatics is present."
     when: "input_contains:kspace_style|pppm|ewald|coul/long"
     forbid_action_families: ["neigh_modify"]
+profiling_rules:
+  low_confidence_allow:
+    applies_to: ["run_config"]
+    risk_levels: ["low"]
+  unknown_confidence_allow:
+    applies_to: ["run_config"]
+    risk_levels: ["low"]

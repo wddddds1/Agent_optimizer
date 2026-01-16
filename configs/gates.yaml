@@ -4,9 +4,19 @@ runtime:
 correctness:
   default_mode: "strict"
   allow_skip_for_low_risk_run_config: true
+  baseline_require_thermo: true
   scalar_thresholds:
     abs: 1.0e-6
     rel: 1.0e-5
+  series_compare:
+    window: 20
+    abs_max: 1.0e-5
+    rel_max: 1.0e-4
+  energy_drift:
+    metric: "TotEng"
+    rel_max: 1.0e-4
+  output_files: []
 variance:
   repeats: 2
   cv_max: 0.03
+  baseline_enforce: false

@@ -6,8 +6,8 @@ cases:
     env:
       OMP_NUM_THREADS: "1"
     budgets:
-      max_iters: 5
-      max_runs: 20
+      max_iters: 1
+      max_runs: 10
       max_wall_seconds: 3600
     tags: ["short", "melt"]
   min_small:
@@ -21,3 +21,25 @@ cases:
       max_runs: 20
       max_wall_seconds: 3600
     tags: ["short", "min"]
+  melt_large:
+    workdir: "examples/melt_large"
+    input_script: "examples/melt_large/in.melt.large"
+    run_args: ["-in", "in.melt.large", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 1
+      max_runs: 10
+      max_wall_seconds: 3600
+    tags: ["melt", "large"]
+  melt_xlarge:
+    workdir: "examples/melt_xlarge"
+    input_script: "examples/melt_xlarge/in.melt.xlarge"
+    run_args: ["-in", "in.melt.xlarge", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 5
+      max_runs: 10
+      max_wall_seconds: 7200
+    tags: ["melt", "xlarge"]

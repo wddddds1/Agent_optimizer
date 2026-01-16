@@ -5,9 +5,10 @@ from pathlib import Path
 
 import yaml
 
+from orchestrator.console import ConsoleUI
 from orchestrator.graph import run_optimization
 from orchestrator.llm_client import LLMClient, LLMConfig
-from orchestrator.router import load_action_space, load_gates, load_policy
+from orchestrator.router import load_action_space, load_direction_space, load_gates, load_policy
 from schemas.job_ir import Budgets, JobIR
 
 
@@ -15,6 +16,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="HPC agent platform MVP")
     parser.add_argument("--case", required=True, help="Case ID from configs/lammps_cases.yaml")
     parser.add_argument("--config-dir", default="configs", help="Config directory")
+    parser.add_argument(
+        "--ui",
+        default="console",
+        choices=["console", "quiet"],
+        help="Console output mode",
+    )
+    parser.add_argument(
+        "--ui-no-raw",
+        action="store_true",
+        help="Disable raw stdout/stderr/log preview for each run",
+    )
+    parser.add_argument(
+        "--ui-preview-bytes",
+        type=int,
+        default=2048,
+        help="Max bytes per output preview when raw preview is enabled",
+    )
     args = parser.parse_args()
 
     config_dir = Path(args.config_dir)
@@ -51,7 +69,15 @@ def main() -> None:
         tags=case.get("tags", []),
     )
 
-    actions = load_action_space(config_dir / "action_space.yaml")
+    selection_mode = env_cfg.get("selection_mode", "action")
+    if selection_mode == "direction":
+        direction_path = env_cfg.get("direction_space", "configs/direction_space.yaml")
+        direction_file = Path(direction_path)
+        if not direction_file.is_absolute():
+            direction_file = (config_dir.parent / direction_file).resolve()
+        actions = load_direction_space(direction_file)
+    else:
+        actions = load_action_space(config_dir / "action_space.yaml")
     policy = load_policy(config_dir / "policy.yaml")
     gates = load_gates(config_dir / "gates.yaml")
 
@@ -69,6 +95,15 @@ def main() -> None:
     artifacts_dir = Path(env_cfg.get("artifacts_dir", "artifacts"))
     if not artifacts_dir.is_absolute():
         artifacts_dir = (config_dir.parent / artifacts_dir).resolve()
+    reporter = (
+        ConsoleUI(
+            enabled=args.ui == "console",
+            show_output_preview=not args.ui_no_raw,
+            preview_bytes=args.ui_preview_bytes,
+        )
+        if args.ui
+        else None
+    )
     result = run_optimization(
         job=job,
         actions=actions,
@@ -78,11 +113,21 @@ def main() -> None:
         time_command=env_cfg.get("time_command"),
         min_delta_seconds=env_cfg.get("min_delta_seconds", 0.0),
         top_k=env_cfg.get("top_k", 5),
+        selection_mode=selection_mode,
+        direction_top_k=int(env_cfg.get("direction_top_k", env_cfg.get("top_k", 5))),
         llm_client=llm_client,
+        reporter=reporter,
+        build_cfg=env_cfg.get("build", {}),
+        baseline_repeats=int(env_cfg.get("experiment", {}).get("baseline_repeats", 1)),
+        baseline_stat=env_cfg.get("experiment", {}).get("baseline_stat", "mean"),
+        validate_top1_repeats=int(env_cfg.get("experiment", {}).get("validate_top1_repeats", 0)),
+        min_improvement_pct=float(env_cfg.get("experiment", {}).get("min_improvement_pct", 0.0)),
     )
 
     print(result["summary_table"])
     print(f"Report: {result['report_md']}")
+    if "report_zh" in result:
+        print(f"Report (ZH): {result['report_zh']}")
 
 
 if __name__ == "__main__":
