@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import os
 import shlex
 import shutil
@@ -20,6 +21,7 @@ class BuildOutput:
     lammps_bin_path: Optional[str]
     provenance_path: Optional[str]
     provenance: Dict[str, object]
+    build_seconds: Optional[float] = None
 
 
 def build_job(
@@ -27,6 +29,7 @@ def build_job(
     source_root: Path,
     run_dir: Path,
 ) -> BuildOutput:
+    start_time = time.monotonic()
     build_dir = run_dir / "build"
     if build_dir.exists():
         shutil.rmtree(build_dir)
@@ -74,6 +77,7 @@ def build_job(
     provenance_path = run_dir / "build_provenance.json"
     provenance_path.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
 
+    build_seconds = time.monotonic() - start_time
     return BuildOutput(
         build_dir=str(build_dir),
         build_log_path=str(build_log_path),
@@ -83,6 +87,7 @@ def build_job(
         lammps_bin_path=lammps_bin_path,
         provenance_path=str(provenance_path),
         provenance=provenance,
+        build_seconds=build_seconds,
     )
 
 

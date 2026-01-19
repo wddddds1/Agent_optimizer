@@ -37,20 +37,37 @@ def load_direction_space(path: Path) -> List[ActionIR]:
         constraints = direction.get("constraints", [])
         verification_plan = direction.get("verification_plan", {})
         presets = direction.get("presets", [])
+        templates = direction.get("templates", [])
         for preset in presets:
             preset_id = preset.get("id")
             if not preset_id:
                 continue
             action_id = f"{direction_id}.{preset_id}"
             description = preset.get("description") or direction.get("description") or direction_id
-            params = {}
-            if preset.get("env"):
-                params["env"] = preset.get("env")
-            if preset.get("run_args"):
-                params["run_args"] = preset.get("run_args")
-            if preset.get("input_edit"):
-                params["input_edit"] = preset.get("input_edit")
-            params["direction_id"] = direction_id
+            params = _build_params(preset, direction_id)
+            actions.append(
+                ActionIR(
+                    action_id=action_id,
+                    family=direction_id,
+                    description=description,
+                    applies_to=applies_to,
+                    parameters=params,
+                    preconditions=preconditions,
+                    constraints=constraints,
+                    expected_effect=expected_effect,
+                    risk_level=risk_level,
+                    verification_plan=verification_plan,
+                )
+            )
+        for template in templates:
+            template_id = template.get("id")
+            if not template_id:
+                continue
+            action_id = f"{direction_id}.template_{template_id}"
+            description = template.get("description") or direction.get("description") or direction_id
+            params = _build_params(template, direction_id)
+            params["template_id"] = template_id
+            params["dynamic_threads"] = True
             actions.append(
                 ActionIR(
                     action_id=action_id,
@@ -66,6 +83,20 @@ def load_direction_space(path: Path) -> List[ActionIR]:
                 )
             )
     return actions
+
+
+def _build_params(node: Dict[str, object], direction_id: str) -> Dict[str, object]:
+    params: Dict[str, object] = {}
+    if node.get("env"):
+        params["env"] = node.get("env")
+    if node.get("run_args"):
+        params["run_args"] = node.get("run_args")
+    if node.get("input_edit"):
+        params["input_edit"] = node.get("input_edit")
+    if node.get("backend_enable"):
+        params["backend_enable"] = node.get("backend_enable")
+    params["direction_id"] = direction_id
+    return params
 
 
 def load_policy(path: Path) -> Dict[str, object]:

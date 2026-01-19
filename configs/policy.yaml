@@ -22,6 +22,10 @@ conditional_rules:
     description: "Avoid neighbor list changes when long-range electrostatics is present."
     when: "input_contains:kspace_style|pppm|ewald|coul/long"
     forbid_action_families: ["neigh_modify"]
+  - id: thread_compare_parallel_only
+    description: "Thread comparison runs should only use parallel_omp."
+    when: "case_tag:thread_compare"
+    forbid_action_families: ["affinity_tune", "wait_policy", "sched_granularity", "runtime_lib"]
 profiling_rules:
   low_confidence_allow:
     applies_to: ["run_config"]

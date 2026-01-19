@@ -80,6 +80,17 @@ def main() -> None:
         actions = load_action_space(config_dir / "action_space.yaml")
     policy = load_policy(config_dir / "policy.yaml")
     gates = load_gates(config_dir / "gates.yaml")
+    candidate_policy = None
+    candidate_policy_path = config_dir / "candidate_policy.yaml"
+    if candidate_policy_path.exists():
+        candidate_policy = yaml.safe_load(candidate_policy_path.read_text(encoding="utf-8"))
+    adapter_cfg = None
+    adapter_dir = Path(env_cfg.get("adapter_dir", "configs/adapters"))
+    if not adapter_dir.is_absolute():
+        adapter_dir = (config_dir.parent / adapter_dir).resolve()
+    adapter_path = adapter_dir / f"{job.app}.yaml"
+    if adapter_path.exists():
+        adapter_cfg = yaml.safe_load(adapter_path.read_text(encoding="utf-8"))
     planner_cfg = {}
     planner_path = config_dir / "planner.yaml"
     if planner_path.exists():
@@ -120,6 +131,8 @@ def main() -> None:
         selection_mode=selection_mode,
         direction_top_k=int(env_cfg.get("direction_top_k", env_cfg.get("top_k", 5))),
         llm_client=llm_client,
+        candidate_policy=candidate_policy,
+        adapter_cfg=adapter_cfg,
         planner_cfg=planner_cfg,
         reporter=reporter,
         build_cfg=env_cfg.get("build", {}),

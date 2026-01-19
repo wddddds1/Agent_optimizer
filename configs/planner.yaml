@@ -12,6 +12,15 @@ defaults:
     max_runtime_fails: 3
     cooldown_rounds: 1
     fallback_family: "run_config"
+  cost_guard:
+    build_seconds_high: 120.0
+    run_seconds_high: 600.0
+    max_candidates_if_high_cost: 2
+    force_halving: true
+  refine_on_best:
+    enabled: true
+    min_improvement_pct: 0.05
+    applies_to: ["run_config"]
   stop_plan:
     max_iterations: null
     min_relative_gain: 0.0

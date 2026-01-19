@@ -4,7 +4,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from schemas.action_ir import ActionIR
+from pydantic import ValidationError
+
 from schemas.candidate_ir import CandidateList
+from schemas.optimizer_output_ir import OptimizerOutput
 from schemas.plan_ir import PlanIR
 from schemas.profile_report import ProfileReport
 from orchestrator.router import RuleContext, filter_actions
@@ -25,6 +28,7 @@ class OptimizerAgent:
         policy: Dict[str, object],
         profile: ProfileReport,
         exclude_action_ids: List[str],
+        system_caps: Optional[Dict[str, object]] = None,
     ) -> List[CandidateList]:
         candidate_lists: List[CandidateList] = []
         family_actions: Dict[str, List[ActionIR]] = {}
@@ -36,9 +40,17 @@ class OptimizerAgent:
                 family_actions[family] = filtered
 
         if family_actions and self.llm_client and self.llm_client.config.enabled:
-            llm_lists = self._try_llm(plan, policy, profile, family_actions, exclude_action_ids)
+            llm_lists = self._try_llm(
+                plan,
+                policy,
+                profile,
+                family_actions,
+                exclude_action_ids,
+                system_caps,
+                ctx,
+            )
             if llm_lists:
-                return llm_lists
+                return _dedupe_candidate_lists(llm_lists, plan)
 
         for family, filtered in family_actions.items():
             candidates = filtered[: plan.max_candidates]
@@ -50,7 +62,7 @@ class OptimizerAgent:
                     confidence=0.6,
                 )
             )
-        return candidate_lists
+        return _dedupe_candidate_lists(candidate_lists, plan)
 
     def _try_llm(
         self,
@@ -59,6 +71,8 @@ class OptimizerAgent:
         profile: ProfileReport,
         family_actions: Dict[str, List[ActionIR]],
         exclude_action_ids: List[str],
+        system_caps: Optional[Dict[str, object]],
+        ctx: RuleContext,
     ) -> Optional[List[CandidateList]]:
         if not self.llm_client or not self.llm_client.config.enabled:
             return None
@@ -71,6 +85,8 @@ class OptimizerAgent:
             },
             "policy": policy,
             "exclude_action_ids": exclude_action_ids,
+            "system_caps": system_caps or {},
+            "current_env": ctx.job.env or {},
             "actions_by_family": {
                 family: [_action_payload(a) for a in actions]
                 for family, actions in family_actions.items()
@@ -80,8 +96,14 @@ class OptimizerAgent:
         self.last_llm_trace = {"payload": payload, "response": data}
         if not data:
             return None
+        try:
+            output = OptimizerOutput(**data)
+        except ValidationError:
+            return None
+        if output.status != "OK":
+            return None
         candidate_lists = _build_llm_candidates(
-            data, plan, family_actions, exclude_action_ids
+            output, plan, family_actions, exclude_action_ids
         )
         return candidate_lists or None
 
@@ -101,36 +123,23 @@ def _action_payload(action: ActionIR) -> Dict[str, object]:
 
 
 def _build_llm_candidates(
-    data: Dict[str, object],
+    output: OptimizerOutput,
     plan: PlanIR,
     family_actions: Dict[str, List[ActionIR]],
     exclude_action_ids: List[str],
 ) -> List[CandidateList]:
-    raw_candidates = data.get("candidates")
-    if not isinstance(raw_candidates, list):
-        return []
     actions_by_id: Dict[str, ActionIR] = {}
     for actions in family_actions.values():
         for action in actions:
             actions_by_id[action.action_id] = action
     candidate_lists: List[CandidateList] = []
-    for item in raw_candidates:
-        if not isinstance(item, dict):
-            continue
-        family = str(item.get("family", "")).strip()
+    for group in output.candidates:
+        family = group.family
         if family not in family_actions:
             continue
-        action_ids = item.get("action_ids", [])
-        if not isinstance(action_ids, list):
-            continue
-        assumptions = item.get("assumptions", [])
-        if not isinstance(assumptions, list):
-            assumptions = []
-        confidence = item.get("confidence", 0.6)
-        try:
-            confidence_val = float(confidence)
-        except (TypeError, ValueError):
-            confidence_val = 0.6
+        action_ids = group.action_ids
+        assumptions = group.assumptions
+        confidence_val = float(group.confidence)
         candidates: List[ActionIR] = []
         for action_id in action_ids:
             action = actions_by_id.get(str(action_id))
@@ -155,6 +164,48 @@ def _build_llm_candidates(
                 )
             )
     return candidate_lists
+
+
+def _dedupe_candidate_lists(candidate_lists: List[CandidateList], plan: PlanIR) -> List[CandidateList]:
+    deduped: List[CandidateList] = []
+    for candidate_list in candidate_lists:
+        seen: set[str] = set()
+        candidates: List[ActionIR] = []
+        for action in candidate_list.candidates:
+            signature = _action_signature(action)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            candidates.append(action)
+            if len(candidates) >= plan.max_candidates:
+                break
+        if not candidates and candidate_list.candidates:
+            candidates = [candidate_list.candidates[0]]
+        if candidates:
+            deduped.append(
+                CandidateList(
+                    family=candidate_list.family,
+                    candidates=candidates,
+                    assumptions=candidate_list.assumptions,
+                    confidence=candidate_list.confidence,
+                )
+            )
+    return deduped
+
+
+def _action_signature(action: ActionIR) -> str:
+    params = _normalized_parameters(action.parameters)
+    applies_to = ",".join(sorted(action.applies_to))
+    return f"{action.family}|{applies_to}|{params}"
+
+
+def _normalized_parameters(params: Dict[str, object]) -> str:
+    try:
+        import json
+        payload = params or {}
+        return json.dumps(payload, sort_keys=True, ensure_ascii=True)
+    except Exception:
+        return str(params)
 
 
 def _load_prompt(name: str) -> str:

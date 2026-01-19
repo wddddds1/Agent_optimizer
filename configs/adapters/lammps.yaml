@@ -1,0 +1,8 @@
+app: lammps
+backend_enable:
+  openmp:
+    run_args:
+      set_flags:
+        - flag: "-sf"
+          values: ["omp"]
+          arg_count: 1

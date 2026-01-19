@@ -14,11 +14,8 @@ families:
   - id: omp_wait_policy
     description: "Adjust OpenMP wait policy."
     expected_effect: ["compute_opt"]
-  - id: lammps_flags
-    description: "Safe LAMMPS command-line flags."
-    expected_effect: ["compute_opt"]
   - id: build_config
-    description: "CMake/build configuration changes."
+    description: "Build configuration changes (compiler flags, toolchain)."
     expected_effect: ["compute_opt"]
   - id: source_patch
     description: "Source code patches (requires rebuild)."
@@ -32,7 +29,7 @@ actions:
     parameters:
       env:
         OMP_NUM_THREADS: "1"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
     risk_level: "low"
@@ -48,7 +45,7 @@ actions:
     parameters:
       env:
         OMP_NUM_THREADS: "2"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
     risk_level: "low"
@@ -64,7 +61,7 @@ actions:
     parameters:
       env:
         OMP_NUM_THREADS: "4"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
     risk_level: "low"
@@ -80,7 +77,7 @@ actions:
     parameters:
       env:
         OMP_NUM_THREADS: "8"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
     risk_level: "low"
@@ -96,7 +93,7 @@ actions:
     parameters:
       env:
         OMP_PROC_BIND: "close"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["mem_locality"]
     risk_level: "low"
@@ -112,7 +109,7 @@ actions:
     parameters:
       env:
         OMP_PROC_BIND: "spread"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["imbalance_reduce"]
     risk_level: "low"
@@ -128,7 +125,7 @@ actions:
     parameters:
       env:
         OMP_PROC_BIND: "true"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["mem_locality"]
     risk_level: "low"
@@ -144,7 +141,7 @@ actions:
     parameters:
       env:
         OMP_PROC_BIND: "false"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["imbalance_reduce"]
     risk_level: "low"
@@ -160,7 +157,7 @@ actions:
     parameters:
       env:
         OMP_PLACES: "cores"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["mem_locality"]
     risk_level: "low"
@@ -176,7 +173,7 @@ actions:
     parameters:
       env:
         OMP_PLACES: "threads"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["mem_locality"]
     risk_level: "low"
@@ -192,7 +189,7 @@ actions:
     parameters:
       env:
         OMP_PLACES: "sockets"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["mem_locality"]
     risk_level: "low"
@@ -208,7 +205,7 @@ actions:
     parameters:
       env:
         OMP_DYNAMIC: "true"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["imbalance_reduce"]
     risk_level: "low"
@@ -224,7 +221,7 @@ actions:
     parameters:
       env:
         OMP_DYNAMIC: "false"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
     risk_level: "low"
@@ -240,7 +237,7 @@ actions:
     parameters:
       env:
         OMP_WAIT_POLICY: "active"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
     risk_level: "low"
@@ -256,7 +253,7 @@ actions:
     parameters:
       env:
         OMP_WAIT_POLICY: "passive"
-    preconditions: ["app_is:lammps"]
+    preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
     risk_level: "low"
@@ -264,77 +261,3 @@ actions:
       gates: ["runtime", "variance"]
       thresholds:
         variance_cv_max: 0.03
-
-  - action_id: lammps_sf_omp
-    family: lammps_flags
-    description: "Enable OpenMP styles via -sf omp."
-    applies_to: ["run_config"]
-    parameters:
-      run_args:
-        set_flags:
-          - flag: "-sf"
-            values: ["omp"]
-            arg_count: 1
-    preconditions: ["app_is:lammps", "args_not_contains:-sf"]
-    constraints: []
-    expected_effect: ["compute_opt"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-
-  - action_id: lammps_pk_omp_1
-    family: lammps_flags
-    description: "Enable package omp with 1 thread via -pk omp 1."
-    applies_to: ["run_config"]
-    parameters:
-      run_args:
-        set_flags:
-          - flag: "-pk"
-            values: ["omp", "1"]
-            arg_count: 2
-    preconditions: ["app_is:lammps", "args_not_contains:-pk"]
-    constraints: []
-    expected_effect: ["compute_opt"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-
-  - action_id: lammps_pk_omp_2
-    family: lammps_flags
-    description: "Enable package omp with 2 threads via -pk omp 2."
-    applies_to: ["run_config"]
-    parameters:
-      run_args:
-        set_flags:
-          - flag: "-pk"
-            values: ["omp", "2"]
-            arg_count: 2
-    preconditions: ["app_is:lammps", "args_not_contains:-pk"]
-    constraints: []
-    expected_effect: ["compute_opt"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-
-  - action_id: build_enable_pkg_omp
-    family: build_config
-    description: "Enable OpenMP package at build time."
-    applies_to: ["build_config"]
-    parameters:
-      build:
-        cmake_args_add:
-          - "-D PKG_OPENMP=on"
-    preconditions: ["app_is:lammps", "case_tag:allow_build"]
-    constraints: []
-    expected_effect: ["compute_opt"]
-    risk_level: "medium"
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05

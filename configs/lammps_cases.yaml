@@ -43,3 +43,14 @@ cases:
       max_runs: 10
       max_wall_seconds: 7200
     tags: ["melt", "xlarge"]
+  melt_xxlarge:
+    workdir: "examples/melt_xxlarge"
+    input_script: "examples/melt_xxlarge/in.melt.xxlarge"
+    run_args: ["-in", "in.melt.xxlarge", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 1
+      max_runs: 6
+      max_wall_seconds: 7200
+    tags: ["melt", "xxlarge", "thread_compare"]

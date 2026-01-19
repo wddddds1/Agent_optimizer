@@ -4,6 +4,7 @@ from orchestrator.agents.planner import PlannerAgent
 from orchestrator.agents.profiler import ProfilerAgent
 from orchestrator.agents.optimizer import OptimizerAgent
 from orchestrator.agents.ranker import RouterRankerAgent
+from orchestrator.agents.reviewer import ReviewerAgent
 from orchestrator.agents.reporter import ReporterAgent
 from orchestrator.agents.triage import TriageAgent
 from orchestrator.agents.verifier import VerifierAgent
@@ -15,6 +16,7 @@ __all__ = [
     "ProfilerAgent",
     "OptimizerAgent",
     "RouterRankerAgent",
+    "ReviewerAgent",
     "ReporterAgent",
     "TriageAgent",
     "VerifierAgent",

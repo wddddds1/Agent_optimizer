@@ -11,6 +11,7 @@ from schemas.ranking_ir import RankedActions
 from schemas.experiment_ir import ExperimentIR
 from schemas.job_ir import JobIR
 from schemas.profile_report import ProfileReport
+from schemas.review_ir import ReviewDecision
 
 
 @dataclass
@@ -135,12 +136,28 @@ class ConsoleUI:
             ],
         )
 
+    def review_summary(self, decision: ReviewDecision) -> None:
+        if not self.enabled:
+            return
+        self._section("收敛评审")
+        self._agent(
+            "ReviewerAgent",
+            [
+                f"是否停止: {decision.should_stop}",
+                f"置信度: {decision.confidence:.2f}",
+                f"建议动作: {decision.suggested_next_step}",
+                f"理由: {decision.reason}",
+            ],
+        )
+
     def run_start(
         self,
         exp_id: str,
         action: Optional[ActionIR],
         env_overrides: Dict[str, str],
         run_args: List[str],
+        base_run_id: Optional[str] = None,
+        base_action_id: Optional[str] = None,
     ) -> None:
         if not self.enabled:
             return
@@ -159,6 +176,10 @@ class ConsoleUI:
             )
             if action.description:
                 self._print(f"  描述: {action.description}")
+            if base_action_id or base_run_id:
+                base_action_id = base_action_id or "baseline"
+                base_run_id = base_run_id or "baseline"
+                self._print(f"  基于: {base_action_id} ({base_run_id})")
         if env_overrides:
             self._print(f"  环境覆盖: {_fmt_env(env_overrides)}")
         if run_args:

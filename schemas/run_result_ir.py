@@ -2,31 +2,34 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from schemas.strict_base import StrictBaseModel
 
 
-class RunArtifactsIndex(BaseModel):
+class RunArtifactsIndex(StrictBaseModel):
     run_dir: str
     stdout_path: Optional[str] = None
     stderr_path: Optional[str] = None
     log_path: Optional[str] = None
     time_path: Optional[str] = None
     build_log: Optional[str] = None
+    repro_script: Optional[str] = None
 
 
-class RunProvenance(BaseModel):
+class RunProvenance(StrictBaseModel):
     binary_path: Optional[str] = None
     binary_sha256: Optional[str] = None
     build_dir: Optional[str] = None
     git_commit: Optional[str] = None
 
 
-class TimingSummary(BaseModel):
+class TimingSummary(StrictBaseModel):
     build_seconds: Optional[float] = None
     run_seconds: Optional[float] = None
 
 
-class RunResultIR(BaseModel):
+class RunResultIR(StrictBaseModel):
     run_id: str
     action_id: str
     status: str

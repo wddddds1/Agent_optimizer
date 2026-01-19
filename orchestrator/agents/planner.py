@@ -23,19 +23,25 @@ class PlannerAgent:
         budgets: Budgets,
         history: Dict[str, object],
         availability: Optional[Dict[str, int]] = None,
+        cost_model: Optional[Dict[str, float]] = None,
     ) -> PlanIR:
-        llm_plan = self._try_llm(iteration_id, analysis, budgets, history, availability)
+        llm_plan = self._try_llm(iteration_id, analysis, budgets, history, availability, cost_model)
         if llm_plan is not None:
-            return _normalize_plan(llm_plan, analysis, self.defaults, budgets, availability)
+            normalized = _normalize_plan(
+                llm_plan, analysis, self.defaults, budgets, availability, cost_model
+            )
+            return _apply_cost_guard(normalized, cost_model, self.defaults)
         chosen = _select_families(
             analysis.allowed_families, history, analysis.bottleneck, availability
         )
+        if analysis.confidence < 0.5:
+            chosen = [fam for fam in chosen if fam not in {"build_config", "source_patch"}]
         evaluation = _build_evaluation(self.defaults.get("evaluation", {}))
         fuse_rules = _build_fuse(self.defaults.get("fuse_rules", {}))
         stop_plan = _build_stop(self.defaults.get("stop_plan", {}), budgets)
         max_candidates = int(self.defaults.get("max_candidates", 3))
         reason = analysis.rationale or "planner default"
-        return PlanIR(
+        plan = PlanIR(
             iteration_id=iteration_id,
             chosen_families=chosen,
             max_candidates=max_candidates,
@@ -45,6 +51,7 @@ class PlannerAgent:
             stop_condition=stop_plan,
             reason=reason,
         )
+        return _apply_cost_guard(plan, cost_model, self.defaults)
 
     def _try_llm(
         self,
@@ -53,6 +60,7 @@ class PlannerAgent:
         budgets: Budgets,
         history: Dict[str, object],
         availability: Optional[Dict[str, int]],
+        cost_model: Optional[Dict[str, float]],
     ) -> Optional[PlanIR]:
         if not self.llm_client or not self.llm_client.config.enabled:
             return None
@@ -64,14 +72,18 @@ class PlannerAgent:
             "history": history,
             "defaults": self.defaults,
             "availability": availability or {},
+            "cost_model": cost_model or {},
         }
         data = self.llm_client.request_json(prompt, payload)
         if not data:
             return None
         try:
-            return PlanIR(**data)
+            plan = PlanIR(**data)
         except ValidationError:
             return None
+        if plan.status != "OK":
+            return None
+        return plan
 
 
 def _select_families(
@@ -112,11 +124,14 @@ def _normalize_plan(
     defaults: Dict[str, object],
     budgets: Budgets,
     availability: Optional[Dict[str, int]],
+    cost_model: Optional[Dict[str, float]],
 ) -> PlanIR:
     allowed = set(analysis.allowed_families)
     chosen = [fam for fam in plan.chosen_families if fam in allowed]
     if availability:
         chosen = [fam for fam in chosen if availability.get(fam, 0) > 0]
+    if analysis.confidence < 0.5:
+        chosen = [fam for fam in chosen if fam not in {"build_config", "source_patch"}]
     if not chosen:
         chosen = _select_families(
             analysis.allowed_families, {}, analysis.bottleneck, availability
@@ -125,6 +140,8 @@ def _normalize_plan(
     fuse_rules = plan.fuse_rules or _build_fuse(defaults.get("fuse_rules", {}))
     stop_plan = plan.stop_condition or _build_stop(defaults.get("stop_plan", {}), budgets)
     max_candidates = plan.max_candidates or int(defaults.get("max_candidates", 3))
+    if fuse_rules.fallback_family is None and "run_config" in analysis.allowed_families:
+        fuse_rules.fallback_family = "run_config"
     return PlanIR(
         iteration_id=plan.iteration_id or 0,
         chosen_families=chosen,
@@ -135,6 +152,30 @@ def _normalize_plan(
         stop_condition=stop_plan,
         reason=plan.reason or analysis.rationale,
     )
+
+
+def _apply_cost_guard(
+    plan: PlanIR,
+    cost_model: Optional[Dict[str, float]],
+    defaults: Dict[str, object],
+) -> PlanIR:
+    if not cost_model:
+        return plan
+    guard = defaults.get("cost_guard", {})
+    try:
+        build_high = float(guard.get("build_seconds_high", 120.0))
+        run_high = float(guard.get("run_seconds_high", 600.0))
+        max_candidates = int(guard.get("max_candidates_if_high_cost", plan.max_candidates))
+        force_halving = bool(guard.get("force_halving", False))
+    except (TypeError, ValueError):
+        return plan
+    avg_build = float(cost_model.get("avg_build_seconds", 0.0) or 0.0)
+    avg_run = float(cost_model.get("avg_run_seconds", 0.0) or 0.0)
+    if avg_build >= build_high or avg_run >= run_high:
+        plan.max_candidates = min(plan.max_candidates, max_candidates)
+        if force_halving:
+            plan.evaluation.use_successive_halving = True
+    return plan
 
 
 def _load_prompt(name: str) -> str:

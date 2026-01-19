@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from pydantic import ValidationError
+
 from schemas.action_ir import ActionIR
 from schemas.candidate_ir import CandidateList
 from schemas.ranking_ir import RankedAction, RankedActions, Rejection
 from schemas.profile_report import ProfileReport
+from schemas.ranker_output_ir import RankerOutput
 from orchestrator.llm_client import LLMClient
 from orchestrator.router import RuleContext, filter_actions
 
@@ -70,11 +73,14 @@ def _rank_actions(
         }
         data = llm_client.request_json(prompt, payload)
         if isinstance(data, dict):
-            ranked_ids = data.get("ranked_action_ids", [])
-            if isinstance(ranked_ids, list) and ranked_ids:
-                rejected = _parse_rejections(data.get("rejected", []))
+            try:
+                output = RankerOutput(**data)
+            except ValidationError:
+                output = None
+            if output and output.status == "OK" and output.ranked_action_ids:
+                rejected = [Rejection(action_id=item.action_id, reason=item.reason) for item in output.rejected]
                 rejected_ids = {rej.action_id for rej in rejected}
-                order = {str(action_id): idx for idx, action_id in enumerate(ranked_ids)}
+                order = {str(action_id): idx for idx, action_id in enumerate(output.ranked_action_ids)}
                 ordered = sorted(
                     actions,
                     key=lambda a: (order.get(a.action_id, len(order)), a.action_id),
@@ -84,14 +90,15 @@ def _rank_actions(
                     if action.action_id in rejected_ids:
                         continue
                     score = float(len(order) - order.get(action.action_id, 0))
+                    breakdown = output.score_breakdown.get(action.action_id, {"llm_rank": score})
                     ranked.append(
                         RankedAction(
                             action=action,
                             score=score,
-                            score_breakdown={"llm_rank": score},
+                            score_breakdown=breakdown,
                         )
                     )
-                notes = str(data.get("scoring_notes") or "llm ranking")
+                notes = output.scoring_notes or "llm ranking"
                 return ranked, notes, rejected
     scored = [(_score_action(action, profile), action) for action in actions]
     scored.sort(key=lambda item: (-item[0][0], item[1].action_id))

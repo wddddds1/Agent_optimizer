@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import statistics
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 from schemas.action_ir import ActionIR
 from schemas.analysis_ir import AnalysisResult
 from schemas.experiment_ir import ExperimentIR
@@ -15,6 +15,7 @@ from schemas.job_ir import JobIR, Budgets
 from schemas.profile_report import ProfileReport
 from schemas.result_ir import ResultIR
 from skills.build_local import BuildOutput, build_job, collect_binary_provenance
+from skills.hardware_probe import get_system_topology
 from skills.patch_git import GitPatchContext, get_git_head, get_git_status
 from orchestrator.console import ConsoleUI
 from orchestrator.agents import (
@@ -24,6 +25,7 @@ from orchestrator.agents import (
     ProfilerAgent,
     OptimizerAgent,
     ReporterAgent,
+    ReviewerAgent,
     RouterRankerAgent,
     TriageAgent,
     VerifierAgent,
@@ -88,6 +90,502 @@ def _build_history_summary(experiments: List[ExperimentIR]) -> Dict[str, object]
     return summary
 
 
+def _build_cost_model(experiments: List[ExperimentIR]) -> Dict[str, float]:
+    run_samples = [
+        exp.results.runtime_seconds
+        for exp in experiments
+        if exp.results and exp.results.runtime_seconds > 0.0
+    ]
+    build_samples = [exp.build_seconds for exp in experiments if exp.build_seconds]
+    avg_run = statistics.mean(run_samples) if run_samples else 0.0
+    avg_build = statistics.mean(build_samples) if build_samples else 0.0
+    return {"avg_run_seconds": avg_run, "avg_build_seconds": avg_build}
+
+
+def _collect_iteration_summaries(
+    experiments: List[ExperimentIR],
+    baseline_runtime: float,
+) -> List[Dict[str, object]]:
+    import re
+
+    summaries: Dict[int, Dict[str, object]] = {}
+    for exp in experiments:
+        if exp.action is None:
+            continue
+        exp_id = exp.exp_id or ""
+        if exp_id.endswith("-validate"):
+            continue
+        match = re.match(r"^iter(\d+)-", exp_id)
+        if not match:
+            continue
+        iteration = int(match.group(1))
+        summary = summaries.setdefault(
+            iteration,
+            {
+                "iteration": iteration,
+                "attempts": 0,
+                "fails": 0,
+                "best_runtime": None,
+                "best_action": None,
+            },
+        )
+        summary["attempts"] += 1
+        if exp.verdict == "FAIL":
+            summary["fails"] += 1
+            continue
+        runtime = exp.results.runtime_seconds
+        if summary["best_runtime"] is None or runtime < summary["best_runtime"]:
+            summary["best_runtime"] = runtime
+            summary["best_action"] = exp.action.action_id
+    results: List[Dict[str, object]] = []
+    for iteration in sorted(summaries.keys()):
+        summary = summaries[iteration]
+        best_runtime = summary.get("best_runtime")
+        speedup = None
+        improvement_pct = None
+        if best_runtime and best_runtime > 0 and baseline_runtime > 0:
+            speedup = baseline_runtime / best_runtime
+            improvement_pct = (baseline_runtime - best_runtime) / baseline_runtime
+        results.append(
+            {
+                **summary,
+                "speedup": speedup,
+                "improvement_pct": improvement_pct,
+            }
+        )
+    return results
+
+
+def _remaining_candidates_by_family(
+    actions: List[ActionIR],
+    tested: set[str],
+) -> Dict[str, int]:
+    remaining: Dict[str, int] = {}
+    for action in actions:
+        if action.action_id in tested:
+            continue
+        remaining[action.family] = remaining.get(action.family, 0) + 1
+    return remaining
+
+
+def _best_summary(
+    baseline: ExperimentIR,
+    best: Optional[ExperimentIR],
+) -> Dict[str, object]:
+    base = baseline.results.runtime_seconds
+    if not best:
+        return {"baseline_runtime": base}
+    best_runtime = best.results.runtime_seconds
+    speedup = base / best_runtime if base > 0 and best_runtime > 0 else None
+    improvement_pct = (base - best_runtime) / base if base > 0 and best_runtime > 0 else None
+    return {
+        "baseline_runtime": base,
+        "best_runtime": best_runtime,
+        "best_action": best.action.action_id if best.action else "baseline",
+        "speedup": speedup,
+        "improvement_pct": improvement_pct,
+    }
+
+
+def _system_caps() -> Dict[str, object]:
+    return get_system_topology()
+
+
+def _best_improvement_pct(
+    baseline_exp: Optional[ExperimentIR],
+    best_exp: Optional[ExperimentIR],
+) -> float:
+    if not baseline_exp or not best_exp:
+        return 0.0
+    base = baseline_exp.results.runtime_seconds
+    best = best_exp.results.runtime_seconds
+    if base <= 0.0 or best <= 0.0:
+        return 0.0
+    return (base - best) / base
+
+
+def _should_refine_on_best(
+    baseline_exp: Optional[ExperimentIR],
+    best_exp: Optional[ExperimentIR],
+    enabled: bool,
+    min_improvement_pct: float,
+) -> bool:
+    if not enabled or not best_exp or not best_exp.action:
+        return False
+    return _best_improvement_pct(baseline_exp, best_exp) >= min_improvement_pct
+
+
+def _select_base_for_action(
+    action: ActionIR,
+    baseline_exp: ExperimentIR,
+    best_exp: Optional[ExperimentIR],
+    refine_on_best: bool,
+    refine_applies_to: set[str],
+) -> tuple[JobIR, Optional[str], Optional[str]]:
+    base_job = baseline_exp.job
+    base_run_id = baseline_exp.run_id
+    base_action_id = "baseline"
+    if refine_on_best and best_exp and best_exp.action:
+        applies_to = set(action.applies_to or [])
+        if applies_to and applies_to.issubset(refine_applies_to):
+            base_job = best_exp.job
+            base_run_id = best_exp.run_id
+            base_action_id = best_exp.action.action_id if best_exp.action else "baseline"
+    return base_job, base_run_id, base_action_id
+
+
+def _prepare_actions(
+    base_actions: List[ActionIR],
+    candidate_policy: Optional[Dict[str, object]],
+    system_caps: Dict[str, object],
+    experiments: List[ExperimentIR],
+    adapter_cfg: Optional[Dict[str, object]],
+    job: JobIR,
+) -> List[ActionIR]:
+    selected_policy = _select_candidate_policy(candidate_policy, job.case_id)
+    actions = _expand_dynamic_actions(base_actions, selected_policy, system_caps, experiments)
+    return _apply_adapter(actions, adapter_cfg, job)
+
+
+def _select_candidate_policy(
+    candidate_policy: Optional[Dict[str, object]],
+    case_id: str,
+) -> Dict[str, object]:
+    if not isinstance(candidate_policy, dict):
+        return {}
+    cases = candidate_policy.get("cases", {})
+    if isinstance(cases, dict) and case_id in cases:
+        return cases.get(case_id) or {}
+    default = candidate_policy.get("default")
+    if isinstance(default, dict):
+        return default
+    return candidate_policy
+
+
+def _expand_dynamic_actions(
+    actions: List[ActionIR],
+    candidate_policy: Optional[Dict[str, object]],
+    system_caps: Dict[str, object],
+    experiments: List[ExperimentIR],
+) -> List[ActionIR]:
+    policy = candidate_policy or {}
+    families_cfg = policy.get("families", {}) if isinstance(policy, dict) else {}
+    threads_cfg = families_cfg.get("parallel_omp", {}).get("threads", {})
+    thread_candidates = _thread_candidates(threads_cfg, system_caps, experiments)
+    allowed_templates = _allowed_templates(threads_cfg)
+    if not thread_candidates:
+        return [action for action in actions if not action.parameters.get("dynamic_threads")]
+    expanded: List[ActionIR] = []
+    for action in actions:
+        if action.parameters.get("dynamic_threads"):
+            template_id = action.parameters.get("template_id", "template")
+            if allowed_templates and template_id not in allowed_templates:
+                continue
+            for threads in thread_candidates:
+                expanded.append(_materialize_thread_action(action, template_id, threads))
+        else:
+            expanded.append(action)
+    return expanded
+
+
+def _thread_candidates(
+    cfg: Dict[str, object],
+    system_caps: Dict[str, object],
+    experiments: List[ExperimentIR],
+) -> List[int]:
+    if not cfg:
+        return []
+    mode = str(cfg.get("mode", "powers_of_two"))
+    explicit_values = cfg.get("values") if mode == "explicit" else None
+    min_threads = int(cfg.get("min", 1))
+    max_raw = cfg.get("max", "physical")
+    max_threads = _resolve_threads_cap(max_raw, system_caps)
+    include_physical = bool(cfg.get("include_physical", True))
+    include_logical = bool(cfg.get("include_logical", False))
+    include_core_groups = bool(cfg.get("include_core_groups", False))
+    include_socket_cores = bool(cfg.get("include_socket_cores", False))
+    include_numa_cores = bool(cfg.get("include_numa_cores", False))
+    max_pool = int(cfg.get("max_pool", 6))
+    keep_bottom = int(cfg.get("keep_bottom_k", 0))
+    keep_top = int(cfg.get("keep_top_k", 0))
+    fractions = _parse_fractions(cfg.get("include_fractions"))
+    candidates = _generate_threads(mode, min_threads, max_threads, explicit_values)
+    if include_physical:
+        candidates.append(_get_int(system_caps.get("physical_cores"), max_threads))
+    if include_logical:
+        candidates.append(_get_int(system_caps.get("logical_cores"), max_threads))
+    if include_socket_cores:
+        socket_cores = _get_int(system_caps.get("cores_per_socket"), 0)
+        if socket_cores:
+            candidates.append(socket_cores)
+    if include_numa_cores:
+        numa_nodes = _get_int(system_caps.get("numa_nodes"), 0)
+        physical = _get_int(system_caps.get("physical_cores"), 0)
+        if numa_nodes and physical:
+            per_numa = max(1, int(round(physical / float(numa_nodes))))
+            candidates.append(per_numa)
+    if include_core_groups:
+        core_groups = system_caps.get("core_groups")
+        if isinstance(core_groups, list):
+            for group in core_groups:
+                if isinstance(group, dict):
+                    count = _get_int(group.get("count"), 0)
+                    if count:
+                        candidates.append(count)
+    if fractions:
+        for frac in fractions:
+            guess = int(round(max_threads * frac))
+            if min_threads <= guess <= max_threads:
+                candidates.append(guess)
+    candidates = sorted({c for c in candidates if c >= min_threads})
+    candidates = _trim_candidates(candidates, max_pool, keep_bottom, keep_top)
+    if cfg.get("expand_if_best_at_max", False):
+        best_threads = _best_threads(experiments)
+        if best_threads and candidates:
+            max_candidate = max(candidates)
+            if best_threads >= max_candidate and max_candidate < max_threads:
+                step = int(cfg.get("expansion_step", 0)) or 0
+                next_threads = max_candidate + step if step else min(max_threads, max_candidate * 2)
+                next_threads = min(max_threads, next_threads)
+                candidates = sorted(set(candidates + [next_threads]))
+                candidates = _trim_candidates(candidates, max_pool, keep_bottom, keep_top)
+    return candidates
+
+
+def _resolve_threads_cap(max_raw: object, system_caps: Dict[str, object]) -> int:
+    if isinstance(max_raw, str):
+        if max_raw == "physical":
+            return _get_int(system_caps.get("physical_cores"), 1)
+        if max_raw == "logical":
+            return _get_int(system_caps.get("logical_cores"), 1)
+        try:
+            return int(max_raw)
+        except ValueError:
+            return _get_int(system_caps.get("physical_cores"), 1)
+    if isinstance(max_raw, (int, float)):
+        return int(max_raw)
+    return _get_int(system_caps.get("physical_cores"), 1)
+
+
+def _generate_threads(
+    mode: str,
+    min_threads: int,
+    max_threads: int,
+    explicit_values: Optional[object],
+) -> List[int]:
+    if max_threads < min_threads:
+        return [min_threads]
+    if mode == "explicit":
+        if isinstance(explicit_values, list):
+            values = []
+            for item in explicit_values:
+                try:
+                    values.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            return values
+        return [min_threads, max_threads] if min_threads != max_threads else [min_threads]
+    if mode == "linear":
+        return list(range(min_threads, max_threads + 1))
+    if mode == "powers_of_two":
+        value = 1
+        candidates: List[int] = []
+        while value <= max_threads:
+            if value >= min_threads:
+                candidates.append(value)
+            value *= 2
+        if min_threads not in candidates:
+            candidates.append(min_threads)
+        return candidates
+    return [min_threads, max_threads] if min_threads != max_threads else [min_threads]
+
+
+def _trim_candidates_basic(candidates: List[int], max_pool: int) -> List[int]:
+    if max_pool <= 0 or len(candidates) <= max_pool:
+        return candidates
+    if max_pool == 1:
+        return [candidates[-1]]
+    if max_pool == 2:
+        return [candidates[0], candidates[-1]]
+    trimmed = [candidates[0], candidates[-1]]
+    step = (len(candidates) - 1) / float(max_pool - 1)
+    for idx in range(1, max_pool - 1):
+        pick = int(round(idx * step))
+        trimmed.append(candidates[pick])
+    return sorted(set(trimmed))
+
+
+def _trim_candidates(
+    candidates: List[int],
+    max_pool: int,
+    keep_bottom: int = 0,
+    keep_top: int = 0,
+) -> List[int]:
+    if max_pool <= 0 or len(candidates) <= max_pool:
+        return candidates
+    keep_bottom = max(0, keep_bottom)
+    keep_top = max(0, keep_top)
+    if keep_bottom == 0 and keep_top == 0:
+        return _trim_candidates_basic(candidates, max_pool)
+    ordered = sorted(set(candidates))
+    if keep_bottom >= len(ordered):
+        return ordered[:max_pool]
+    max_kept = min(max_pool, len(ordered))
+    if keep_bottom + keep_top > max_kept:
+        keep_top = max(0, max_kept - keep_bottom)
+    kept = ordered[:keep_bottom]
+    if keep_top:
+        kept.extend(ordered[-keep_top:])
+    remaining_budget = max_pool - len(kept)
+    if remaining_budget <= 0:
+        return sorted(set(kept))[:max_pool]
+    remaining = [c for c in ordered if c not in kept]
+    if remaining:
+        kept.extend(_trim_candidates_basic(remaining, remaining_budget))
+    return sorted(set(kept))
+
+
+def _best_threads(experiments: List[ExperimentIR]) -> Optional[int]:
+    best = _best_pass_exp(experiments)
+    if not best or not best.job:
+        return None
+    env = best.job.env or {}
+    value = env.get("OMP_NUM_THREADS")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _allowed_templates(cfg: Dict[str, object]) -> Optional[set[str]]:
+    template_ids = cfg.get("template_ids") if isinstance(cfg, dict) else None
+    if not template_ids:
+        return None
+    if isinstance(template_ids, list):
+        return {str(item) for item in template_ids if str(item).strip()}
+    return None
+
+
+def _parse_fractions(value: object) -> List[float]:
+    if not isinstance(value, list):
+        return []
+    fractions: List[float] = []
+    for item in value:
+        try:
+            frac = float(item)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 < frac <= 1.0:
+            fractions.append(frac)
+    return sorted(set(fractions))
+
+
+def _get_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _materialize_thread_action(
+    template_action: ActionIR, template_id: str, threads: int
+) -> ActionIR:
+    action = template_action.model_copy(deep=True)
+    action.action_id = f"{template_action.family}.t{threads}_{template_id}"
+    action.description = _format_thread_description(template_action.description, threads)
+    params = dict(action.parameters or {})
+    env = dict(params.get("env", {}) or {})
+    env["OMP_NUM_THREADS"] = str(threads)
+    env = _replace_thread_placeholders(env, threads)
+    params["env"] = env
+    params["dynamic_threads"] = False
+    action.parameters = params
+    return action
+
+
+def _replace_thread_placeholders(env: Dict[str, str], threads: int) -> Dict[str, str]:
+    replaced: Dict[str, str] = {}
+    for key, value in env.items():
+        if isinstance(value, str) and "{threads}" in value:
+            replaced[key] = value.replace("{threads}", str(threads))
+        else:
+            replaced[key] = value
+    return replaced
+
+
+def _format_thread_description(description: str, threads: int) -> str:
+    if not description:
+        return f"OMP={threads}"
+    return description.replace("{threads}", str(threads))
+
+
+def _apply_adapter(
+    actions: List[ActionIR],
+    adapter_cfg: Optional[Dict[str, object]],
+    job: JobIR,
+) -> List[ActionIR]:
+    if not adapter_cfg or adapter_cfg.get("app") not in {job.app}:
+        return actions
+    backend_map = adapter_cfg.get("backend_enable", {})
+    if not isinstance(backend_map, dict):
+        return actions
+    adapted: List[ActionIR] = []
+    for action in actions:
+        params = dict(action.parameters or {})
+        backend = params.get("backend_enable")
+        mapping = backend_map.get(str(backend)) if backend else None
+        if mapping and "run_args" in mapping:
+            params["run_args"] = _merge_run_args(params.get("run_args"), mapping.get("run_args"))
+        action.parameters = params
+        adapted.append(action)
+    return adapted
+
+
+def _merge_run_args(base: Optional[Dict[str, object]], extra: Optional[Dict[str, object]]) -> Dict[str, object]:
+    merged: Dict[str, object] = {}
+    if isinstance(base, dict):
+        merged.update(base)
+    if not isinstance(extra, dict):
+        return merged
+    set_flags = list(merged.get("set_flags", []))
+    seen = {item.get("flag") for item in set_flags if isinstance(item, dict)}
+    for item in extra.get("set_flags", []):
+        if not isinstance(item, dict):
+            continue
+        flag = item.get("flag")
+        if flag in seen:
+            continue
+        set_flags.append(item)
+        seen.add(flag)
+    if set_flags:
+        merged["set_flags"] = set_flags
+    return merged
+
+
+def _select_validation_base(
+    baseline_exp: ExperimentIR,
+    best_exp: ExperimentIR,
+    experiments: List[ExperimentIR],
+) -> tuple[JobIR, Optional[str], Optional[str]]:
+    if best_exp.base_run_id:
+        base_exp = _find_experiment_by_run_id(experiments, best_exp.base_run_id)
+        if base_exp:
+            base_action_id = base_exp.action.action_id if base_exp.action else "baseline"
+            return base_exp.job, base_exp.run_id, base_action_id
+    return baseline_exp.job, baseline_exp.run_id, "baseline"
+
+
+def _find_experiment_by_run_id(
+    experiments: List[ExperimentIR], run_id: str
+) -> Optional[ExperimentIR]:
+    for exp in experiments:
+        if exp.run_id == run_id:
+            return exp
+    return None
+
+
 def _apply_confidence_policy(
     actions: List[ActionIR],
     analysis: AnalysisResult,
@@ -127,6 +625,8 @@ def run_optimization(
     selection_mode: str,
     direction_top_k: int,
     llm_client: Optional[LLMClient],
+    candidate_policy: Optional[Dict[str, object]] = None,
+    adapter_cfg: Optional[Dict[str, object]] = None,
     planner_cfg: Optional[Dict[str, object]] = None,
     reporter: Optional[ConsoleUI] = None,
     build_cfg: Optional[Dict[str, object]] = None,
@@ -141,12 +641,15 @@ def run_optimization(
     optimizer = OptimizerAgent(llm_client)
     ranker = RouterRankerAgent(llm_client)
     verifier = VerifierAgent()
+    reviewer = ReviewerAgent(llm_client)
     executor = ExecutorAgent(_run_experiment)
     reporter_agent = ReporterAgent()
     triage = TriageAgent()
     memory = OptimizationMemory()
     state = StopState()
     trace_events: List[Dict[str, object]] = []
+    system_caps = _system_caps()
+    candidate_policy_summary = _select_candidate_policy(candidate_policy, job.case_id)
 
     start_time = time.monotonic()
     repo_root = Path(__file__).resolve().parents[1]
@@ -164,9 +667,13 @@ def run_optimization(
             validate_top1_repeats=validate_top1_repeats,
             min_improvement_pct=min_improvement_pct,
         )
+    last_review_decision: Optional[Dict[str, object]] = None
     baseline_exp = executor.execute(
         exp_id="baseline",
         job=job,
+        base_job=None,
+        base_run_id=None,
+        base_action_id=None,
         action=None,
         actions_root=repo_root,
         policy=policy,
@@ -219,12 +726,18 @@ def run_optimization(
             failure_info,
             agent_trace_path,
             llm_summary_zh=None,
+            candidate_policy=candidate_policy_summary,
+            review_decision=last_review_decision,
         )
         report_info["agent_trace"] = agent_trace_path
         return report_info
 
     prev_best_time = baseline_exp.results.runtime_seconds
     iteration = 0
+    refine_cfg = (planner_cfg or {}).get("refine_on_best", {})
+    refine_enabled = bool(refine_cfg.get("enabled", False))
+    refine_min_improvement = float(refine_cfg.get("min_improvement_pct", min_improvement_pct or 0.0))
+    refine_applies_to = set(refine_cfg.get("applies_to", ["run_config"]))
     while True:
         elapsed = time.monotonic() - start_time
         if should_stop(job.budgets, iteration, state, elapsed, min_delta_seconds):
@@ -235,14 +748,32 @@ def run_optimization(
             break
         iteration += 1
 
-        input_text = _safe_read(Path(job.input_script))
-        ctx = RuleContext(job=job, input_text=input_text, run_args=job.run_args, env=job.env)
+        refine_on_best = _should_refine_on_best(
+            baseline_exp=baseline_exp,
+            best_exp=memory.best,
+            enabled=refine_enabled,
+            min_improvement_pct=refine_min_improvement,
+        )
+        ctx_job = memory.best.job if refine_on_best and memory.best else baseline_exp.job
+        input_text = _safe_read(Path(ctx_job.input_script))
+        ctx = RuleContext(
+            job=ctx_job, input_text=input_text, run_args=ctx_job.run_args, env=ctx_job.env
+        )
         profile_ref = memory.best.profile_report if memory.best else baseline_exp.profile_report
         history_summary = _build_history_summary(memory.experiments)
+        cost_model = _build_cost_model(memory.experiments)
         tested_actions = [exp.action.action_id for exp in memory.experiments if exp.action]
+        iteration_actions = _prepare_actions(
+            base_actions=actions,
+            candidate_policy=candidate_policy,
+            system_caps=system_caps,
+            experiments=memory.experiments,
+            adapter_cfg=adapter_cfg,
+            job=job,
+        )
         analysis = analyst.analyze(profile_ref, history_summary, policy, job.tags)
         if selection_mode == "direction":
-            analysis.allowed_families = _select_direction_families(actions, profile_ref)
+            analysis.allowed_families = _select_direction_families(iteration_actions, profile_ref)
         if "allow_build" in job.tags:
             analysis.allowed_families.append("build_config")
         if "allow_source_patch" in job.tags:
@@ -251,12 +782,14 @@ def run_optimization(
         if selection_mode != "direction":
             allowed_targets = set(analysis.allowed_families)
             actions_by_target = [
-                action for action in actions if any(target in allowed_targets for target in action.applies_to)
+                action
+                for action in iteration_actions
+                if any(target in allowed_targets for target in action.applies_to)
             ]
             analysis.allowed_families = sorted({action.family for action in actions_by_target})
             available_actions = _apply_confidence_policy(actions_by_target, analysis, policy)
         else:
-            available_actions = _apply_confidence_policy(actions, analysis, policy)
+            available_actions = _apply_confidence_policy(iteration_actions, analysis, policy)
         eligible_actions = filter_actions(available_actions, ctx, analysis.allowed_families, policy)
         analysis.allowed_families = sorted({action.family for action in eligible_actions})
         allowed_after_confidence = sorted({action.family for action in available_actions})
@@ -275,6 +808,7 @@ def run_optimization(
                 "allowed_families": analysis.allowed_families,
                 "confidence": analysis.confidence,
                 "rationale": analysis.rationale,
+                "refine_on_best": refine_on_best,
             }
         )
         if reporter:
@@ -289,13 +823,16 @@ def run_optimization(
             if action.action_id in tested_actions:
                 continue
             availability[action.family] = availability.get(action.family, 0) + 1
-        plan = planner.plan(iteration, analysis, job.budgets, history_summary, availability)
+        plan = planner.plan(
+            iteration, analysis, job.budgets, history_summary, availability, cost_model
+        )
         trace_events.append(
             {
                 "event": "plan",
                 "agent": "PlannerAgent",
                 "iteration": iteration,
                 "plan": plan.model_dump(),
+                "cost_model": cost_model,
             }
         )
         if reporter:
@@ -308,6 +845,7 @@ def run_optimization(
             policy=policy,
             profile=memory.best.profile_report if memory.best else baseline_exp.profile_report,
             exclude_action_ids=tested_actions,
+            system_caps=system_caps,
         )
         candidate_ids: List[str] = []
         for candidate_list in candidate_lists:
@@ -356,9 +894,19 @@ def run_optimization(
             if state.run_count >= job.budgets.max_runs:
                 break
             exp_id = f"iter{iteration}-{action.action_id}"
+            base_job, base_run_id, base_action_id = _select_base_for_action(
+                action=action,
+                baseline_exp=baseline_exp,
+                best_exp=memory.best,
+                refine_on_best=refine_on_best,
+                refine_applies_to=refine_applies_to,
+            )
             exp = executor.execute(
                 exp_id=exp_id,
                 job=job,
+                base_job=base_job,
+                base_run_id=base_run_id,
+                base_action_id=base_action_id,
                 action=action,
                 actions_root=repo_root,
                 policy=policy,
@@ -374,7 +922,7 @@ def run_optimization(
                 baseline_runtime=baseline_exp.results.runtime_seconds,
                 prior_samples=None,
                 trace_events=trace_events,
-                parent_run_id=baseline_exp.run_id,
+                parent_run_id=base_run_id,
                 iteration=iteration,
                 llm_trace=None,
                 reporter=reporter,
@@ -393,7 +941,7 @@ def run_optimization(
                         "summary": failure.model_dump(),
                     }
                 )
-            _append_run_index(artifacts_dir, exp, parent_run_id=baseline_exp.run_id, iteration=iteration)
+            _append_run_index(artifacts_dir, exp, parent_run_id=base_run_id, iteration=iteration)
 
         llm_iteration_summary = None
         if iteration_experiments and llm_client and llm_client.config.enabled:
@@ -439,6 +987,63 @@ def run_optimization(
         else:
             state.no_improve_iters += 1
 
+        tested_actions = {exp.action.action_id for exp in memory.experiments if exp.action}
+        refreshed_actions = _prepare_actions(
+            base_actions=actions,
+            candidate_policy=candidate_policy,
+            system_caps=system_caps,
+            experiments=memory.experiments,
+            adapter_cfg=adapter_cfg,
+            job=job,
+        )
+        remaining_candidates = _remaining_candidates_by_family(refreshed_actions, tested_actions)
+        history_summary = _build_history_summary(memory.experiments)
+        cost_model = _build_cost_model(memory.experiments)
+        iteration_summaries = _collect_iteration_summaries(
+            memory.experiments, baseline_exp.results.runtime_seconds
+        )
+        review_payload = {
+            "iteration": iteration,
+            "budgets": {
+                "max_iters": job.budgets.max_iters,
+                "max_runs": job.budgets.max_runs,
+                "max_wall_seconds": job.budgets.max_wall_seconds,
+                "remaining_iters": max(0, job.budgets.max_iters - iteration),
+                "remaining_runs": max(0, job.budgets.max_runs - state.run_count),
+            },
+            "stop_state": {
+                "run_count": state.run_count,
+                "fail_count": state.fail_count,
+                "no_improve_iters": state.no_improve_iters,
+            },
+            "history_summary": history_summary,
+            "cost_model": cost_model,
+            "remaining_candidates": remaining_candidates,
+            "iteration_summaries": iteration_summaries[-3:],
+            "best_summary": _best_summary(baseline_exp, memory.best),
+            "context": {
+                "selection_mode": selection_mode,
+                "tags": job.tags,
+            },
+        }
+        review_decision = reviewer.review(review_payload)
+        last_review_decision = review_decision.model_dump()
+        trace_events.append(
+            {
+                "event": "review_decision",
+                "agent": "ReviewerAgent",
+                "iteration": iteration,
+                "decision": review_decision.model_dump(),
+                "payload": review_payload,
+            }
+        )
+        if reporter:
+            reporter.review_summary(review_decision)
+        if review_decision.should_stop:
+            if reporter:
+                reporter.stop(f"reviewer_stop: {review_decision.reason}")
+            break
+
     validation_exp = None
     if (
         memory.best
@@ -448,9 +1053,17 @@ def run_optimization(
     ):
         repeats = validate_top1_repeats
         exp_id = f"{memory.best.exp_id}-validate"
+        base_job, base_run_id, base_action_id = _select_validation_base(
+            baseline_exp=baseline_exp,
+            best_exp=memory.best,
+            experiments=memory.experiments,
+        )
         validation_exp = executor.execute(
             exp_id=exp_id,
             job=job,
+            base_job=base_job,
+            base_run_id=base_run_id,
+            base_action_id=base_action_id,
             action=memory.best.action,
             actions_root=repo_root,
             policy=policy,
@@ -466,7 +1079,7 @@ def run_optimization(
             baseline_runtime=baseline_exp.results.runtime_seconds,
             prior_samples=memory.best.results.samples,
             trace_events=trace_events,
-            parent_run_id=memory.best.run_id,
+            parent_run_id=base_run_id or memory.best.run_id,
             iteration=iteration,
             llm_trace=None,
             reporter=reporter,
@@ -476,7 +1089,10 @@ def run_optimization(
         if validation_exp.verdict == "FAIL":
             state.fail_count += 1
         _append_run_index(
-            artifacts_dir, validation_exp, parent_run_id=memory.best.run_id, iteration=iteration
+            artifacts_dir,
+            validation_exp,
+            parent_run_id=base_run_id or memory.best.run_id,
+            iteration=iteration,
         )
 
     success_info = _evaluate_success(
@@ -511,6 +1127,8 @@ def run_optimization(
         success_info,
         agent_trace_path,
         llm_summary_zh,
+        candidate_policy=candidate_policy_summary,
+        review_decision=last_review_decision,
     )
     report_info["agent_trace"] = agent_trace_path
     if reporter:
@@ -525,6 +1143,9 @@ def run_optimization(
 def _run_experiment(
     exp_id: str,
     job: JobIR,
+    base_job: Optional[JobIR],
+    base_run_id: Optional[str],
+    base_action_id: Optional[str],
     action: Optional[ActionIR],
     actions_root: Path,
     policy: Dict[str, object],
@@ -549,11 +1170,19 @@ def _run_experiment(
     run_dir = artifacts_dir / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    env_overrides, run_args = _apply_run_config_action(job, action)
+    base_job_snapshot = base_job or job
+    env_overrides, run_args = _apply_run_config_action(base_job_snapshot, action)
     run_args = _ensure_log_path(run_args, run_dir)
     run_trace: List[Dict[str, object]] = []
     if reporter:
-        reporter.run_start(exp_id=exp_id, action=action, env_overrides=env_overrides, run_args=run_args)
+        reporter.run_start(
+            exp_id=exp_id,
+            action=action,
+            env_overrides=env_overrides,
+            run_args=run_args,
+            base_run_id=base_run_id,
+            base_action_id=base_action_id,
+        )
     _append_trace(
         trace_events,
         run_trace,
@@ -562,6 +1191,8 @@ def _run_experiment(
             "agent": "OptimizerAgent",
             "run_id": run_id,
             "action_id": action.action_id if action else "baseline",
+            "base_run_id": base_run_id,
+            "base_action_id": base_action_id,
             "env_overrides": env_overrides,
             "run_args": run_args,
         },
@@ -574,16 +1205,17 @@ def _run_experiment(
     patch_path = None
     git_before = None
     git_after = None
-    workdir = Path(job.workdir)
-    input_script = Path(job.input_script)
+    workdir = Path(base_job_snapshot.workdir)
+    input_script = Path(base_job_snapshot.input_script)
     source_root = actions_root
 
     build_output: Optional[BuildOutput] = None
     build_config_diff_path: Optional[str] = None
     binary_provenance: Optional[Dict[str, object]] = None
+    repro_script_path: Optional[str] = None
     run_output = None
 
-    job_snapshot = job.model_copy(deep=True)
+    job_snapshot = base_job_snapshot.model_copy(deep=True)
     job_snapshot.env.update(env_overrides)
     job_snapshot.run_args = run_args
 
@@ -606,6 +1238,8 @@ def _run_experiment(
         reasons = ["input script outside repo; cannot apply git patch"]
         exp = _build_experiment_ir(
             exp_id=exp_id,
+            base_run_id=base_run_id,
+            base_action_id=base_action_id,
             job=job_snapshot,
             action=action,
             patch_path=None,
@@ -616,6 +1250,7 @@ def _run_experiment(
             result=result,
             verdict=verdict,
             reasons=reasons,
+            build_seconds=None,
         )
         if reporter:
             reporter.verify_result(exp)
@@ -635,6 +1270,9 @@ def _run_experiment(
             run_id=run_id,
             job=job_snapshot,
             action=action,
+            base_run_id=base_run_id,
+            base_action_id=base_action_id,
+            base_job=base_job_snapshot,
             env_overrides=env_overrides,
             run_args=run_args,
             git_before=None,
@@ -650,6 +1288,7 @@ def _run_experiment(
             build_output=None,
             binary_provenance=None,
             build_config_diff_path=None,
+            repro_script_path=None,
         )
         _write_run_trace(run_dir, run_trace)
         return exp
@@ -707,6 +1346,12 @@ def _run_experiment(
                 )
 
             binary_provenance = collect_binary_provenance(job_snapshot.lammps_bin, run_dir)
+            repro_script_path = _write_repro_script(
+                run_dir=run_dir,
+                workdir=workdir,
+                job=job_snapshot,
+                run_args=run_args,
+            )
 
             run_output, profile = profiler.run(
                 job_snapshot, run_args, env_overrides, workdir, run_dir, time_command, repeats
@@ -751,6 +1396,8 @@ def _run_experiment(
         reasons = [str(exc)]
         exp = _build_experiment_ir(
             exp_id=exp_id,
+            base_run_id=base_run_id,
+            base_action_id=base_action_id,
             job=job_snapshot,
             action=action,
             patch_path=None,
@@ -761,6 +1408,7 @@ def _run_experiment(
             result=result,
             verdict=verdict,
             reasons=reasons,
+            build_seconds=build_output.build_seconds if build_output else None,
         )
         if reporter:
             reporter.verify_result(exp)
@@ -780,6 +1428,9 @@ def _run_experiment(
             run_id=run_id,
             job=job_snapshot,
             action=action,
+            base_run_id=base_run_id,
+            base_action_id=base_action_id,
+            base_job=base_job_snapshot,
             env_overrides=env_overrides,
             run_args=run_args,
             git_before=git_before,
@@ -795,12 +1446,20 @@ def _run_experiment(
             build_output=build_output,
             binary_provenance=binary_provenance,
             build_config_diff_path=build_config_diff_path,
+            repro_script_path=repro_script_path,
         )
         _write_run_trace(run_dir, run_trace)
         return exp
 
     if action and action.applies_to == ["run_config"]:
-        patch_path = _write_run_config_diff(run_dir, job, run_args, env_overrides)
+        patch_path = _write_run_config_diff(
+            run_dir,
+            base_job_snapshot,
+            run_args,
+            env_overrides,
+            base_run_id,
+            base_action_id,
+        )
 
     verify = verifier.verify(job_snapshot, action, result, profile, gates, baseline_exp)
     result.correctness_metrics.update(verify.correctness_metrics)
@@ -818,6 +1477,8 @@ def _run_experiment(
     )
     exp = _build_experiment_ir(
         exp_id=exp_id,
+        base_run_id=base_run_id,
+        base_action_id=base_action_id,
         job=job_snapshot,
         action=action,
         patch_path=patch_path,
@@ -828,6 +1489,7 @@ def _run_experiment(
         result=result,
         verdict=verify.verdict,
         reasons=verify.reasons,
+        build_seconds=build_output.build_seconds if build_output else None,
     )
     if reporter:
         reporter.verify_result(exp)
@@ -852,6 +1514,10 @@ def _run_experiment(
         build_output=build_output,
         binary_provenance=binary_provenance,
         build_config_diff_path=build_config_diff_path,
+        repro_script_path=repro_script_path,
+        base_run_id=base_run_id,
+        base_action_id=base_action_id,
+        base_job=base_job_snapshot,
     )
     _write_run_trace(run_dir, run_trace)
     return exp
@@ -1208,6 +1874,9 @@ def _write_run_manifest(
     run_id: str,
     job: JobIR,
     action: Optional[ActionIR],
+    base_run_id: Optional[str],
+    base_action_id: Optional[str],
+    base_job: Optional[JobIR],
     env_overrides: Dict[str, str],
     run_args: List[str],
     git_before: Optional[str],
@@ -1223,11 +1892,15 @@ def _write_run_manifest(
     build_output: Optional[BuildOutput],
     binary_provenance: Optional[Dict[str, object]],
     build_config_diff_path: Optional[str],
+    repro_script_path: Optional[str],
 ) -> None:
     manifest = _build_run_manifest(
         run_id=run_id,
         job=job,
         action=action,
+        base_run_id=base_run_id,
+        base_action_id=base_action_id,
+        base_job=base_job,
         env_overrides=env_overrides,
         run_args=run_args,
         git_before=git_before,
@@ -1243,6 +1916,7 @@ def _write_run_manifest(
         build_output=build_output,
         binary_provenance=binary_provenance,
         build_config_diff_path=build_config_diff_path,
+        repro_script_path=repro_script_path,
     )
     path = run_dir / "manifest.json"
     path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1252,6 +1926,9 @@ def _build_run_manifest(
     run_id: str,
     job: JobIR,
     action: Optional[ActionIR],
+    base_run_id: Optional[str],
+    base_action_id: Optional[str],
+    base_job: Optional[JobIR],
     env_overrides: Dict[str, str],
     run_args: List[str],
     git_before: Optional[str],
@@ -1267,6 +1944,7 @@ def _build_run_manifest(
     build_output: Optional[BuildOutput],
     binary_provenance: Optional[Dict[str, object]],
     build_config_diff_path: Optional[str],
+    repro_script_path: Optional[str],
 ) -> Dict[str, object]:
     git_status = get_git_status(repo_root)
     lammps_hash = _sha256_file(job.lammps_bin)
@@ -1277,6 +1955,7 @@ def _build_run_manifest(
         "log": result.logs[2] if len(result.logs) > 2 else None,
         "time": run_output.time_output_path if run_output else None,
         "patch": patch_path,
+        "repro_script": repro_script_path,
     }
     build_section = None
     if build_output:
@@ -1290,6 +1969,7 @@ def _build_run_manifest(
             "provenance_path": build_output.provenance_path,
             "provenance": build_output.provenance,
             "build_config_diff": build_config_diff_path,
+            "build_seconds": build_output.build_seconds,
         }
     verification = None
     if verify:
@@ -1304,6 +1984,12 @@ def _build_run_manifest(
         "iteration": iteration,
         "action_id": action.action_id if action else "baseline",
         "action_family": action.family if action else None,
+        "base": {
+            "run_id": base_run_id,
+            "action_id": base_action_id,
+            "env": base_job.env if base_job else None,
+            "run_args": base_job.run_args if base_job else None,
+        },
         "env_overrides": env_overrides,
         "env_final": job.env,
         "run_args": run_args,
@@ -1576,6 +2262,8 @@ def _extract_llm_selection_reason(llm_summary: Optional[Dict[str, object]]) -> O
 
 def _build_experiment_ir(
     exp_id: str,
+    base_run_id: Optional[str],
+    base_action_id: Optional[str],
     job: JobIR,
     action: Optional[ActionIR],
     patch_path: Optional[str],
@@ -1586,11 +2274,14 @@ def _build_experiment_ir(
     result: ResultIR,
     verdict: str,
     reasons: List[str],
+    build_seconds: Optional[float] = None,
 ) -> ExperimentIR:
     timestamps = [time.strftime("%Y-%m-%dT%H:%M:%S")]
     return ExperimentIR(
         exp_id=exp_id,
         parent_exp_id=None,
+        base_run_id=base_run_id,
+        base_action_id=base_action_id,
         job=job,
         action=action,
         git_commit_before=git_before,
@@ -1602,20 +2293,56 @@ def _build_experiment_ir(
         results=result,
         verdict=verdict,
         reasons=reasons,
+        build_seconds=build_seconds,
     )
 
 
 def _write_run_config_diff(
-    run_dir: Path, job: JobIR, run_args: List[str], env_overrides: Dict[str, str]
+    run_dir: Path,
+    base_job: JobIR,
+    run_args: List[str],
+    env_overrides: Dict[str, str],
+    base_run_id: Optional[str],
+    base_action_id: Optional[str],
 ) -> str:
     diff = {
+        "base_run_id": base_run_id,
+        "base_action_id": base_action_id,
+        "env_before": base_job.env,
         "env_overrides": env_overrides,
-        "run_args_before": job.run_args,
+        "env_after": {**base_job.env, **env_overrides},
+        "run_args_before": base_job.run_args,
         "run_args_after": run_args,
     }
     diff_path = run_dir / "run_config.diff.json"
     diff_path.write_text(json.dumps(diff, indent=2), encoding="utf-8")
     return str(diff_path)
+
+
+def _write_repro_script(
+    run_dir: Path,
+    workdir: Path,
+    job: JobIR,
+    run_args: List[str],
+) -> str:
+    import shlex
+
+    repro_path = run_dir / "repro.sh"
+    env_lines = []
+    for key, value in sorted(job.env.items()):
+        env_lines.append(f"export {key}={shlex.quote(str(value))}")
+    args = " ".join(shlex.quote(str(arg)) for arg in run_args)
+    lines = [
+        "#!/bin/sh",
+        "set -e",
+        f"cd {shlex.quote(str(workdir))}",
+        *env_lines,
+        f"{shlex.quote(str(job.lammps_bin))} {args}",
+        "",
+    ]
+    repro_path.write_text("\n".join(lines), encoding="utf-8")
+    repro_path.chmod(0o755)
+    return str(repro_path)
 
 
 def _write_experiment(run_dir: Path, exp: ExperimentIR) -> None:

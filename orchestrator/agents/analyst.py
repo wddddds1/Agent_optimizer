@@ -75,9 +75,12 @@ class AnalystAgent:
         if not data:
             return None
         try:
-            return AnalysisResult(**data)
+            result = AnalysisResult(**data)
         except ValidationError:
             return None
+        if result.status != "OK":
+            return None
+        return result
 
 
 def _analysis_confidence(profile: ProfileReport) -> float:

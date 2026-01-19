@@ -22,5 +22,14 @@ You are RouterRankerAgent.
     {"action_id": "...", "reason": "policy_filtered|inapplicable|low_evidence"}
   ],
   "scoring_notes": "中文：说明排序依据（引用1-2条证据）",
-  "confidence": 0.6
+  "confidence": 0.6,
+  "score_breakdown": {
+    "action_id": {"gain_prior": 1.0, "risk_penalty": -0.2}
+  },
+  "status": "OK",
+  "missing_fields": []
 }
+
+硬约束
+- 输出必须是单一 JSON 对象，不得包含额外字段或文字。
+- 若证据不足，返回 status=NEED_MORE_EVIDENCE 并列出 missing_fields。
