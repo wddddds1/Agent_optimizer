@@ -5,83 +5,33 @@ import json
 import statistics
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from schemas.action_ir import ActionIR
+from schemas.analysis_ir import AnalysisResult
 from schemas.experiment_ir import ExperimentIR
 from schemas.job_ir import JobIR, Budgets
 from schemas.profile_report import ProfileReport
 from schemas.result_ir import ResultIR
 from skills.build_local import BuildOutput, build_job, collect_binary_provenance
 from skills.patch_git import GitPatchContext, get_git_head, get_git_status
-from skills.profiling_local import profile_job
-from skills.report import write_report
-from skills.verify import verify_run
 from orchestrator.console import ConsoleUI
+from orchestrator.agents import (
+    AnalystAgent,
+    ExecutorAgent,
+    PlannerAgent,
+    ProfilerAgent,
+    OptimizerAgent,
+    ReporterAgent,
+    RouterRankerAgent,
+    TriageAgent,
+    VerifierAgent,
+)
 from orchestrator.memory import OptimizationMemory
 from orchestrator.llm_client import LLMClient
-from orchestrator.router import RuleContext, filter_actions, rank_actions
+from orchestrator.router import RuleContext, filter_actions
 from orchestrator.stop import StopState, should_stop
-
-
-@dataclass
-class AnalysisResult:
-    bottlenecks: List[str]
-    allowed_families: List[str]
-    confidence: str
-
-
-class ProfilerAgent:
-    def run(self, job: JobIR, run_args: List[str], env_overrides: Dict[str, str], workdir: Path,
-            artifacts_dir: Path, time_command: Optional[str], repeats: int) -> Tuple:
-        return profile_job(
-            job=job,
-            run_args=run_args,
-            env_overrides=env_overrides,
-            workdir=workdir,
-            artifacts_dir=artifacts_dir,
-            time_command=time_command,
-            repeats=repeats,
-        )
-
-
-class AnalystAgent:
-    def analyze(self, profile: ProfileReport) -> AnalysisResult:
-        timing = profile.timing_breakdown
-        total = timing.get("total", 0.0) or 0.0
-        comm_ratio = (timing.get("comm", 0.0) / total) if total else 0.0
-        output_ratio = (timing.get("output", 0.0) / total) if total else 0.0
-        bottlenecks = []
-        allowed = []
-        confidence = _analysis_confidence(profile)
-        if comm_ratio > 0.2:
-            bottlenecks.append("communication")
-        if output_ratio > 0.2:
-            bottlenecks.append("io")
-        bottlenecks.append("compute")
-        allowed.extend(["omp_threads", "omp_binding", "omp_places", "omp_dynamic", "omp_wait_policy", "lammps_flags"])
-        return AnalysisResult(
-            bottlenecks=bottlenecks,
-            allowed_families=sorted(set(allowed)),
-            confidence=confidence,
-        )
-
-
-def _analysis_confidence(profile: ProfileReport) -> str:
-    timing = profile.timing_breakdown or {}
-    total = timing.get("total", 0.0) or 0.0
-    if total <= 0.0:
-        return "unknown"
-    keys = ["pair", "kspace", "neigh", "comm", "modify", "output"]
-    present = [key for key in keys if timing.get(key) is not None]
-    positive = [key for key in keys if (timing.get(key) or 0.0) > 0.0]
-    if len(positive) >= 2:
-        return "high"
-    if len(present) >= 2:
-        return "low"
-    return "unknown"
 
 
 def _best_pass_exp(experiments: List[ExperimentIR]) -> Optional[ExperimentIR]:
@@ -114,15 +64,39 @@ def _stop_reason(
     return "stop condition triggered"
 
 
+def _build_history_summary(experiments: List[ExperimentIR]) -> Dict[str, object]:
+    summary: Dict[str, object] = {
+        "family_best_gain": {},
+        "family_failures": {},
+        "family_attempts": {},
+    }
+    for exp in experiments:
+        if exp.action is None:
+            continue
+        family = exp.action.family
+        summary["family_attempts"][family] = summary["family_attempts"].get(family, 0) + 1
+        if exp.verdict == "FAIL":
+            summary["family_failures"][family] = summary["family_failures"].get(family, 0) + 1
+            continue
+        speedup = exp.results.derived_metrics.get("speedup_vs_baseline")
+        if speedup is None:
+            continue
+        gain = speedup - 1.0
+        best = summary["family_best_gain"].get(family)
+        if best is None or gain > best:
+            summary["family_best_gain"][family] = gain
+    return summary
+
+
 def _apply_confidence_policy(
     actions: List[ActionIR],
     analysis: AnalysisResult,
     policy: Dict[str, object],
 ) -> List[ActionIR]:
-    if analysis.confidence == "high":
+    if analysis.confidence >= 0.8:
         return actions
     rules = policy.get("profiling_rules", {})
-    rule_key = "low_confidence_allow" if analysis.confidence == "low" else "unknown_confidence_allow"
+    rule_key = "low_confidence_allow" if analysis.confidence >= 0.5 else "unknown_confidence_allow"
     rule = rules.get(rule_key) or rules.get("low_confidence_allow") or {}
     if not rule:
         return []
@@ -141,97 +115,6 @@ def _apply_confidence_policy(
     return filtered
 
 
-class OptimizerAgent:
-    def __init__(self, llm_client: Optional[LLMClient]) -> None:
-        self.llm_client = llm_client
-        self.last_llm_trace: Optional[Dict[str, object]] = None
-        self.last_ranking_mode: str = "heuristic"
-
-    def propose(
-        self,
-        actions: List[ActionIR],
-        ctx: RuleContext,
-        allowed_families: List[str],
-        top_k: int,
-        selection_mode: str,
-        direction_top_k: int,
-        profile: ProfileReport,
-        policy: Dict[str, object],
-        exclude_action_ids: List[str],
-        trace_events: Optional[List[Dict[str, object]]],
-        iteration: int,
-    ) -> List[ActionIR]:
-        filtered = filter_actions(actions, ctx, allowed_families, policy)
-        filtered = [action for action in filtered if action.action_id not in exclude_action_ids]
-        if self.llm_client and self.llm_client.config.enabled:
-            context = {
-                "case_id": ctx.job.case_id,
-                "allowed_families": allowed_families,
-                "run_args": ctx.run_args,
-                "env": ctx.env,
-            }
-            llm_ids = self.llm_client.rank_actions(filtered, profile, context)
-            explanation = self.llm_client.explain_decision(
-                {
-                    **context,
-                    "candidate_action_ids": [action.action_id for action in filtered],
-                    "llm_ranked_action_ids": llm_ids,
-                }
-            )
-            ranked = _rank_with_llm_ids(filtered, profile, llm_ids)
-            self.last_llm_trace = {
-                "event": "llm_explanation",
-                "agent": "OptimizerAgent",
-                "iteration": iteration,
-                "ranked_action_ids": llm_ids,
-                "explanation": explanation,
-            }
-            self.last_ranking_mode = "llm"
-            if trace_events is not None:
-                trace_events.append(
-                    {
-                        "event": "llm_explanation",
-                        "agent": "OptimizerAgent",
-                        "iteration": iteration,
-                        "ranked_action_ids": llm_ids,
-                        "explanation": explanation,
-                    }
-                )
-        else:
-            ranked = rank_actions(filtered, profile)
-            self.last_llm_trace = None
-            self.last_ranking_mode = "heuristic"
-        if selection_mode == "direction" and ranked:
-            selected_family = ranked[0].family
-            filtered_ranked = [action for action in ranked if action.family == selected_family]
-            if trace_events is not None:
-                trace_events.append(
-                    {
-                        "event": "direction_selected",
-                        "agent": "OptimizerAgent",
-                        "iteration": iteration,
-                        "direction": selected_family,
-                        "candidate_action_ids": [action.action_id for action in filtered_ranked],
-                    }
-                )
-            limit = max(direction_top_k, 1)
-            return filtered_ranked[:limit]
-        return ranked[:top_k]
-
-
-class VerifierAgent:
-    def verify(
-        self,
-        job: JobIR,
-        action: Optional[ActionIR],
-        result: ResultIR,
-        profile: ProfileReport,
-        gates: Dict[str, object],
-        baseline_exp: Optional[ExperimentIR],
-    ):
-        return verify_run(job, action, result, profile, gates, baseline_exp)
-
-
 def run_optimization(
     job: JobIR,
     actions: List[ActionIR],
@@ -244,6 +127,7 @@ def run_optimization(
     selection_mode: str,
     direction_top_k: int,
     llm_client: Optional[LLMClient],
+    planner_cfg: Optional[Dict[str, object]] = None,
     reporter: Optional[ConsoleUI] = None,
     build_cfg: Optional[Dict[str, object]] = None,
     baseline_repeats: int = 1,
@@ -252,9 +136,14 @@ def run_optimization(
     min_improvement_pct: float = 0.0,
 ) -> Dict[str, object]:
     profiler = ProfilerAgent()
-    analyst = AnalystAgent()
+    analyst = AnalystAgent(llm_client)
+    planner = PlannerAgent(planner_cfg or {}, llm_client)
     optimizer = OptimizerAgent(llm_client)
+    ranker = RouterRankerAgent(llm_client)
     verifier = VerifierAgent()
+    executor = ExecutorAgent(_run_experiment)
+    reporter_agent = ReporterAgent()
+    triage = TriageAgent()
     memory = OptimizationMemory()
     state = StopState()
     trace_events: List[Dict[str, object]] = []
@@ -275,7 +164,7 @@ def run_optimization(
             validate_top1_repeats=validate_top1_repeats,
             min_improvement_pct=min_improvement_pct,
         )
-    baseline_exp = _run_experiment(
+    baseline_exp = executor.execute(
         exp_id="baseline",
         job=job,
         action=None,
@@ -322,13 +211,14 @@ def run_optimization(
         if reporter:
             reporter.stop("baseline failed gates")
         agent_trace_path = _write_agent_trace(artifacts_dir, trace_events)
-        report_info = write_report(
+        report_info = reporter_agent.write(
             memory.experiments,
             baseline_exp,
             baseline_exp,
             artifacts_dir,
             failure_info,
             agent_trace_path,
+            llm_summary_zh=None,
         )
         report_info["agent_trace"] = agent_trace_path
         return report_info
@@ -348,7 +238,9 @@ def run_optimization(
         input_text = _safe_read(Path(job.input_script))
         ctx = RuleContext(job=job, input_text=input_text, run_args=job.run_args, env=job.env)
         profile_ref = memory.best.profile_report if memory.best else baseline_exp.profile_report
-        analysis = analyst.analyze(profile_ref)
+        history_summary = _build_history_summary(memory.experiments)
+        tested_actions = [exp.action.action_id for exp in memory.experiments if exp.action]
+        analysis = analyst.analyze(profile_ref, history_summary, policy, job.tags)
         if selection_mode == "direction":
             analysis.allowed_families = _select_direction_families(actions, profile_ref)
         if "allow_build" in job.tags:
@@ -356,7 +248,17 @@ def run_optimization(
         if "allow_source_patch" in job.tags:
             analysis.allowed_families.append("source_patch")
         analysis.allowed_families = sorted(set(analysis.allowed_families))
-        available_actions = _apply_confidence_policy(actions, analysis, policy)
+        if selection_mode != "direction":
+            allowed_targets = set(analysis.allowed_families)
+            actions_by_target = [
+                action for action in actions if any(target in allowed_targets for target in action.applies_to)
+            ]
+            analysis.allowed_families = sorted({action.family for action in actions_by_target})
+            available_actions = _apply_confidence_policy(actions_by_target, analysis, policy)
+        else:
+            available_actions = _apply_confidence_policy(actions, analysis, policy)
+        eligible_actions = filter_actions(available_actions, ctx, analysis.allowed_families, policy)
+        analysis.allowed_families = sorted({action.family for action in eligible_actions})
         allowed_after_confidence = sorted({action.family for action in available_actions})
         if analysis.allowed_families:
             analysis.allowed_families = sorted(
@@ -369,61 +271,92 @@ def run_optimization(
                 "event": "analysis",
                 "agent": "AnalystAgent",
                 "iteration": iteration,
-                "bottlenecks": analysis.bottlenecks,
+                "bottleneck": analysis.bottleneck,
                 "allowed_families": analysis.allowed_families,
                 "confidence": analysis.confidence,
+                "rationale": analysis.rationale,
             }
         )
         if reporter:
             reporter.analysis(
-                bottlenecks=analysis.bottlenecks,
+                bottlenecks=[analysis.bottleneck],
                 allowed_families=analysis.allowed_families,
-                confidence=analysis.confidence,
+                confidence=f"{analysis.confidence:.2f}",
+                rationale=analysis.rationale,
             )
-        tested_actions = [exp.action.action_id for exp in memory.experiments if exp.action]
-        candidates = optimizer.propose(
+        availability: Dict[str, int] = {}
+        for action in eligible_actions:
+            if action.action_id in tested_actions:
+                continue
+            availability[action.family] = availability.get(action.family, 0) + 1
+        plan = planner.plan(iteration, analysis, job.budgets, history_summary, availability)
+        trace_events.append(
+            {
+                "event": "plan",
+                "agent": "PlannerAgent",
+                "iteration": iteration,
+                "plan": plan.model_dump(),
+            }
+        )
+        if reporter:
+            reporter.plan_summary(plan)
+
+        candidate_lists = optimizer.propose(
             actions=available_actions,
             ctx=ctx,
-            allowed_families=analysis.allowed_families,
-            top_k=top_k,
-            selection_mode=selection_mode,
-            direction_top_k=direction_top_k,
-            profile=memory.best.profile_report if memory.best else baseline_exp.profile_report,
+            plan=plan,
             policy=policy,
+            profile=memory.best.profile_report if memory.best else baseline_exp.profile_report,
             exclude_action_ids=tested_actions,
-            trace_events=trace_events,
-            iteration=iteration,
         )
+        candidate_ids: List[str] = []
+        for candidate_list in candidate_lists:
+            candidate_ids.extend([action.action_id for action in candidate_list.candidates])
         trace_events.append(
             {
                 "event": "candidate_proposal",
                 "agent": "OptimizerAgent",
                 "iteration": iteration,
-                "ranking_mode": optimizer.last_ranking_mode,
                 "selection_mode": selection_mode,
                 "allowed_families": analysis.allowed_families,
                 "analysis_confidence": analysis.confidence,
-                "candidate_action_ids": [action.action_id for action in candidates],
+                "candidate_action_ids": candidate_ids,
+            }
+        )
+        ranked = ranker.rank(candidate_lists, ctx, policy, profile_ref)
+        ranked_actions = [item.action for item in ranked.ranked]
+        rank_limit = min(plan.max_candidates, top_k, max(len(ranked_actions), 1))
+        ranked_actions = ranked_actions[:rank_limit]
+        trace_events.append(
+            {
+                "event": "ranked_actions",
+                "agent": "RouterRankerAgent",
+                "iteration": iteration,
+                "ranked_action_ids": [action.action_id for action in ranked_actions],
+                "rejected_action_ids": [item.action_id for item in ranked.rejected],
+                "scoring_notes": ranked.scoring_notes,
             }
         )
         if reporter:
             reporter.candidates(
-                actions=candidates,
-                ranking_mode=optimizer.last_ranking_mode,
+                actions=ranked_actions,
+                ranking_mode=ranked.scoring_notes or "heuristic",
                 selection_mode=selection_mode,
-                llm_explanation=optimizer.last_llm_trace.get("explanation") if optimizer.last_llm_trace else None,
-        )
-        if not candidates:
+                llm_explanation=None,
+            )
+            reporter.rank_summary(ranked)
+        if not ranked_actions:
             if reporter:
-                reporter.stop("no candidates after policy filtering")
+                reporter.stop("无可执行候选")
             break
 
         iteration_experiments: List[ExperimentIR] = []
-        for action in candidates:
+        candidate_repeats = max(1, plan.evaluation.candidate_repeats_stage1)
+        for action in ranked_actions:
             if state.run_count >= job.budgets.max_runs:
                 break
             exp_id = f"iter{iteration}-{action.action_id}"
-            exp = _run_experiment(
+            exp = executor.execute(
                 exp_id=exp_id,
                 job=job,
                 action=action,
@@ -435,7 +368,7 @@ def run_optimization(
                 artifacts_dir=artifacts_dir,
                 time_command=time_command,
                 build_cfg=build_cfg or {},
-                repeats=1,
+                repeats=candidate_repeats,
                 runtime_agg="mean",
                 baseline_exp=baseline_exp,
                 baseline_runtime=baseline_exp.results.runtime_seconds,
@@ -443,7 +376,7 @@ def run_optimization(
                 trace_events=trace_events,
                 parent_run_id=baseline_exp.run_id,
                 iteration=iteration,
-                llm_trace=optimizer.last_llm_trace,
+                llm_trace=None,
                 reporter=reporter,
             )
             memory.record(exp)
@@ -451,6 +384,15 @@ def run_optimization(
             state.run_count += 1
             if exp.verdict == "FAIL":
                 state.fail_count += 1
+                failure = triage.classify(exp, artifacts_dir / "runs" / exp.run_id)
+                trace_events.append(
+                    {
+                        "event": "triage",
+                        "agent": "TriageAgent",
+                        "run_id": exp.run_id,
+                        "summary": failure.model_dump(),
+                    }
+                )
             _append_run_index(artifacts_dir, exp, parent_run_id=baseline_exp.run_id, iteration=iteration)
 
         llm_iteration_summary = None
@@ -458,7 +400,7 @@ def run_optimization(
             llm_iteration_summary = _build_llm_iteration_summary_zh(
                 iteration=iteration,
                 analysis=analysis,
-                candidates=candidates,
+                candidates=ranked_actions,
                 experiments=iteration_experiments,
                 baseline=baseline_exp,
                 llm_client=llm_client,
@@ -477,11 +419,11 @@ def run_optimization(
                 artifacts_dir=artifacts_dir,
                 iteration=iteration,
                 analysis=analysis,
-                candidates=candidates,
+                candidates=ranked_actions,
                 experiments=iteration_experiments,
                 baseline=baseline_exp,
-                llm_enabled=optimizer.last_ranking_mode == "llm",
-                llm_trace=optimizer.last_llm_trace,
+                llm_enabled=bool(llm_client and llm_client.config.enabled),
+                llm_trace=None,
                 llm_summary_zh=llm_iteration_summary,
             )
             if reporter:
@@ -506,7 +448,7 @@ def run_optimization(
     ):
         repeats = validate_top1_repeats
         exp_id = f"{memory.best.exp_id}-validate"
-        validation_exp = _run_experiment(
+        validation_exp = executor.execute(
             exp_id=exp_id,
             job=job,
             action=memory.best.action,
@@ -561,7 +503,7 @@ def run_optimization(
             }
         )
     agent_trace_path = _write_agent_trace(artifacts_dir, trace_events)
-    report_info = write_report(
+    report_info = reporter_agent.write(
         memory.experiments,
         baseline_exp,
         memory.best,
@@ -1171,7 +1113,7 @@ def _build_llm_iteration_summary_zh(
         "iteration": iteration,
         "baseline_runtime_seconds": baseline.results.runtime_seconds,
         "analysis": {
-            "bottlenecks": analysis.bottlenecks,
+            "bottleneck": analysis.bottleneck,
             "allowed_families": analysis.allowed_families,
             "confidence": analysis.confidence,
         },
@@ -1236,17 +1178,6 @@ def _read_file_preview(path: Optional[str], max_bytes: int) -> Optional[Dict[str
     else:
         text = file_path.read_text(encoding="utf-8", errors="replace")
     return {"text": text, "size_bytes": size, "truncated": truncated}
-
-
-def _rank_with_llm_ids(
-    actions: List[ActionIR],
-    profile: ProfileReport,
-    llm_ids: List[str],
-) -> List[ActionIR]:
-    if not llm_ids:
-        return rank_actions(actions, profile)
-    order = {action_id: idx for idx, action_id in enumerate(llm_ids)}
-    return sorted(actions, key=lambda a: (order.get(a.action_id, len(order)), a.action_id))
 
 
 def _select_direction_families(actions: List[ActionIR], profile: ProfileReport) -> List[str]:
@@ -1463,9 +1394,9 @@ def _write_iteration_summary(
         f"# Iteration {iteration:03d} Summary",
         "",
         "## Analysis",
-        f"- Bottlenecks: {', '.join(analysis.bottlenecks)}",
+        f"- Bottleneck: {analysis.bottleneck}",
         f"- Allowed families: {', '.join(analysis.allowed_families)}",
-        f"- Profiling confidence: {analysis.confidence}",
+        f"- Profiling confidence: {analysis.confidence:.2f}",
         f"- Ranking mode: {'llm' if llm_enabled else 'heuristic'}",
         "",
         "## Candidates",
@@ -1536,9 +1467,9 @@ def _build_iteration_summary_zh(
         f"# 第 {iteration:03d} 轮摘要",
         "",
         "## 分析",
-        f"- 瓶颈: {', '.join(analysis.bottlenecks)}",
+        f"- 瓶颈: {analysis.bottleneck}",
         f"- 允许动作族: {', '.join(analysis.allowed_families)}",
-        f"- 画像置信度: {analysis.confidence}",
+        f"- 画像置信度: {analysis.confidence:.2f}",
         f"- 排序模式: {'llm' if llm_enabled else 'heuristic'}",
         "",
         "## 候选动作",

@@ -1,0 +1,15 @@
+from __future__ import annotations
+
+from typing import Dict, List
+
+from pydantic import BaseModel, Field
+
+
+class AnalysisResult(BaseModel):
+    bottleneck: str
+    allowed_families: List[str] = Field(default_factory=list)
+    allowed_transforms: List[str] = Field(default_factory=list)
+    forbidden_transforms: List[str] = Field(default_factory=list)
+    risk_overrides: Dict[str, object] = Field(default_factory=dict)
+    confidence: float = 0.0
+    rationale: str = ""

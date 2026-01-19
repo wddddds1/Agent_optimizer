@@ -1,0 +1,18 @@
+version: 1
+defaults:
+  max_candidates: 3
+  evaluation:
+    baseline_repeats: 1
+    candidate_repeats_stage0: 1
+    candidate_repeats_stage1: 1
+    top1_validation_repeats: 0
+    use_successive_halving: false
+  fuse_rules:
+    max_compile_fails: 2
+    max_runtime_fails: 3
+    cooldown_rounds: 1
+    fallback_family: "run_config"
+  stop_plan:
+    max_iterations: null
+    min_relative_gain: 0.0
+    patience_rounds: 2

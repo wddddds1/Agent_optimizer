@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, TextIO, Tuple
 
 from schemas.action_ir import ActionIR
+from schemas.plan_ir import PlanIR
+from schemas.ranking_ir import RankedActions
 from schemas.experiment_ir import ExperimentIR
 from schemas.job_ir import JobIR
 from schemas.profile_report import ProfileReport
@@ -56,16 +58,38 @@ class ConsoleUI:
         )
         self._print("")
 
-    def analysis(self, bottlenecks: List[str], allowed_families: List[str], confidence: str) -> None:
+    def analysis(
+        self,
+        bottlenecks: List[str],
+        allowed_families: List[str],
+        confidence: str,
+        rationale: Optional[str] = None,
+    ) -> None:
         if not self.enabled:
             return
         self._section("分析")
+        rationale = rationale or "无"
         self._agent(
             "AnalystAgent",
             [
                 f"瓶颈: {', '.join(bottlenecks) if bottlenecks else '无'}",
                 f"允许动作族: {', '.join(allowed_families) if allowed_families else '无'}",
                 f"画像置信度: {confidence}",
+                f"理由: {rationale}",
+            ],
+        )
+
+    def plan_summary(self, plan: PlanIR) -> None:
+        if not self.enabled:
+            return
+        self._section("计划")
+        self._agent(
+            "PlannerAgent",
+            [
+                f"选择方向: {', '.join(plan.chosen_families) if plan.chosen_families else '无'}",
+                f"候选上限: {plan.max_candidates}",
+                f"Top1 复跑: {plan.evaluation.top1_validation_repeats}",
+                f"理由: {plan.reason}",
             ],
         )
 
@@ -97,6 +121,19 @@ class ConsoleUI:
                     self._print(f"     描述: {action.description}")
         if llm_explanation:
             self._agent("OptimizerAgent", ["LLM 解释:"] + _split_lines(llm_explanation, "  - "))
+
+    def rank_summary(self, ranked: RankedActions) -> None:
+        if not self.enabled:
+            return
+        self._section("排序结果")
+        self._agent(
+            "RouterRankerAgent",
+            [
+                f"候选数: {len(ranked.ranked)}",
+                f"被拒绝: {len(ranked.rejected)}",
+                f"说明: {ranked.scoring_notes or 'heuristic'}",
+            ],
+        )
 
     def run_start(
         self,

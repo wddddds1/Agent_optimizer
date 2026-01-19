@@ -107,10 +107,10 @@ class LLMClient:
         prompt = (
             "你是性能优化审计员。请根据给定实验数据，输出一个 JSON 对象，包含以下键：\n"
             "- experiment_reasons: {run_id: 中文简要原因}\n"
-            "- experiment_details: {run_id: 中文详细分析段落（不少于4句）}\n"
+            "- experiment_details: {run_id: 中文详细分析段落（不少于4句，需包含：做了什么、为什么、预期、实测结果与简短结论）}\n"
             "- overall_analysis: [\"中文分析句子\", ...] (3-6 条)\n"
             "- selection_reason: \"中文简要说明为什么最终选择该优化\"\n"
-            "要求：只输出 JSON，不要 markdown，不要额外文字。原因要简短、具体、可解释。"
+            "要求：只输出 JSON，不要 markdown，不要额外文字。原因要简短、具体、可解释；不要编造未给出的数据。"
         )
         response = self.client.chat.completions.create(
             model=self.config.model,
@@ -133,10 +133,10 @@ class LLMClient:
         prompt = (
             "你是性能优化审计员。请根据给定本轮迭代数据，输出一个 JSON 对象，包含以下键：\n"
             "- experiment_reasons: {run_id: 中文简要原因}\n"
-            "- experiment_details: {run_id: 中文详细分析段落（不少于4句）}\n"
+            "- experiment_details: {run_id: 中文详细分析段落（不少于4句，需包含：做了什么、为什么、预期、实测结果与简短结论）}\n"
             "- summary_lines: [\"中文分析句子\", ...] (2-5 条)\n"
             "- selection_reason: \"中文简要说明本轮为什么选择该最优配置\"\n"
-            "要求：只输出 JSON，不要 markdown，不要额外文字。原因要简短、具体、可解释。"
+            "要求：只输出 JSON，不要 markdown，不要额外文字。原因要简短、具体、可解释；不要编造未给出的数据。"
         )
         response = self.client.chat.completions.create(
             model=self.config.model,
@@ -145,6 +145,25 @@ class LLMClient:
             messages=[
                 {"role": "system", "content": "Return only JSON."},
                 {"role": "user", "content": prompt + "\n\nPayload:\n" + json.dumps(payload)},
+            ],
+        )
+        content = response.choices[0].message.content.strip()
+        data = _safe_json_loads(content)
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    def request_json(self, prompt: str, payload: Dict[str, object]) -> Optional[Dict[str, object]]:
+        if not self.client:
+            return None
+        message = prompt.rstrip() + "\n\nPayload:\n" + json.dumps(payload, ensure_ascii=False)
+        response = self.client.chat.completions.create(
+            model=self.config.model,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+            messages=[
+                {"role": "system", "content": "Return only JSON. No markdown or extra text."},
+                {"role": "user", "content": message},
             ],
         )
         content = response.choices[0].message.content.strip()

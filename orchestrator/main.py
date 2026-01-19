@@ -80,6 +80,10 @@ def main() -> None:
         actions = load_action_space(config_dir / "action_space.yaml")
     policy = load_policy(config_dir / "policy.yaml")
     gates = load_gates(config_dir / "gates.yaml")
+    planner_cfg = {}
+    planner_path = config_dir / "planner.yaml"
+    if planner_path.exists():
+        planner_cfg = yaml.safe_load(planner_path.read_text(encoding="utf-8")).get("defaults", {})
 
     llm_cfg_raw = env_cfg.get("llm", {})
     llm_config = LLMConfig(
@@ -116,6 +120,7 @@ def main() -> None:
         selection_mode=selection_mode,
         direction_top_k=int(env_cfg.get("direction_top_k", env_cfg.get("top_k", 5))),
         llm_client=llm_client,
+        planner_cfg=planner_cfg,
         reporter=reporter,
         build_cfg=env_cfg.get("build", {}),
         baseline_repeats=int(env_cfg.get("experiment", {}).get("baseline_repeats", 1)),
