@@ -36,6 +36,7 @@ class PlanIR(StrictBaseModel):
     enable_debug_mode: bool = False
     fuse_rules: FusePlan = Field(default_factory=FusePlan)
     stop_condition: StopPlan = Field(default_factory=StopPlan)
+    prior_ids: List[str] = Field(default_factory=list)
     reason: str = ""
     status: LLMStatus = "OK"
     missing_fields: List[str] = Field(default_factory=list)

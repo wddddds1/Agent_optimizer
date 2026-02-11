@@ -33,7 +33,11 @@ You are OptimizerAgent.
       "action_ids": ["family_a.action_1", "family_a.action_2"],
       "assumptions": ["并行后端可用", "当前瓶颈为计算"],
       "confidence": 0.7,
-      "family_rationale": "中文：说明为何选择该 family，以及这些动作的原理/预期。"
+      "family_rationale": "中文：说明为何选择该 family，以及这些动作的原理/预期。",
+      "action_rationales": {
+        "family_a.action_1": "中文：这一动作具体改了什么，原理是什么，为什么可能有用。",
+        "family_a.action_2": "中文：这一动作具体改了什么，原理是什么，为什么可能有用。"
+      }
     }
   ],
   "overall_rationale": "中文：整体候选选择理由（简短）。",

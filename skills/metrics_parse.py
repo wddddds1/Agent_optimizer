@@ -7,10 +7,14 @@ from typing import Dict, List
 def parse_lammps_timing(log_text: str) -> Dict[str, float]:
     breakdown: Dict[str, float] = {}
     loop_total = None
-    loop_match = re.search(r"Loop time of\s+([0-9.]+)\s+on", log_text)
-    if loop_match:
-        loop_total = float(loop_match.group(1))
+    loop_matches = re.findall(r"Loop time of\s+([0-9.]+)\s+on", log_text)
+    if loop_matches:
+        loop_total = float(loop_matches[-1])
         breakdown["total"] = loop_total
+    wall_matches = re.findall(r"Total wall time:\s+([0-9]+):([0-9]+):([0-9]+)", log_text)
+    if wall_matches:
+        hours, minutes, seconds = wall_matches[-1]
+        breakdown["wall_total"] = float(hours) * 3600.0 + float(minutes) * 60.0 + float(seconds)
 
     lines = log_text.splitlines()
     in_table = False
@@ -65,6 +69,16 @@ def parse_time_output(time_text: str) -> Dict[str, float]:
             metrics["block_in"] = value
         elif label.startswith("block output operations"):
             metrics["block_out"] = value
+        elif label.startswith("instructions retired"):
+            metrics["instructions_retired"] = value
+        elif label.startswith("cycles elapsed"):
+            metrics["cycles_elapsed"] = value
+        elif label.startswith("peak memory footprint"):
+            metrics["peak_memory_bytes"] = value
+        elif label.startswith("voluntary context switches"):
+            metrics["voluntary_ctx_switches"] = value
+        elif label.startswith("involuntary context switches"):
+            metrics["involuntary_ctx_switches"] = value
         elif label.startswith("real"):
             metrics["time_real_sec"] = value
         elif label.startswith("user"):
@@ -136,9 +150,8 @@ def parse_thermo_series(log_text: str, max_rows: int = 0) -> Dict[str, List[floa
     if max_rows and len(rows) > max_rows:
         rows = rows[-max_rows:]
     series: Dict[str, List[float]] = {}
+    # Include Step column so callers can align by timestep
     for idx, key in enumerate(header):
-        if key == "Step":
-            continue
         series[key] = [row[idx] for row in rows]
     return series
 

@@ -16,7 +16,9 @@ def profile_job(
     workdir: Path,
     artifacts_dir: Path,
     time_command: Optional[str],
+    wrapper_command: Optional[list[str]] = None,
     repeats: int = 1,
+    launcher_cfg: Optional[Dict[str, object]] = None,
 ) -> tuple[RunOutput, ProfileReport]:
     run_output = run_job(
         job=job,
@@ -25,7 +27,9 @@ def profile_job(
         workdir=workdir,
         artifacts_dir=artifacts_dir,
         time_command=time_command,
+        wrapper_command=wrapper_command,
         repeats=repeats,
+        launcher_cfg=launcher_cfg,
     )
 
     log_text = ""

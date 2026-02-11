@@ -12,7 +12,7 @@ def _gates():
     return {
         "runtime": {"require_exit_code_zero": True, "error_regex": "ERROR"},
         "correctness": {
-            "allow_skip_for_low_risk_run_config": True,
+            "allow_skip_for_low_risk_run_config": False,
             "baseline_require_thermo": True,
             "scalar_thresholds": {"abs": 1e-6, "rel": 1e-5},
             "series_compare": {"window": 10, "abs_max": 1e-5, "rel_max": 1e-4},
@@ -94,7 +94,6 @@ def test_runtime_gate_pass():
     )
     verdict = verify_run(_job(), action, result, profile, _gates(), _baseline_exp())
     assert verdict.verdict == "PASS"
-    assert "correctness_skipped_reason" in verdict.correctness_metrics
 
 
 def test_correctness_requires_baseline_for_input_edit():

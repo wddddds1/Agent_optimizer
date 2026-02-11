@@ -36,11 +36,12 @@
 
 1. Baseline (if needed): run N times, compute median/variance; store BaselineStats.
 2. ProfilerAgent: parse artifacts -> ProfileReport.
-3. AnalystAgent: ProfileReport + History -> AnalysisResult (allowed families/transforms).
-4. PlannerAgent: AnalysisResult + Budget + Cost model -> PlanIR (which family, how many candidates, evaluation strategy).
-5. OptimizerAgent: PlanIR + Policy + (optional code context) -> CandidateList[ActionIR] (2–5 representative actions).
-6. RouterRankerAgent: policy-filter + dedupe + score -> RankedActions (top-K).
-7. For each action in RankedActions (until budget):
+3. PlannerAgent: ProfileReport + History -> AnalysisResult + PlanIR (which family, how many candidates, evaluation strategy).
+4. IdeaAgent: propose optimization ideas (direction + mechanism) from evidence.
+5. ActionSynthAgent: convert ideas into temporary ActionIR candidates.
+6. OptimizerAgent: PlanIR + Policy + (optional code context) -> CandidateList[ActionIR] (2–5 representative actions).
+7. RouterRankerAgent: policy-filter + dedupe + score -> RankedActions (top-K).
+8. For each action in RankedActions (until budget):
    a) ExecutorAgent: apply action via skills (patch/build/run/collect) -> RunResult.
    b) VerifierAgent: deterministic gates -> VerificationResult.
    c) TriageAgent (only on FAIL/exception): classify failure -> FailureSummary; may trigger debug mode/fuse rules.
@@ -49,7 +50,7 @@
 
 ---
 
-## 3. Agents (8 Total)
+## 3. Agents
 
 ### Shared Contract for ALL Agents
 - Input: a structured `ContextBundle` assembled by Orchestrator (see §4).
@@ -103,39 +104,7 @@ ProfileSignals:
 
 ---
 
-### 3.2 AnalystAgent (LLM-assisted, constrained)
-**Purpose**: Convert evidence into allowed optimization directions and risk constraints.
-
-**When called**: every iteration after ProfileReport.
-
-**Inputs**
-- `ProfileReport`
-- `HistorySummary` (recent gains/fails/cost by family)
-- `PolicySnapshot` (available families, hard constraints)
-- `CaseSuiteSpec` (primary/guard, tags)
-
-**Output IR: `AnalysisResult`**
-Required fields:
-- `bottleneck: ...` (same enum as ProfileReport)
-- `allowed_families: list[FamilyId]` (subset of ["run_config","build_config","source_patch"])
-- `allowed_transforms: list[str]` (for source_patch; e.g., "hoist_invariant","math_simplify")
-- `forbidden_transforms: list[str]`
-- `risk_overrides: dict[str,Any]` (e.g., {"fastmath": "forbid", "lto": "allow"})
-- `confidence: float`
-- `rationale: str` (short, grounded in evidence)
-
-**Boundary**
-- Must not output specific actions/patches. Only “what directions are allowed now”.
-
-**Prompt must include**
-- Role & scope
-- Evidence-only rule
-- Output schema (JSON)
-- Conservative behavior under low confidence
-
----
-
-### 3.3 PlannerAgent (Deterministic decision; optional LLM explanation)
+### 3.2 PlannerAgent (Deterministic decision; optional LLM explanation)
 **Purpose**: Choose *one* optimization family (or two max) and allocate budget/evaluation strategy.
 
 **When called**: after AnalysisResult.
@@ -501,7 +470,7 @@ For every run_id:
 ## 8. Default File Layout
 
 - `prompts/system.md`
-- `prompts/agents/{profiler,analyst,planner,optimizer,ranker,executor,verifier,triage,reporter}.md`
+- `prompts/agents/{profiler,planner,idea,action_synth,optimizer,ranker,executor,verifier,triage,reporter}.md`
 - `schemas/` Pydantic models for all IRs listed above
 - `orchestrator/graph.py` deterministic state machine
 - `orchestrator/agents/*.py` wrappers that call LLM or deterministic logic
@@ -513,6 +482,11 @@ For every run_id:
 
 ## 9. Minimal LLM Usage Policy
 
-- LLM-required agents: AnalystAgent (optional), OptimizerAgent (required), TriageAgent (optional), ReporterAgent (optional)
+- LLM-required agents: OptimizerAgent (required), IdeaAgent (optional), ActionSynthAgent (optional), TriageAgent (optional), ReporterAgent (optional)
 - LLM-prohibited for decision authority: Orchestrator, VerifierAgent, skills, gates
 - All LLM outputs must be JSON that validates against IR schema; otherwise treat as FAIL and fallback or request more context.
+### 3.3 IdeaAgent (LLM-assisted idea discovery)
+**Purpose**: Propose optimization ideas from evidence; no execution.
+
+### 3.4 ActionSynthAgent (LLM-assisted action synthesis)
+**Purpose**: Convert ideas into temporary ActionIR candidates; must pass policy/adapter checks.

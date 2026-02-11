@@ -1,34 +1,183 @@
 families:
-  - id: omp_threads
-    description: "Adjust OpenMP thread count."
+  - id: parallel_omp
+    description: "OpenMP parallel strategy (threads + binding)."
     expected_effect: ["compute_opt", "mem_locality"]
-  - id: omp_binding
-    description: "Adjust OpenMP binding policy."
+  - id: runtime_backend_select
+    description: "Select runtime backend (execution path switch)."
+    expected_effect: ["compute_opt"]
+  - id: affinity_tune
+    description: "Adjust thread binding and placement."
     expected_effect: ["mem_locality", "imbalance_reduce"]
-  - id: omp_places
-    description: "Adjust OpenMP places."
-    expected_effect: ["mem_locality"]
-  - id: omp_dynamic
-    description: "Toggle OpenMP dynamic threading."
-    expected_effect: ["imbalance_reduce"]
-  - id: omp_wait_policy
+  - id: wait_policy
     description: "Adjust OpenMP wait policy."
     expected_effect: ["compute_opt"]
-  - id: build_config
-    description: "Build configuration changes (compiler flags, toolchain)."
+  - id: sched_granularity
+    description: "Adjust OpenMP schedule policy."
+    expected_effect: ["imbalance_reduce"]
+  - id: runtime_lib
+    description: "Runtime allocator/library tuning."
     expected_effect: ["compute_opt"]
+  - id: comm_tune
+    description: "Communication runtime tuning."
+    expected_effect: ["comm_reduce"]
+  - id: io_tune
+    description: "I/O runtime tuning."
+    expected_effect: ["io_reduce"]
+  - id: neighbor_tune
+    description: "Neighbor list rebuild tuning."
+    expected_effect: ["comm_reduce", "mem_locality"]
+  - id: output_tune
+    description: "Output frequency tuning."
+    expected_effect: ["io_reduce"]
+  - id: accuracy_tune
+    description: "Accuracy/performance tradeoff tuning."
+    expected_effect: ["compute_opt"]
+  - id: load_balance
+    description: "Load balancing and scheduling tuning."
+    expected_effect: ["imbalance_reduce"]
+  - id: lib_threading
+    description: "Math/IO library threading policy."
+    expected_effect: ["compute_opt"]
+  - id: build_config
+    description: "Build configuration packs."
+    expected_effect: ["compute_opt"]
+  - id: parallel_mpi
+    description: "MPI rank count and process decomposition."
+    expected_effect: ["compute_opt", "comm_reduce"]
+    risk_level: "low"
+    applies_to: ["run_config"]
+    gates: ["runtime", "correctness", "variance"]
+
+  - id: mpi_omp_hybrid
+    description: "MPI+OpenMP hybrid parallelism (rank x thread combinations)."
+    expected_effect: ["compute_opt", "mem_locality", "comm_reduce"]
+    risk_level: "medium"
+    applies_to: ["run_config"]
+    gates: ["runtime", "correctness", "variance"]
+
   - id: source_patch
     description: "Source code patches (requires rebuild)."
-    expected_effect: ["compute_opt"]
+    expected_effect: ["compute_opt", "mem_locality", "comm_reduce", "imbalance_reduce"]
 
 actions:
-  - action_id: omp_threads_1
-    family: omp_threads
-    description: "Set OMP_NUM_THREADS=1 (serial baseline)."
+  - action_id: parallel_omp.template_close_cores
+    family: parallel_omp
+    description: "OMP={threads}, bind close, places cores."
     applies_to: ["run_config"]
     parameters:
       env:
-        OMP_NUM_THREADS: "1"
+        OMP_NUM_THREADS: "{threads}"
+        OMP_PROC_BIND: "close"
+        OMP_PLACES: "cores"
+        OMP_DYNAMIC: "false"
+      backend_enable: "openmp"
+      template_id: "close_cores"
+      dynamic_threads: true
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: parallel_omp.template_spread_cores
+    family: parallel_omp
+    description: "OMP={threads}, bind spread, places cores."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "{threads}"
+        OMP_PROC_BIND: "spread"
+        OMP_PLACES: "cores"
+        OMP_DYNAMIC: "false"
+      backend_enable: "openmp"
+      template_id: "spread_cores"
+      dynamic_threads: true
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: parallel_omp.template_close_threads
+    family: parallel_omp
+    description: "OMP={threads}, bind close, places threads."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "{threads}"
+        OMP_PROC_BIND: "close"
+        OMP_PLACES: "threads"
+        OMP_DYNAMIC: "false"
+      backend_enable: "openmp"
+      template_id: "close_threads"
+      dynamic_threads: true
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: parallel_omp.template_spread_threads
+    family: parallel_omp
+    description: "OMP={threads}, bind spread, places threads."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "{threads}"
+        OMP_PROC_BIND: "spread"
+        OMP_PLACES: "threads"
+        OMP_DYNAMIC: "false"
+      backend_enable: "openmp"
+      template_id: "spread_threads"
+      dynamic_threads: true
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: parallel_omp.template_close_sockets
+    family: parallel_omp
+    description: "OMP={threads}, bind close, places sockets."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "{threads}"
+        OMP_PROC_BIND: "close"
+        OMP_PLACES: "sockets"
+        OMP_DYNAMIC: "false"
+      backend_enable: "openmp"
+      template_id: "close_sockets"
+      dynamic_threads: true
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: parallel_omp.dynamic_off
+    family: parallel_omp
+    description: "Disable OpenMP dynamic adjustment."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_DYNAMIC: "false"
+      backend_enable: "openmp"
     preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
@@ -38,13 +187,31 @@ actions:
       thresholds:
         variance_cv_max: 0.03
 
-  - action_id: omp_threads_2
-    family: omp_threads
-    description: "Set OMP_NUM_THREADS=2."
+  - action_id: parallel_omp.nested_on
+    family: parallel_omp
+    description: "Enable nested OpenMP."
     applies_to: ["run_config"]
     parameters:
       env:
-        OMP_NUM_THREADS: "2"
+        OMP_NESTED: "true"
+      backend_enable: "openmp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: parallel_omp.nested_off
+    family: parallel_omp
+    description: "Disable nested OpenMP."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NESTED: "false"
+      backend_enable: "openmp"
     preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
@@ -52,15 +219,50 @@ actions:
     verification_plan:
       gates: ["runtime", "variance"]
       thresholds:
-        variance_cv_max: 0.03
+        variance_cv_max: 0.05
 
-  - action_id: omp_threads_4
-    family: omp_threads
-    description: "Set OMP_NUM_THREADS=4."
+  - action_id: parallel_omp.max_active_levels_2
+    family: parallel_omp
+    description: "Set OMP_MAX_ACTIVE_LEVELS=2."
     applies_to: ["run_config"]
     parameters:
       env:
-        OMP_NUM_THREADS: "4"
+        OMP_MAX_ACTIVE_LEVELS: "2"
+      backend_enable: "openmp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: parallel_omp.max_active_levels_4
+    family: parallel_omp
+    description: "Set OMP_MAX_ACTIVE_LEVELS=4."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_MAX_ACTIVE_LEVELS: "4"
+      backend_enable: "openmp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: parallel_omp.stacksize_64m
+    family: parallel_omp
+    description: "Set OMP_STACKSIZE=64M."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_STACKSIZE: "64M"
+      backend_enable: "openmp"
     preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
@@ -68,15 +270,16 @@ actions:
     verification_plan:
       gates: ["runtime", "variance"]
       thresholds:
-        variance_cv_max: 0.03
+        variance_cv_max: 0.05
 
-  - action_id: omp_threads_8
-    family: omp_threads
-    description: "Set OMP_NUM_THREADS=8."
+  - action_id: parallel_omp.stacksize_128m
+    family: parallel_omp
+    description: "Set OMP_STACKSIZE=128M."
     applies_to: ["run_config"]
     parameters:
       env:
-        OMP_NUM_THREADS: "8"
+        OMP_STACKSIZE: "128M"
+      backend_enable: "openmp"
     preconditions: []
     constraints: []
     expected_effect: ["compute_opt"]
@@ -84,15 +287,16 @@ actions:
     verification_plan:
       gates: ["runtime", "variance"]
       thresholds:
-        variance_cv_max: 0.03
+        variance_cv_max: 0.05
 
-  - action_id: omp_proc_bind_close
-    family: omp_binding
-    description: "Set OMP_PROC_BIND=close."
+  - action_id: affinity_tune.bind_close
+    family: affinity_tune
+    description: "Set OMP_PROC_BIND=close and OMP_PLACES=cores."
     applies_to: ["run_config"]
     parameters:
       env:
         OMP_PROC_BIND: "close"
+        OMP_PLACES: "cores"
     preconditions: []
     constraints: []
     expected_effect: ["mem_locality"]
@@ -102,13 +306,14 @@ actions:
       thresholds:
         variance_cv_max: 0.03
 
-  - action_id: omp_proc_bind_spread
-    family: omp_binding
-    description: "Set OMP_PROC_BIND=spread."
+  - action_id: affinity_tune.bind_spread
+    family: affinity_tune
+    description: "Set OMP_PROC_BIND=spread and OMP_PLACES=cores."
     applies_to: ["run_config"]
     parameters:
       env:
         OMP_PROC_BIND: "spread"
+        OMP_PLACES: "cores"
     preconditions: []
     constraints: []
     expected_effect: ["imbalance_reduce"]
@@ -118,8 +323,8 @@ actions:
       thresholds:
         variance_cv_max: 0.03
 
-  - action_id: omp_proc_bind_true
-    family: omp_binding
+  - action_id: affinity_tune.bind_true
+    family: affinity_tune
     description: "Set OMP_PROC_BIND=true."
     applies_to: ["run_config"]
     parameters:
@@ -134,29 +339,13 @@ actions:
       thresholds:
         variance_cv_max: 0.03
 
-  - action_id: omp_proc_bind_false
-    family: omp_binding
+  - action_id: affinity_tune.bind_false
+    family: affinity_tune
     description: "Set OMP_PROC_BIND=false."
     applies_to: ["run_config"]
     parameters:
       env:
         OMP_PROC_BIND: "false"
-    preconditions: []
-    constraints: []
-    expected_effect: ["imbalance_reduce"]
-    risk_level: "low"
-    verification_plan:
-      gates: ["runtime", "variance"]
-      thresholds:
-        variance_cv_max: 0.03
-
-  - action_id: omp_places_cores
-    family: omp_places
-    description: "Set OMP_PLACES=cores."
-    applies_to: ["run_config"]
-    parameters:
-      env:
-        OMP_PLACES: "cores"
     preconditions: []
     constraints: []
     expected_effect: ["mem_locality"]
@@ -166,8 +355,8 @@ actions:
       thresholds:
         variance_cv_max: 0.03
 
-  - action_id: omp_places_threads
-    family: omp_places
+  - action_id: affinity_tune.places_threads
+    family: affinity_tune
     description: "Set OMP_PLACES=threads."
     applies_to: ["run_config"]
     parameters:
@@ -182,8 +371,8 @@ actions:
       thresholds:
         variance_cv_max: 0.03
 
-  - action_id: omp_places_sockets
-    family: omp_places
+  - action_id: affinity_tune.places_sockets
+    family: affinity_tune
     description: "Set OMP_PLACES=sockets."
     applies_to: ["run_config"]
     parameters:
@@ -198,40 +387,8 @@ actions:
       thresholds:
         variance_cv_max: 0.03
 
-  - action_id: omp_dynamic_on
-    family: omp_dynamic
-    description: "Enable OpenMP dynamic threads."
-    applies_to: ["run_config"]
-    parameters:
-      env:
-        OMP_DYNAMIC: "true"
-    preconditions: []
-    constraints: []
-    expected_effect: ["imbalance_reduce"]
-    risk_level: "low"
-    verification_plan:
-      gates: ["runtime", "variance"]
-      thresholds:
-        variance_cv_max: 0.03
-
-  - action_id: omp_dynamic_off
-    family: omp_dynamic
-    description: "Disable OpenMP dynamic threads."
-    applies_to: ["run_config"]
-    parameters:
-      env:
-        OMP_DYNAMIC: "false"
-    preconditions: []
-    constraints: []
-    expected_effect: ["compute_opt"]
-    risk_level: "low"
-    verification_plan:
-      gates: ["runtime", "variance"]
-      thresholds:
-        variance_cv_max: 0.03
-
-  - action_id: omp_wait_active
-    family: omp_wait_policy
+  - action_id: wait_policy.wait_active
+    family: wait_policy
     description: "Set OMP_WAIT_POLICY=active."
     applies_to: ["run_config"]
     parameters:
@@ -246,8 +403,8 @@ actions:
       thresholds:
         variance_cv_max: 0.03
 
-  - action_id: omp_wait_passive
-    family: omp_wait_policy
+  - action_id: wait_policy.wait_passive
+    family: wait_policy
     description: "Set OMP_WAIT_POLICY=passive."
     applies_to: ["run_config"]
     parameters:
@@ -261,3 +418,2438 @@ actions:
       gates: ["runtime", "variance"]
       thresholds:
         variance_cv_max: 0.03
+
+  - action_id: sched_granularity.static
+    family: sched_granularity
+    description: "Set OMP_SCHEDULE=static."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_SCHEDULE: "static"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: sched_granularity.dynamic
+    family: sched_granularity
+    description: "Set OMP_SCHEDULE=dynamic."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_SCHEDULE: "dynamic"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: sched_granularity.static_1
+    family: sched_granularity
+    description: "Set OMP_SCHEDULE=static,1."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_SCHEDULE: "static,1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: sched_granularity.dynamic_1
+    family: sched_granularity
+    description: "Set OMP_SCHEDULE=dynamic,1."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_SCHEDULE: "dynamic,1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: sched_granularity.guided
+    family: sched_granularity
+    description: "Set OMP_SCHEDULE=guided."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_SCHEDULE: "guided"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: sched_granularity.auto
+    family: sched_granularity
+    description: "Set OMP_SCHEDULE=auto."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_SCHEDULE: "auto"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.03
+
+  - action_id: runtime_lib.disable_nano
+    family: runtime_lib
+    description: "Disable small-object allocator for large allocations."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        MallocNanoZone: "0"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.enable_nano
+    family: runtime_lib
+    description: "Enable small-object allocator."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        MallocNanoZone: "1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.malloc_arena_1
+    family: runtime_lib
+    description: "Set MALLOC_ARENA_MAX=1."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        MALLOC_ARENA_MAX: "1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.malloc_arena_2
+    family: runtime_lib
+    description: "Set MALLOC_ARENA_MAX=2."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        MALLOC_ARENA_MAX: "2"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.malloc_arena_4
+    family: runtime_lib
+    description: "Set MALLOC_ARENA_MAX=4."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        MALLOC_ARENA_MAX: "4"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.malloc_trim_0
+    family: runtime_lib
+    description: "Set MALLOC_TRIM_THRESHOLD_=0."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        MALLOC_TRIM_THRESHOLD_: "0"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.kmp_blocktime_0
+    family: runtime_lib
+    description: "Set KMP_BLOCKTIME=0."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        KMP_BLOCKTIME: "0"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.kmp_blocktime_200
+    family: runtime_lib
+    description: "Set KMP_BLOCKTIME=200."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        KMP_BLOCKTIME: "200"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.kmp_affinity_compact
+    family: runtime_lib
+    description: "Set KMP_AFFINITY=granularity=fine,compact,1,0."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        KMP_AFFINITY: "granularity=fine,compact,1,0"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.kmp_affinity_scatter
+    family: runtime_lib
+    description: "Set KMP_AFFINITY=granularity=fine,scatter."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        KMP_AFFINITY: "granularity=fine,scatter"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.numa_interleave
+    family: runtime_lib
+    description: "Set NUMA policy to interleave."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        NUMA_POLICY: "interleave"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.numa_local
+    family: runtime_lib
+    description: "Set NUMA policy to local."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        NUMA_POLICY: "local"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.thp_always
+    family: runtime_lib
+    description: "Request transparent huge pages always."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        THP: "always"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.thp_never
+    family: runtime_lib
+    description: "Request transparent huge pages never."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        THP: "never"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.power_performance
+    family: runtime_lib
+    description: "Request performance CPU governor."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        CPU_GOVERNOR: "performance"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_lib.power_powersave
+    family: runtime_lib
+    description: "Request powersave CPU governor."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        CPU_GOVERNOR: "powersave"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.collective_algo_ring
+    family: comm_tune
+    description: "Prefer ring-style collective algorithm."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_tuning:
+        collective_algo: "ring"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.collective_algo_tree
+    family: comm_tune
+    description: "Prefer tree-style collective algorithm."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_tuning:
+        collective_algo: "tree"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.message_aggregation
+    family: comm_tune
+    description: "Enable message aggregation to reduce small-message overhead."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_tuning:
+        message_aggregation: "enabled"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.nonblocking_overlap
+    family: comm_tune
+    description: "Enable nonblocking overlap in MPI runtime."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_tuning:
+        nonblocking_overlap: "enabled"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.topology_mapping_aware
+    family: comm_tune
+    description: "Enable topology-aware mapping."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_tuning:
+        topology_mapping: "aware"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.async_enable
+    family: io_tune
+    description: "Enable asynchronous I/O path."
+    applies_to: ["run_config"]
+    parameters:
+      io_tuning:
+        async: "true"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.format_binary
+    family: io_tune
+    description: "Prefer binary I/O format."
+    applies_to: ["run_config"]
+    parameters:
+      io_tuning:
+        format: "binary"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.aggregator_auto
+    family: io_tune
+    description: "Auto-tune I/O aggregators."
+    applies_to: ["run_config"]
+    parameters:
+      io_tuning:
+        aggregator: "auto"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.checkpoint_compress
+    family: io_tune
+    description: "Enable checkpoint compression."
+    applies_to: ["run_config"]
+    parameters:
+      io_tuning:
+        checkpoint_compress: "true"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.romio_cb_nodes_4
+    family: io_tune
+    description: "ROMIO collective buffer nodes = 4."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_CB_NODES: "4"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.romio_cb_nodes_8
+    family: io_tune
+    description: "ROMIO collective buffer nodes = 8."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_CB_NODES: "8"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.romio_cb_read_enable
+    family: io_tune
+    description: "Enable ROMIO collective read."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_CB_READ: "enable"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.romio_cb_read_disable
+    family: io_tune
+    description: "Disable ROMIO collective read."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_CB_READ: "disable"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.romio_cb_write_enable
+    family: io_tune
+    description: "Enable ROMIO collective write."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_CB_WRITE: "enable"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.romio_cb_write_disable
+    family: io_tune
+    description: "Disable ROMIO collective write."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_CB_WRITE: "disable"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.romio_ds_read_disable
+    family: io_tune
+    description: "Disable ROMIO data sieving read."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_DS_READ: "disable"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.romio_ds_write_disable
+    family: io_tune
+    description: "Disable ROMIO data sieving write."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_DS_WRITE: "disable"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.stripe_count_4
+    family: io_tune
+    description: "File system stripe count = 4."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        LUSTRE_STRIPE_COUNT: "4"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.stripe_count_8
+    family: io_tune
+    description: "File system stripe count = 8."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        LUSTRE_STRIPE_COUNT: "8"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.stripe_size_4m
+    family: io_tune
+    description: "File system stripe size = 4M."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        LUSTRE_STRIPE_SIZE: "4194304"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.stripe_size_8m
+    family: io_tune
+    description: "File system stripe size = 8M."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        LUSTRE_STRIPE_SIZE: "8388608"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.collective_buffer_4m
+    family: io_tune
+    description: "Collective I/O buffer size = 4M."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_CB_BUFFER_SIZE: "4194304"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: io_tune.collective_buffer_16m
+    family: io_tune
+    description: "Collective I/O buffer size = 16M."
+    applies_to: ["run_config"]
+    parameters:
+      io_env:
+        ROMIO_CB_BUFFER_SIZE: "16777216"
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_3
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.3."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.3
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_2
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.2."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.2
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_25
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.25."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.25
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_35
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.35."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.35
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_4
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.4."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.4
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_45
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.45."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.45
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_5
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.5."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.5
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_55
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.55."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.55
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_6
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.6."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.6
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.skin_0_7
+    family: neighbor_tune
+    description: "Neighbor skin distance = 0.7."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_skin: 0.7
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.every_10
+    family: neighbor_tune
+    description: "Neighbor rebuild every 10 steps."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_every: 10
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.every_20
+    family: neighbor_tune
+    description: "Neighbor rebuild every 20 steps."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_every: 20
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.every_40
+    family: neighbor_tune
+    description: "Neighbor rebuild every 40 steps."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_every: 40
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: neighbor_tune.every_80
+    family: neighbor_tune
+    description: "Neighbor rebuild every 80 steps."
+    applies_to: ["input_script"]
+    parameters:
+      neighbor_every: 80
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: output_tune.thermo_100
+    family: output_tune
+    description: "Thermo output every 100 steps."
+    applies_to: ["input_script"]
+    parameters:
+      output_thermo_every: 100
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: output_tune.thermo_50
+    family: output_tune
+    description: "Thermo output every 50 steps."
+    applies_to: ["input_script"]
+    parameters:
+      output_thermo_every: 50
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: output_tune.thermo_200
+    family: output_tune
+    description: "Thermo output every 200 steps."
+    applies_to: ["input_script"]
+    parameters:
+      output_thermo_every: 200
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: output_tune.thermo_1000
+    family: output_tune
+    description: "Thermo output every 1000 steps."
+    applies_to: ["input_script"]
+    parameters:
+      output_thermo_every: 1000
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: output_tune.thermo_500
+    family: output_tune
+    description: "Thermo output every 500 steps."
+    applies_to: ["input_script"]
+    parameters:
+      output_thermo_every: 500
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: output_tune.dump_1000
+    family: output_tune
+    description: "Dump output every 1000 steps."
+    applies_to: ["input_script"]
+    parameters:
+      output_dump_every: 1000
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: output_tune.dump_500
+    family: output_tune
+    description: "Dump output every 500 steps."
+    applies_to: ["input_script"]
+    parameters:
+      output_dump_every: 500
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: output_tune.dump_2000
+    family: output_tune
+    description: "Dump output every 2000 steps."
+    applies_to: ["input_script"]
+    parameters:
+      output_dump_every: 2000
+    preconditions: []
+    constraints: []
+    expected_effect: ["io_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: accuracy_tune.kspace_acc_1e4
+    family: accuracy_tune
+    description: "kspace_modify accuracy 1e-4."
+    applies_to: ["input_script"]
+    parameters:
+      kspace_accuracy: "1.0e-4"
+    preconditions: ["input_contains:^kspace_modify\\s+"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: accuracy_tune.kspace_acc_1e5
+    family: accuracy_tune
+    description: "kspace_modify accuracy 1e-5."
+    applies_to: ["input_script"]
+    parameters:
+      kspace_accuracy: "1.0e-5"
+    preconditions: ["input_contains:^kspace_modify\\s+"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: accuracy_tune.kspace_acc_1e6
+    family: accuracy_tune
+    description: "kspace_modify accuracy 1e-6."
+    applies_to: ["input_script"]
+    parameters:
+      kspace_accuracy: "1.0e-6"
+    preconditions: ["input_contains:^kspace_modify\\s+"]
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.comm_cutoff_2_0
+    family: comm_tune
+    description: "comm_modify cutoff 2.0."
+    applies_to: ["input_script"]
+    parameters:
+      comm_cutoff: 2.0
+    preconditions: ["input_contains:^comm_modify\\s+"]
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.comm_cutoff_2_5
+    family: comm_tune
+    description: "comm_modify cutoff 2.5."
+    applies_to: ["input_script"]
+    parameters:
+      comm_cutoff: 2.5
+    preconditions: ["input_contains:^comm_modify\\s+"]
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.comm_cutoff_3_0
+    family: comm_tune
+    description: "comm_modify cutoff 3.0."
+    applies_to: ["input_script"]
+    parameters:
+      comm_cutoff: 3.0
+    preconditions: ["input_contains:^comm_modify\\s+"]
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.comm_mode_single
+    family: comm_tune
+    description: "comm_modify mode single."
+    applies_to: ["input_script"]
+    parameters:
+      comm_mode: "single"
+    preconditions: ["input_contains:^comm_modify\\s+"]
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.comm_mode_multi
+    family: comm_tune
+    description: "comm_modify mode multi."
+    applies_to: ["input_script"]
+    parameters:
+      comm_mode: "multi"
+    preconditions: ["input_contains:^comm_modify\\s+"]
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.newton_on
+    family: comm_tune
+    description: "newton on."
+    applies_to: ["input_script"]
+    parameters:
+      newton_setting: "on"
+    preconditions: ["input_contains:^newton\\s+"]
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.newton_off
+    family: comm_tune
+    description: "newton off."
+    applies_to: ["input_script"]
+    parameters:
+      newton_setting: "off"
+    preconditions: ["input_contains:^newton\\s+"]
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_coll_ring
+    family: comm_tune
+    description: "MPI collective algorithm ring."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_COLL_ALGO: "ring"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_coll_tree
+    family: comm_tune
+    description: "MPI collective algorithm tree."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_COLL_ALGO: "tree"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.ucx_tls_rc
+    family: comm_tune
+    description: "UCX transport rc,tcp."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        UCX_TLS: "rc,tcp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.ucx_tls_sm
+    family: comm_tune
+    description: "UCX transport sm,rc,tcp."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        UCX_TLS: "sm,rc,tcp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_eager_128k
+    family: comm_tune
+    description: "MPI eager limit 128k."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_EAGER_LIMIT: "131072"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_eager_256k
+    family: comm_tune
+    description: "MPI eager limit 256k."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_EAGER_LIMIT: "262144"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.shm_enable
+    family: comm_tune
+    description: "Enable MPI shared-memory transport."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_SHM_ENABLE: "1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.shm_disable
+    family: comm_tune
+    description: "Disable MPI shared-memory transport."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_SHM_ENABLE: "0"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_pin_on
+    family: comm_tune
+    description: "Enable MPI process pinning."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_PINNING: "1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_pin_off
+    family: comm_tune
+    description: "Disable MPI process pinning."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_PINNING: "0"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.ompi_pml_ucx
+    family: comm_tune
+    description: "OpenMPI PML=ucx."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        OMPI_MCA_pml: "ucx"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.ompi_pml_ob1
+    family: comm_tune
+    description: "OpenMPI PML=ob1."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        OMPI_MCA_pml: "ob1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.ompi_btl_vader
+    family: comm_tune
+    description: "OpenMPI BTL=vader,self."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        OMPI_MCA_btl: "vader,self"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.ompi_btl_tcp
+    family: comm_tune
+    description: "OpenMPI BTL=tcp,self."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        OMPI_MCA_btl: "tcp,self"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_ranks_2
+    family: comm_tune
+    description: "MPI ranks hint = 2."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_RANKS: "2"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_ranks_4
+    family: comm_tune
+    description: "MPI ranks hint = 4."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_RANKS: "4"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: comm_tune.mpi_ranks_8
+    family: comm_tune
+    description: "MPI ranks hint = 8."
+    applies_to: ["run_config"]
+    parameters:
+      mpi_env:
+        MPI_RANKS: "8"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: load_balance.partition_balanced
+    family: load_balance
+    description: "Select balanced partition strategy."
+    applies_to: ["run_config"]
+    parameters:
+      load_balance:
+        partition_strategy: "balanced"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: load_balance.partition_weighted
+    family: load_balance
+    description: "Select weighted partition strategy."
+    applies_to: ["run_config"]
+    parameters:
+      load_balance:
+        partition_strategy: "weighted"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: load_balance.schedule_dynamic
+    family: load_balance
+    description: "Enable dynamic scheduling to reduce imbalance."
+    applies_to: ["run_config"]
+    parameters:
+      load_balance:
+        schedule_policy: "dynamic"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: lib_threading.mkl_threads_1
+    family: lib_threading
+    description: "Limit MKL to 1 thread."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        MKL_NUM_THREADS: "1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: lib_threading.openblas_threads_1
+    family: lib_threading
+    description: "Limit OpenBLAS to 1 thread."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OPENBLAS_NUM_THREADS: "1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: lib_threading.fftw_threads_1
+    family: lib_threading
+    description: "Limit FFTW to 1 thread."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        FFTW_NUM_THREADS: "1"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: lib_threading.template_blas_threads
+    family: lib_threading
+    description: "Set BLAS/FFT libraries threads={threads}."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        MKL_NUM_THREADS: "{threads}"
+        OPENBLAS_NUM_THREADS: "{threads}"
+        FFTW_NUM_THREADS: "{threads}"
+        MKL_DYNAMIC: "false"
+        OPENBLAS_DYNAMIC: "0"
+      template_id: "blas_threads"
+      dynamic_threads: true
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.o3_native
+    family: build_config
+    description: "Build pack: O3 + native."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "o3_native"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.o2_conservative
+    family: build_config
+    description: "Build pack: O2 conservative."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "o2_conservative"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.o3_lto
+    family: build_config
+    description: "Build pack: O3 + LTO."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "o3_lto"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.o3_native_lto
+    family: build_config
+    description: "Build pack: O3 + native + LTO."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "o3_native_lto"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.fastmath
+    family: build_config
+    description: "Build pack: fast-math (strict correctness required)."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "fastmath"
+      numeric_risk: "high"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.o3_native_fastmath
+    family: build_config
+    description: "Build pack: O3 + native + fast-math."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "o3_native_fastmath"
+      numeric_risk: "high"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.o3_native_unroll
+    family: build_config
+    description: "Build pack: O3 + native + unroll loops."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "o3_native_unroll"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.o3_native_vec
+    family: build_config
+    description: "Build pack: O3 + native + vectorization flags."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "o3_native_vec"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.o3_native_fp_precise
+    family: build_config
+    description: "Build pack: O3 + native + precise FP contraction."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "o3_native_fp_precise"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.pgo_generate
+    family: build_config
+    description: "Build pack: PGO generate."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "pgo_generate"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.pgo_use
+    family: build_config
+    description: "Build pack: PGO use."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "pgo_use"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.pkg_openmp
+    family: build_config
+    description: "Enable OpenMP package."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "pkg_openmp"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.pkg_opt
+    family: build_config
+    description: "Enable OPT package."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "pkg_opt"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: build_config.pkg_opt_openmp
+    family: build_config
+    description: "Enable OPT + OpenMP packages."
+    applies_to: ["build_config"]
+    parameters:
+      build_pack_id: "pkg_opt_openmp"
+      numeric_risk: "low"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.loop_interchange_blocking
+    family: source_patch
+    description: "Patch: loop interchange/blocking for cache locality."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "loop_interchange_blocking"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.loop_fission
+    family: source_patch
+    description: "Patch: split optional/flag-guarded diagnostics into a second pass (avoid core updates)."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "loop_fission"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.loop_fusion
+    family: source_patch
+    description: "Patch: loop fusion to reduce passes."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "loop_fusion"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.array_packing
+    family: source_patch
+    description: "Patch: array packing for cache line reuse."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "array_packing"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.temporary_elision
+    family: source_patch
+    description: "Patch: eliminate temporaries and redundant stores."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "temporary_elision"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.cache_local_pointers
+    family: source_patch
+    description: "Patch: cache frequently accessed pointers locally."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "cache_local_pointers"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality", "compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.cache_local_pointers_multi
+    family: source_patch
+    description: "Patch: cache pointers across compute/inner/middle/outer."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "cache_local_pointers_multi"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality", "compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.loop_unroll
+    family: source_patch
+    description: "Patch: unroll hot inner loops."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "loop_unroll"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.prefetch_hints
+    family: source_patch
+    description: "Patch: add prefetch hints for predictable access."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "prefetch_hints"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.branch_simplify
+    family: source_patch
+    description: "Patch: simplify branches in hot loops."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "branch_simplify"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.alignment_hints
+    family: source_patch
+    description: "Patch: add alignment/contiguous hints."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "alignment_hints"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.vectorization_enablers
+    family: source_patch
+    description: "Patch: vectorization enablers for irregular access."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "vectorization_enablers"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.hoist_invariant
+    family: source_patch
+    description: "Patch: hoist loop-invariant computations."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "hoist_invariant"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.conditional_elision
+    family: source_patch
+    description: "Patch: move guarded updates inside conditionals."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "conditional_elision"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.precision_policy
+    family: source_patch
+    description: "Patch: localized precision policy adjustments."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "precision_policy"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.math_equivalence
+    family: source_patch
+    description: "Patch: math equivalence (pow->mul/fast exp)."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "math_equivalence"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.comm_frequency_merge
+    family: source_patch
+    description: "Patch: merge/reduce collective frequency."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "comm_frequency_merge"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.message_aggregation
+    family: source_patch
+    description: "Patch: aggregate small messages."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "message_aggregation"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.comm_overlap
+    family: source_patch
+    description: "Patch: overlap communication with computation."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "comm_overlap"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.nonblocking_overlap
+    family: source_patch
+    description: "Patch: nonblocking overlap for comm/compute."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "nonblocking_overlap"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.compute_comm_reorder
+    family: source_patch
+    description: "Patch: reorder compute/communication phases."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "compute_comm_reorder"
+    preconditions: []
+    constraints: []
+    expected_effect: ["comm_reduce"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.omp_scope_adjust
+    family: source_patch
+    description: "Patch: adjust OpenMP scope to inner loops."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "omp_scope_adjust"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.vectorization_hints
+    family: source_patch
+    description: "Patch: add vectorization hints."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "vectorization_hints"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.partitioning_rebalance
+    family: source_patch
+    description: "Patch: partitioning/load rebalance."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "partitioning_rebalance"
+    preconditions: []
+    constraints: []
+    expected_effect: ["imbalance_reduce"]
+    risk_level: "high"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+  # ──── Pure MPI rank actions ────
+
+  - action_id: parallel_mpi.ranks_2
+    family: parallel_mpi
+    description: "2 MPI ranks."
+    applies_to: ["run_config"]
+    parameters:
+      launcher: {type: "mpirun", np: 2, extra_args: []}
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "comm_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: parallel_mpi.ranks_4
+    family: parallel_mpi
+    description: "4 MPI ranks."
+    applies_to: ["run_config"]
+    parameters:
+      launcher: {type: "mpirun", np: 4, extra_args: []}
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "comm_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: parallel_mpi.ranks_8
+    family: parallel_mpi
+    description: "8 MPI ranks."
+    applies_to: ["run_config"]
+    parameters:
+      launcher: {type: "mpirun", np: 8, extra_args: []}
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "comm_reduce"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  # ──── MPI+OpenMP hybrid actions ────
+
+  - action_id: mpi_omp_hybrid.r2_t2
+    family: mpi_omp_hybrid
+    description: "2 ranks × 2 threads/rank."
+    applies_to: ["run_config"]
+    parameters:
+      launcher: {type: "mpirun", np: 2, extra_args: []}
+      backend_enable: "mpi_omp"
+      env:
+        OMP_NUM_THREADS: "2"
+        OMP_PROC_BIND: "close"
+        OMP_PLACES: "cores"
+      backend_threads: 2
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality", "comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: mpi_omp_hybrid.r2_t4
+    family: mpi_omp_hybrid
+    description: "2 ranks × 4 threads/rank."
+    applies_to: ["run_config"]
+    parameters:
+      launcher: {type: "mpirun", np: 2, extra_args: []}
+      backend_enable: "mpi_omp"
+      env:
+        OMP_NUM_THREADS: "4"
+        OMP_PROC_BIND: "close"
+        OMP_PLACES: "cores"
+      backend_threads: 4
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality", "comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: mpi_omp_hybrid.r4_t2
+    family: mpi_omp_hybrid
+    description: "4 ranks × 2 threads/rank."
+    applies_to: ["run_config"]
+    parameters:
+      launcher: {type: "mpirun", np: 4, extra_args: []}
+      backend_enable: "mpi_omp"
+      env:
+        OMP_NUM_THREADS: "2"
+        OMP_PROC_BIND: "close"
+        OMP_PLACES: "cores"
+      backend_threads: 2
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality", "comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: mpi_omp_hybrid.r4_t4
+    family: mpi_omp_hybrid
+    description: "4 ranks × 4 threads/rank."
+    applies_to: ["run_config"]
+    parameters:
+      launcher: {type: "mpirun", np: 4, extra_args: []}
+      backend_enable: "mpi_omp"
+      env:
+        OMP_NUM_THREADS: "4"
+        OMP_PROC_BIND: "close"
+        OMP_PLACES: "cores"
+      backend_threads: 4
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality", "comm_reduce"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  # ──── Runtime backend selection ────
+
+  - action_id: runtime_backend_select.openmp
+    family: runtime_backend_select
+    description: "Enable OpenMP backend baseline (OMP_NUM_THREADS=1)."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "1"
+      backend_enable: "openmp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_backend_select.template_omp_pk
+    family: runtime_backend_select
+    description: "Enable OpenMP backend with package omp threads={threads}."
+    applies_to: ["run_config"]
+    parameters:
+      env:
+        OMP_NUM_THREADS: "{threads}"
+        OMP_PROC_BIND: "close"
+        OMP_PLACES: "cores"
+      backend_enable: "openmp"
+      backend_threads: "{threads}"
+      template_id: "omp_pk"
+      dynamic_threads: true
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt", "mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: runtime_backend_select.opt
+    family: runtime_backend_select
+    description: "Enable optimized backend (vectorized kernels)."
+    applies_to: ["run_config"]
+    parameters:
+      backend_enable: "opt"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  # ──── Algorithm-level source patch actions ────
+
+  - action_id: source_patch.param_table_pack
+    family: source_patch
+    description: "Pack LJ coefficient arrays (cutsq, lj1-lj4, offset) into cache-aligned fast_alpha_t struct for single-cache-line lookup per type pair. Reference: pair_lj_cut_opt.cpp."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "param_table_pack"
+      target_file: "src/OPENMP/pair_lj_cut_omp.cpp"
+      target_anchor: "for (int ii = iifrom"
+      reference_impl: "src/OPT/pair_lj_cut_opt.cpp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality", "compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.special_pair_split
+    family: source_patch
+    description: "Split inner loop into sbindex==0 fast path (skip factor_lj and NEIGHMASK) and special-bond slow path. ~99% of pairs take fast path. Reference: pair_lj_cut_opt.cpp."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "special_pair_split"
+      target_file: "src/OPENMP/pair_lj_cut_omp.cpp"
+      target_anchor: "factor_lj = special_lj[sbmask(j)]"
+      reference_impl: "src/OPT/pair_lj_cut_opt.cpp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.flat_coeff_lookup
+    family: source_patch
+    description: "Flatten 2D coefficient arrays (cutsq[i][j]) into 1D flat table (tabsix[i*ntypes+j]) to eliminate pointer indirection. Usually combined with param_table_pack."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "flat_coeff_lookup"
+      target_file: "src/OPENMP/pair_lj_cut_omp.cpp"
+      target_anchor: "cutsq[itype]"
+      reference_impl: "src/OPT/pair_lj_cut_opt.cpp"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "medium"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  - action_id: source_patch.neighbor_prefetch
+    family: source_patch
+    description: "Insert software prefetch hints for next neighbor's coordinates in pair force inner loop."
+    applies_to: ["source_patch"]
+    parameters:
+      patch_family: "neighbor_prefetch"
+      target_file: "src/OPENMP/pair_lj_cut_omp.cpp"
+      target_anchor: "for (jj = 0; jj < jnum"
+    preconditions: []
+    constraints: []
+    expected_effect: ["mem_locality"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05

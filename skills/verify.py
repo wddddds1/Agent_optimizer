@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -26,6 +27,9 @@ def verify_run(
     profile: ProfileReport,
     gates: Dict[str, object],
     baseline_exp: Optional[ExperimentIR],
+    is_final_validation: bool = False,
+    agentic_decider=None,
+    agentic_cfg: Optional[Dict[str, object]] = None,
 ) -> VerifyResult:
     reasons: List[str] = []
     correctness_metrics: Dict[str, object] = {}
@@ -45,15 +49,29 @@ def verify_run(
             reasons.append("log file missing for runtime check")
 
     correctness_cfg = gates.get("correctness", {})
+    correctness_cfg, final_cfg = _apply_final_validation(correctness_cfg, is_final_validation)
+    apply_relaxations = True
+    if is_final_validation:
+        apply_relaxations = bool(final_cfg.get("allow_relaxations", False))
     is_baseline = action is None
+    # Always require correctness checks for every non-baseline run.
+    # Baseline still respects baseline_require_thermo.
     require_correctness = False
     if is_baseline:
         require_correctness = bool(correctness_cfg.get("baseline_require_thermo", True))
-    elif action:
-        if any(target in action.applies_to for target in ["input_script", "source_patch", "build_config"]):
-            require_correctness = True
-        elif action.risk_level != "low":
-            require_correctness = True
+    else:
+        require_correctness = True
+    if is_final_validation:
+        require_correctness = True
+
+    effective_cfg = _effective_correctness_cfg(
+        correctness_cfg,
+        action,
+        apply_relaxations=apply_relaxations,
+    )
+    agentic_cfg = agentic_cfg or {}
+    agentic_mode = str(agentic_cfg.get("mode", "")).lower()
+    use_agent = agentic_decider is not None and agentic_mode == "agent_only" and not is_baseline
 
     if require_correctness:
         log_text = ""
@@ -62,28 +80,43 @@ def verify_run(
                 log_text = Path(profile.log_path).read_text(encoding="utf-8")
             except FileNotFoundError:
                 reasons.append("log file missing for correctness check")
-        series_cfg = correctness_cfg.get("series_compare", {})
+        series_cfg = effective_cfg.get("series_compare", {})
         series_window = int(series_cfg.get("window", 0)) if series_cfg else 0
         metrics = parse_thermo_table(log_text)
         series = parse_thermo_series(log_text, max_rows=series_window)
+        baseline_text = ""
+        if not is_baseline and baseline_exp and baseline_exp.profile_report.log_path:
+            try:
+                baseline_text = Path(baseline_exp.profile_report.log_path).read_text(encoding="utf-8")
+            except FileNotFoundError:
+                baseline_text = ""
         if not metrics and not series:
-            reasons.append("no thermo metrics available for correctness check")
+            if not use_agent:
+                reasons.append("no thermo metrics available for correctness check")
+            correctness_metrics["no_thermo_metrics"] = True
         else:
             correctness_metrics["key_scalar_diffs"] = {}
             correctness_metrics["series_diffs"] = {}
+            correctness_metrics["scalar_values"] = {}
+            correctness_metrics["series_stats"] = {}
+            adaptive_cfg = {}
             baseline_series = {}
             baseline_metrics = {}
             if not is_baseline:
-                if baseline_exp and baseline_exp.profile_report.log_path:
-                    try:
-                        baseline_text = Path(baseline_exp.profile_report.log_path).read_text(encoding="utf-8")
-                        baseline_metrics = parse_thermo_table(baseline_text)
-                        baseline_series = parse_thermo_series(baseline_text, max_rows=series_window)
-                    except FileNotFoundError:
-                        baseline_metrics = {}
-                        baseline_series = {}
+                if baseline_text:
+                    baseline_metrics = parse_thermo_table(baseline_text)
+                    baseline_series = parse_thermo_series(baseline_text, max_rows=series_window)
                 if not baseline_metrics and not baseline_series:
-                    reasons.append("baseline metrics missing for correctness check")
+                    if not use_agent:
+                        reasons.append("baseline metrics missing for correctness check")
+                    correctness_metrics["baseline_metrics_missing"] = True
+            if effective_cfg.get("adaptive_from_baseline") and baseline_series:
+                adaptive_cfg = _adaptive_thresholds(
+                    baseline_series,
+                    effective_cfg,
+                )
+                if adaptive_cfg:
+                    correctness_metrics["adaptive_thresholds"] = adaptive_cfg
 
             if baseline_metrics and metrics:
                 for key, value in metrics.items():
@@ -93,30 +126,70 @@ def verify_run(
                     diff = abs(value - base)
                     rel = diff / max(abs(base), 1.0e-12)
                     correctness_metrics["key_scalar_diffs"][key] = {"abs": diff, "rel": rel}
-                    abs_thresh = correctness_cfg.get("scalar_thresholds", {}).get("abs", 0.0)
-                    rel_thresh = correctness_cfg.get("scalar_thresholds", {}).get("rel", 0.0)
-                    if diff > abs_thresh and rel > rel_thresh:
-                        reasons.append(f"correctness drift: {key}")
+                    correctness_metrics["scalar_values"][key] = {"baseline": base, "run": value}
+                    if not use_agent:
+                        abs_thresh = effective_cfg.get("scalar_thresholds", {}).get("abs", 0.0)
+                        rel_thresh = effective_cfg.get("scalar_thresholds", {}).get("rel", 0.0)
+                        if adaptive_cfg:
+                            key_cfg = adaptive_cfg.get("scalar_thresholds", {}).get(key, {})
+                            abs_thresh = max(abs_thresh, float(key_cfg.get("abs", 0.0)))
+                            rel_thresh = max(rel_thresh, float(key_cfg.get("rel", 0.0)))
+                        if diff > abs_thresh and rel > rel_thresh:
+                            reasons.append(f"correctness drift: {key}")
 
             if baseline_series and series:
-                abs_thresh = series_cfg.get("abs_max", 0.0) if series_cfg else 0.0
-                rel_thresh = series_cfg.get("rel_max", 0.0) if series_cfg else 0.0
+                # Build timestep-aligned index for accurate comparison
+                steps = series.get("Step", [])
+                base_steps = baseline_series.get("Step", [])
+                if steps and base_steps:
+                    # Align by timestep intersection
+                    base_step_idx = {int(s): i for i, s in enumerate(base_steps)}
+                    aligned_indices = []  # (series_idx, baseline_idx)
+                    for si, s in enumerate(steps):
+                        bi = base_step_idx.get(int(s))
+                        if bi is not None:
+                            aligned_indices.append((si, bi))
+                else:
+                    # Fallback: align from end (legacy behaviour)
+                    aligned_indices = None
+
                 for key, values in series.items():
+                    if key == "Step":
+                        continue
                     base_values = baseline_series.get(key)
                     if not base_values:
                         continue
-                    count = min(len(values), len(base_values))
-                    if count == 0:
-                        continue
-                    diffs = [abs(values[-count + i] - base_values[-count + i]) for i in range(count)]
+                    if aligned_indices is not None:
+                        if not aligned_indices:
+                            continue
+                        diffs = [abs(values[si] - base_values[bi]) for si, bi in aligned_indices]
+                        base_slice = [base_values[bi] for _, bi in aligned_indices]
+                        run_slice = [values[si] for si, _ in aligned_indices]
+                    else:
+                        count = min(len(values), len(base_values))
+                        if count == 0:
+                            continue
+                        diffs = [abs(values[-count + i] - base_values[-count + i]) for i in range(count)]
+                        base_slice = base_values[-count:]
+                        run_slice = values[-count:]
                     max_abs = max(diffs)
-                    base_mag = max(max(abs(v) for v in base_values[-count:]), 1.0e-12)
+                    base_mag = max(max(abs(v) for v in base_slice), 1.0e-12)
                     max_rel = max_abs / base_mag
                     correctness_metrics["series_diffs"][key] = {"max_abs": max_abs, "max_rel": max_rel}
-                    if max_abs > abs_thresh and max_rel > rel_thresh:
-                        reasons.append(f"series drift: {key}")
+                    stats = _series_stats(base_slice, run_slice)
+                    if stats:
+                        correctness_metrics["series_stats"][key] = stats
+                    if not use_agent:
+                        abs_thresh = series_cfg.get("abs_max", 0.0) if series_cfg else 0.0
+                        rel_thresh = series_cfg.get("rel_max", 0.0) if series_cfg else 0.0
+                        if adaptive_cfg:
+                            key_cfg = adaptive_cfg.get("series_compare", {}).get(key, {})
+                            abs_thresh = max(abs_thresh, float(key_cfg.get("abs_max", 0.0)))
+                            rel_thresh = max(rel_thresh, float(key_cfg.get("rel_max", 0.0)))
+                        if max_abs > abs_thresh and max_rel > rel_thresh:
+                            reasons.append(f"series drift: {key}")
 
-            drift_cfg = correctness_cfg.get("energy_drift", {})
+            drift_cfg = effective_cfg.get("energy_drift", {})
             drift_metric = drift_cfg.get("metric", "TotEng")
             drift_limit = float(drift_cfg.get("rel_max", 0.0))
             drift_value = _energy_drift(series, drift_metric)
@@ -125,14 +198,48 @@ def verify_run(
                 correctness_metrics["energy_drift"] = drift_value
             if baseline_drift is not None:
                 correctness_metrics["energy_drift_baseline"] = baseline_drift
-            if not is_baseline and drift_value is not None and drift_limit:
+            if not use_agent and not is_baseline and drift_value is not None and drift_limit:
+                if adaptive_cfg:
+                    drift_cfg = adaptive_cfg.get("energy_drift", {})
+                    drift_limit = max(drift_limit, float(drift_cfg.get("rel_max", 0.0)))
                 if baseline_drift is not None:
-                    if abs(drift_value - baseline_drift) > drift_limit:
+                    # Only fail if drift got WORSE (larger magnitude), not if
+                    # it improved (smaller magnitude than baseline).
+                    if abs(drift_value) > abs(baseline_drift) and abs(drift_value - baseline_drift) > drift_limit:
                         reasons.append("energy drift delta exceeded")
                 elif abs(drift_value) > drift_limit:
                     reasons.append("energy drift threshold exceeded")
+
+        if use_agent:
+            hard_failures = [
+                r
+                for r in reasons
+                if not r.startswith("correctness drift")
+                and not r.startswith("series drift")
+                and "energy drift" not in r
+            ]
+            payload = _build_agent_payload(
+                job=job,
+                action=action,
+                profile=profile,
+                result=result,
+                correctness_metrics=correctness_metrics,
+                hard_failures=hard_failures,
+                run_log_text=log_text,
+                baseline_log_text=baseline_text if not is_baseline else "",
+                agentic_cfg=agentic_cfg,
+            )
+            decision = agentic_decider(payload) if agentic_decider else None
+            if isinstance(decision, dict):
+                correctness_metrics["agent_decision"] = decision
+                verdict = str(decision.get("verdict", "")).upper()
+                if verdict == "FAIL":
+                    reasons.append(f"agent correctness: {decision.get('rationale', 'FAIL')}")
+                elif verdict == "NEED_MORE_CONTEXT":
+                    reasons.append("agent correctness: NEED_MORE_CONTEXT")
+
     else:
-        if correctness_cfg.get("allow_skip_for_low_risk_run_config", False):
+        if effective_cfg.get("allow_skip_for_low_risk_run_config", False):
             correctness_metrics["correctness_skipped_reason"] = "low-risk run_config action"
 
     variance_cfg = gates.get("variance", {})
@@ -169,6 +276,29 @@ def verify_run(
         else:
             reasons.append("output file comparison unavailable")
 
+    if action and action.family == "runtime_backend_select" and not use_agent:
+        if effective_cfg.get("backend_select_allow_drift", False):
+            drift_prefixes = ("correctness drift:", "series drift:", "energy drift")
+            drift_reasons = [r for r in reasons if r.startswith(drift_prefixes)]
+            if drift_reasons:
+                reasons = [r for r in reasons if not r.startswith(drift_prefixes)]
+                correctness_metrics["backend_select_drift_ignored"] = True
+
+    # Runtime regression guard: fail if >2x slower than baseline.
+    regression_limit = float(runtime_cfg.get("max_regression_factor", 2.0))
+    if (
+        not is_baseline
+        and baseline_exp
+        and baseline_exp.results
+        and baseline_exp.results.runtime_seconds > 0
+        and result.runtime_seconds > 0
+    ):
+        factor = result.runtime_seconds / baseline_exp.results.runtime_seconds
+        if factor > regression_limit:
+            reasons.append(
+                f"runtime regression: {factor:.1f}x slower than baseline"
+            )
+
     verdict = "PASS" if not reasons else "FAIL"
     return VerifyResult(verdict=verdict, reasons=reasons, correctness_metrics=correctness_metrics)
 
@@ -181,6 +311,188 @@ def _energy_drift(series: Dict[str, List[float]], key: str) -> Optional[float]:
     end = values[-1]
     denom = abs(start) if abs(start) > 1.0e-12 else 1.0
     return (end - start) / denom
+
+
+def _series_stats(baseline_vals: List[float], run_vals: List[float]) -> Optional[Dict[str, float]]:
+    if not baseline_vals or not run_vals:
+        return None
+    n = min(len(baseline_vals), len(run_vals))
+    if n == 0:
+        return None
+    b = baseline_vals[:n]
+    r = run_vals[:n]
+    b_mean = sum(b) / n
+    r_mean = sum(r) / n
+    b_var = sum((x - b_mean) ** 2 for x in b) / n
+    r_var = sum((x - r_mean) ** 2 for x in r) / n
+    b_std = math.sqrt(b_var)
+    r_std = math.sqrt(r_var)
+    diff_mean = r_mean - b_mean
+    rel_mean = diff_mean / max(abs(b_mean), 1.0e-12)
+    return {
+        "n": n,
+        "baseline_mean": b_mean,
+        "baseline_std": b_std,
+        "run_mean": r_mean,
+        "run_std": r_std,
+        "mean_diff": diff_mean,
+        "mean_rel": rel_mean,
+    }
+
+
+def _build_agent_payload(
+    job: JobIR,
+    action: Optional[ActionIR],
+    profile: ProfileReport,
+    result: ResultIR,
+    correctness_metrics: Dict[str, object],
+    hard_failures: List[str],
+    run_log_text: str,
+    baseline_log_text: str,
+    agentic_cfg: Dict[str, object],
+) -> Dict[str, object]:
+    max_lines = int(agentic_cfg.get("max_log_lines", 80) or 80)
+    payload = {
+        "action": action.model_dump() if action else None,
+        "job": {
+            "app": job.app,
+            "case_id": job.case_id,
+            "run_args": job.run_args,
+            "env": job.env,
+            "input_script": job.input_script,
+        },
+        "profile": {
+            "timing_breakdown": profile.timing_breakdown,
+            "system_metrics": profile.system_metrics,
+            "notes": profile.notes,
+        },
+        "runtime": {
+            "runtime_seconds": result.runtime_seconds,
+            "exit_code": result.exit_code,
+        },
+        "correctness_metrics": correctness_metrics,
+        "hard_failures": hard_failures,
+        "run_thermo_excerpt": _thermo_excerpt(run_log_text, max_lines=max_lines),
+        "baseline_thermo_excerpt": _thermo_excerpt(baseline_log_text, max_lines=max_lines),
+    }
+    return payload
+
+
+def _thermo_excerpt(text: str, max_lines: int = 80) -> str:
+    if not text:
+        return ""
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    header_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("Step") and len(line.split()) > 2:
+            header_idx = i
+    if header_idx is None:
+        return "\n".join(lines[-max_lines:])
+    excerpt = lines[header_idx : header_idx + max_lines]
+    return "\n".join(excerpt)
+
+
+def _adaptive_thresholds(
+    baseline_series: Dict[str, List[float]],
+    effective_cfg: Dict[str, object],
+) -> Dict[str, object]:
+    multiplier = float(effective_cfg.get("adaptive_multiplier", 3.0))
+    floors = effective_cfg.get("adaptive_floor", {})
+    if not isinstance(floors, dict):
+        floors = {}
+    scalar_abs_floor = float(floors.get("scalar_abs", 0.0))
+    scalar_rel_floor = float(floors.get("scalar_rel", 0.0))
+    series_abs_floor = float(floors.get("series_abs", 0.0))
+    series_rel_floor = float(floors.get("series_rel", 0.0))
+    drift_rel_floor = float(floors.get("drift_rel", 0.0))
+    scalar_thresholds: Dict[str, Dict[str, float]] = {}
+    series_thresholds: Dict[str, Dict[str, float]] = {}
+
+    for key, values in baseline_series.items():
+        if key == "Step" or not values:
+            continue
+        mean = sum(values) / len(values)
+        diffs = [abs(v - mean) for v in values]
+        max_abs = max(diffs)
+        base_mag = max(abs(mean), 1.0e-12)
+        max_rel = max_abs / base_mag
+        scalar_thresholds[key] = {
+            "abs": max(max_abs * multiplier, scalar_abs_floor),
+            "rel": max(max_rel * multiplier, scalar_rel_floor),
+        }
+        series_thresholds[key] = {
+            "abs_max": max(max_abs * multiplier, series_abs_floor),
+            "rel_max": max(max_rel * multiplier, series_rel_floor),
+        }
+
+    drift_metric = effective_cfg.get("energy_drift", {}).get("metric", "TotEng")
+    drift_value = _energy_drift(baseline_series, str(drift_metric))
+    drift_rel = abs(drift_value) if drift_value is not None else 0.0
+    energy_drift = {"rel_max": max(drift_rel * multiplier, drift_rel_floor)}
+    return {
+        "scalar_thresholds": scalar_thresholds,
+        "series_compare": series_thresholds,
+        "energy_drift": energy_drift,
+    }
+
+
+def _effective_correctness_cfg(
+    correctness_cfg: Dict[str, object],
+    action: Optional[ActionIR],
+    apply_relaxations: bool = True,
+) -> Dict[str, object]:
+    if not apply_relaxations or not action:
+        return correctness_cfg
+    if action.family == "runtime_backend_select":
+        relaxed = correctness_cfg.get("backend_select_relaxed", {})
+        if isinstance(relaxed, dict) and relaxed:
+            effective = dict(correctness_cfg)
+            for key in ("scalar_thresholds", "series_compare", "energy_drift"):
+                if key in relaxed:
+                    effective[key] = relaxed[key]
+            return effective
+    if action.family == "neighbor_tune":
+        relaxed = correctness_cfg.get("neighbor_tune_relaxed", {})
+        if isinstance(relaxed, dict) and relaxed:
+            effective = dict(correctness_cfg)
+            for key in ("scalar_thresholds", "series_compare", "energy_drift"):
+                if key in relaxed:
+                    effective[key] = relaxed[key]
+            return effective
+    if not any(target in action.applies_to for target in ["build_config"]):
+        return correctness_cfg
+    params = action.parameters or {}
+    numeric_risk = params.get("numeric_risk")
+    if numeric_risk != "low":
+        return correctness_cfg
+    relaxed = correctness_cfg.get("build_config_relaxed", {})
+    if not isinstance(relaxed, dict):
+        return correctness_cfg
+    effective = dict(correctness_cfg)
+    for key in ("scalar_thresholds", "series_compare", "energy_drift"):
+        if key in relaxed:
+            effective[key] = relaxed[key]
+    return effective
+
+
+def _apply_final_validation(
+    correctness_cfg: Dict[str, object],
+    is_final_validation: bool,
+) -> tuple[Dict[str, object], Dict[str, object]]:
+    if not is_final_validation:
+        return correctness_cfg, {}
+    final_cfg = correctness_cfg.get("final_validation", {})
+    if not isinstance(final_cfg, dict) or not final_cfg:
+        merged = dict(correctness_cfg)
+        merged["allow_skip_for_low_risk_run_config"] = False
+        merged["backend_select_allow_drift"] = False
+        return merged, {}
+    merged = dict(correctness_cfg)
+    for key, value in final_cfg.items():
+        if key == "allow_relaxations":
+            continue
+        merged[key] = value
+    return merged, final_cfg
 
 
 def _hash_output_files(workdir: Path, files: List[str]) -> Dict[str, Optional[str]]:

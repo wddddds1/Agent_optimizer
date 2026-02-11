@@ -17,7 +17,9 @@ class ProfilerAgent:
         workdir: Path,
         artifacts_dir: Path,
         time_command: Optional[str],
+        wrapper_command: Optional[list[str]],
         repeats: int,
+        launcher_cfg: Optional[Dict[str, object]] = None,
     ) -> Tuple[object, ProfileReport]:
         return profile_job(
             job=job,
@@ -26,5 +28,7 @@ class ProfilerAgent:
             workdir=workdir,
             artifacts_dir=artifacts_dir,
             time_command=time_command,
+            wrapper_command=wrapper_command,
             repeats=repeats,
+            launcher_cfg=launcher_cfg,
         )

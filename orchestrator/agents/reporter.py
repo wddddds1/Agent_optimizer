@@ -18,6 +18,9 @@ class ReporterAgent:
         llm_summary_zh: Optional[Dict[str, object]],
         candidate_policy: Optional[Dict[str, object]],
         review_decision: Optional[Dict[str, object]],
+        phase_transitions: Optional[List[Dict[str, object]]],
+        composite_exp: Optional[ExperimentIR] = None,
+        min_improvement_pct: float = 0.0,
     ) -> Dict[str, object]:
         return write_report(
             experiments,
@@ -29,4 +32,7 @@ class ReporterAgent:
             llm_summary_zh,
             candidate_policy,
             review_decision,
+            phase_transitions,
+            composite_exp=composite_exp,
+            min_improvement_pct=min_improvement_pct,
         )

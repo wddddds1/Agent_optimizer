@@ -1,6 +1,9 @@
 version: 1
+active_profile: aggressive
 defaults:
   max_candidates: 3
+  min_patch_candidates: 3
+  chain_min_improvement_pct: 0.0
   evaluation:
     baseline_repeats: 1
     candidate_repeats_stage0: 1
@@ -19,9 +22,212 @@ defaults:
     force_halving: true
   refine_on_best:
     enabled: true
-    min_improvement_pct: 0.05
-    applies_to: ["run_config"]
-  stop_plan:
-    max_iterations: null
-    min_relative_gain: 0.0
-    patience_rounds: 2
+    min_improvement_pct: 0.0
+    applies_to: ["run_config", "input_script", "build_config", "source_patch"]
+  retune_budget: 1
+  post_patch_retune_budget: 1
+  retune_policy:
+    min_improvement_pct: 0.01
+    max_candidates: 3
+    families:
+      - parallel_omp
+      - affinity_tune
+      - neighbor_tune
+      - output_tune
+      - runtime_lib
+      - sched_granularity
+      - wait_policy
+      - lib_threading
+      - comm_tune
+      - io_tune
+  runtime_probe:
+    min_neigh_ratio: 0.08
+    min_comm_ratio: 0.08
+    min_output_ratio: 0.08
+  ranking:
+    weights:
+      memory: 1.0
+      llm: 1.0
+      heuristic: 1.0
+      evidence: 1.0
+      novelty_bonus: 0.2
+      risk_penalty: 0.3
+    epsilon_explore: 0.2
+    evidence_thresholds:
+      neigh_ratio: 0.08
+      comm_ratio: 0.08
+      output_ratio: 0.08
+  fast_start:
+    enabled: false
+    iterations: 2
+    targets: ["run_config", "build_config"]
+    max_candidates_per_family: 1
+    max_total_candidates: 2
+  memory:
+    enabled: true
+    min_gain_pct: 0.1
+    min_gain_sigma_mult: 2.0
+    max_cv: 0.03
+    strong_gain_pct: 2.0
+    decay_half_life_days: 14.0
+    record_negative: true
+    app_match_boost: 2.0
+    app_mismatch_penalty: 0.2
+    case_match_boost: 1.3
+    backend_mismatch_penalty: 0.7
+  memory_replay:
+    enabled: true
+    max_actions: 6
+    min_gain_pct: 1.0
+  # Agentic code patching: multi-turn LLM with tool use for better code understanding
+  agentic_code_patch:
+    enabled: true
+    api_key_env: "DEEPSEEK_API_KEY"
+    base_url: "https://api.deepseek.com"
+    model: "deepseek-chat"
+    max_turns: 25
+    max_tool_calls_per_turn: 5
+  # Two-phase optimization: Phase 1 (parameter sweep) + Phase 2 (source patches)
+  two_phase:
+    enabled: false
+    parameter_explorer:
+      enabled: true
+      api_key_env: "DEEPSEEK_API_KEY"
+      base_url: "https://api.deepseek.com"
+      model: "deepseek-chat"
+      temperature: 0.3
+      max_turns: 30
+      max_tool_calls_per_turn: 5
+      max_candidates: 15
+    # Deep code analysis: agentic agent that explores source code at the start
+    # of Phase 2 to produce ranked optimization opportunities.
+    deep_analysis:
+      enabled: true
+      api_key_env: "DEEPSEEK_API_KEY"
+      base_url: "https://api.deepseek.com"
+      model: "deepseek-chat"
+      temperature: 0.3
+      max_tokens: 4096
+      max_turns: 35
+      max_tool_calls_per_turn: 5
+    code_optimization:
+      enabled: true
+      max_iterations: 5
+  batch_selection:
+    enabled: true
+    min_batch: 3
+    max_batch: 5
+  reflection:
+    enabled: true
+
+profiles:
+  aggressive:
+    max_candidates: 5
+    min_patch_candidates: 3
+    chain_min_improvement_pct: 0.0
+    evaluation:
+      baseline_repeats: 1
+      candidate_repeats_stage0: 1
+      candidate_repeats_stage1: 1
+      top1_validation_repeats: 0
+      use_successive_halving: false
+    fuse_rules:
+      max_compile_fails: 2
+      max_runtime_fails: 4
+      cooldown_rounds: 1
+      fallback_family: "run_config"
+    cost_guard:
+      build_seconds_high: 120.0
+      run_seconds_high: 600.0
+      max_candidates_if_high_cost: 3
+      force_halving: true
+    refine_on_best:
+      enabled: true
+      min_improvement_pct: 0.0
+      applies_to: ["run_config", "input_script", "build_config", "source_patch"]
+    retune_budget: 2
+    post_patch_retune_budget: 2
+    retune_policy:
+      min_improvement_pct: 0.0
+      max_candidates: 4
+      families:
+        - parallel_omp
+        - affinity_tune
+        - neighbor_tune
+        - output_tune
+        - runtime_lib
+        - sched_granularity
+        - wait_policy
+        - lib_threading
+        - comm_tune
+        - io_tune
+    runtime_probe:
+      min_neigh_ratio: 0.08
+      min_comm_ratio: 0.08
+      min_output_ratio: 0.08
+    ranking:
+      weights:
+        memory: 1.2
+        llm: 1.0
+        heuristic: 1.0
+        evidence: 1.0
+        novelty_bonus: 0.3
+        risk_penalty: 0.3
+      epsilon_explore: 0.25
+      evidence_thresholds:
+        neigh_ratio: 0.08
+        comm_ratio: 0.08
+        output_ratio: 0.08
+    fast_start:
+      enabled: true
+      iterations: 2
+      targets: ["run_config", "build_config"]
+      max_candidates_per_family: 1
+      max_total_candidates: 2
+    memory:
+      enabled: true
+      min_gain_pct: 0.1
+      min_gain_sigma_mult: 2.0
+      max_cv: 0.03
+      strong_gain_pct: 2.0
+      decay_half_life_days: 10.0
+      record_negative: true
+      app_match_boost: 2.0
+      app_mismatch_penalty: 0.2
+      case_match_boost: 1.4
+      backend_mismatch_penalty: 0.7
+    memory_replay:
+      enabled: true
+      max_actions: 6
+      min_gain_pct: 1.0
+    agentic_code_patch:
+      enabled: true
+      api_key_env: "DEEPSEEK_API_KEY"
+      base_url: "https://api.deepseek.com"
+      model: "deepseek-chat"
+      max_turns: 30
+      max_tool_calls_per_turn: 6
+    two_phase:
+      enabled: true
+      parameter_explorer:
+        enabled: true
+        api_key_env: "DEEPSEEK_API_KEY"
+        base_url: "https://api.deepseek.com"
+        model: "deepseek-chat"
+        temperature: 0.3
+        max_turns: 30
+        max_tool_calls_per_turn: 5
+        max_candidates: 15
+      code_optimization:
+        enabled: true
+        max_iterations: 5
+    batch_selection:
+      enabled: true
+      min_batch: 3
+      max_batch: 5
+    reflection:
+      enabled: true
+    stop_plan:
+      max_iterations: null
+      min_relative_gain: 0.0
+      patience_rounds: 2

@@ -20,6 +20,7 @@ def get_system_topology() -> Dict[str, object]:
     core_groups = _probe_core_groups(topology)
     if core_groups:
         topology["core_groups"] = core_groups
+    _merge_dict(topology, _probe_mpi_runtime())
     return topology
 
 
@@ -145,6 +146,67 @@ def _to_int(value: Optional[str]) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _probe_mpi_runtime() -> Dict[str, object]:
+    """Detect available MPI runtime (mpirun/mpiexec/srun).
+
+    Returns the first available launcher as the default.
+    """
+    detected: List[Dict[str, str]] = []
+    for launcher in ["mpirun", "mpiexec", "srun"]:
+        path = _which(launcher)
+        if path:
+            version_text = ""
+            try:
+                result = subprocess.run(
+                    [path, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                version_text = (result.stdout + result.stderr).strip().split("\n")[0]
+            except Exception:
+                pass
+            detected.append({"name": launcher, "path": path, "version": version_text})
+    if not detected:
+        return {}
+    default = detected[0]
+    return {
+        "mpi_launcher": default["name"],
+        "mpi_launcher_path": default["path"],
+        "mpi_version": default["version"],
+        "mpi_launchers_available": detected,
+    }
+
+
+def check_binary_mpi_support(binary_path: str) -> bool:
+    """Check whether a binary is linked against a real MPI library.
+
+    Uses ``otool -L`` on macOS or ``ldd`` on Linux to inspect shared
+    library dependencies.  Returns *True* if a real MPI library (libmpi,
+    libpmpi, libmpich, etc.) is found, *False* otherwise.
+    """
+    binary = Path(binary_path)
+    if not binary.exists():
+        return False
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            result = subprocess.run(
+                ["otool", "-L", str(binary)],
+                capture_output=True, text=True, timeout=5,
+            )
+        else:
+            result = subprocess.run(
+                ["ldd", str(binary)],
+                capture_output=True, text=True, timeout=5,
+            )
+        output = result.stdout.lower()
+        mpi_markers = ["libmpi", "libpmpi", "libmpich", "libmsmpi"]
+        return any(marker in output for marker in mpi_markers)
+    except Exception:
+        return False
 
 
 def _merge_dict(target: Dict[str, object], source: Dict[str, object]) -> None:

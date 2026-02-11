@@ -1,0 +1,25 @@
+LAMMPS (10 Dec 2025 - Development - patch_10Dec2025-120-ga51f9ba0e7-modified)
+  using 1 OpenMP thread(s) per MPI task
+# EAM Copper benchmark - larger scale
+# 瓶颈: pair_eam (many-body势, 比 LJ 复杂)
+# 特点: 需要计算嵌入能, 代码优化空间大
+
+units           metal
+atom_style      atomic
+
+# 40x40x40 box = 256,000 atoms (比 melt_xxlarge 的 131k 大)
+lattice         fcc 3.615
+Lattice spacing in x,y,z = 3.615 3.615 3.615
+region          box block 0 40 0 40 0 40
+create_box      1 box
+Created orthogonal box = (0 0 0) to (144.6 144.6 144.6)
+  1 by 1 by 1 MPI processor grid
+create_atoms    1 box
+Created 256000 atoms
+  using lattice units in orthogonal box = (0 0 0) to (144.6 144.6 144.6)
+  create_atoms CPU = 0.006 seconds
+
+pair_style      eam
+ERROR: Unrecognized pair style 'eam' is part of the MANYBODY package which is not enabled in this LAMMPS binary.
+For more information see https://docs.lammps.org/err0010 (src/force.cpp:279)
+Last input line: pair_style eam

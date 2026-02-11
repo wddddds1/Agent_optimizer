@@ -1,0 +1,262 @@
+version: 1
+families:
+  - id: comm_frequency_merge
+    description: "Merge or reduce collective communication frequency."
+    transform_types: ["comm_frequency_merge"]
+    requires_caps: ["mpi_runtime_knobs"]
+    requires_hotspot: ["comm"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["comm_reduce"]
+
+  - id: comm_overlap
+    description: "Overlap communication with computation."
+    transform_types: ["comm_overlap"]
+    requires_caps: ["mpi_runtime_knobs"]
+    requires_hotspot: ["comm"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["comm_reduce", "compute_opt"]
+
+  - id: message_aggregation
+    description: "Aggregate small messages to reduce overhead."
+    transform_types: ["message_aggregation"]
+    requires_caps: ["mpi_runtime_knobs"]
+    requires_hotspot: ["comm"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["comm_reduce"]
+
+  - id: nonblocking_overlap
+    description: "Use nonblocking communication to overlap compute/comm."
+    transform_types: ["nonblocking_overlap"]
+    requires_caps: ["mpi_runtime_knobs"]
+    requires_hotspot: ["comm"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["comm_reduce", "compute_opt"]
+
+  - id: mpi_hoist_out_of_inner_loop
+    description: "Hoist MPI collectives out of inner loops."
+    transform_types: ["mpi_hoist_out_of_inner_loop"]
+    requires_caps: ["mpi_runtime_knobs"]
+    risk: "high"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    requires_strict_correctness: true
+    patch_tags: ["comm_reduce", "compute_opt"]
+
+  - id: compute_comm_reorder
+    description: "Reorder compute/communication to avoid redundant sync."
+    transform_types: ["compute_comm_reorder"]
+    requires_caps: ["mpi_runtime_knobs"]
+    risk: "high"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    requires_strict_correctness: true
+    patch_tags: ["comm_reduce"]
+
+  - id: omp_scope_adjust
+    description: "Move OpenMP scope to inner-most hot loops."
+    transform_types: ["omp_scope_adjust"]
+    requires_caps: ["runtime_parallel_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt"]
+
+  - id: loop_interchange_blocking
+    description: "Loop interchange/blocking for cache locality."
+    transform_types: ["loop_interchange_blocking"]
+    requires_caps: ["memory_tuning_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality"]
+
+  - id: loop_fission
+    description: "Split optional/flag-guarded diagnostics from hot loops (do not duplicate core updates)."
+    transform_types: ["loop_fission"]
+    requires_caps: ["memory_tuning_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality"]
+
+  - id: loop_fusion
+    description: "Fuse adjacent loops to reduce passes over data."
+    transform_types: ["loop_fusion"]
+    requires_caps: ["memory_tuning_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality"]
+
+  - id: array_packing
+    description: "Pack multiple arrays to improve cache line reuse."
+    transform_types: ["array_packing"]
+    requires_caps: ["memory_tuning_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality"]
+
+  - id: temporary_elision
+    description: "Eliminate temporary arrays and redundant stores."
+    transform_types: ["temporary_elision"]
+    requires_caps: ["memory_tuning_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality"]
+
+  - id: cache_local_pointers
+    description: "Cache frequently accessed pointers/arrays locally in hot loops."
+    transform_types: ["cache_local_pointers"]
+    requires_caps: ["memory_tuning_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality", "compute_opt"]
+    compiler_covered: true
+    tier: "micro"
+
+  - id: cache_local_pointers_multi
+    description: "Cache pointers/arrays across related hot functions (multi-function)."
+    transform_types: ["cache_local_pointers_multi"]
+    requires_caps: ["memory_tuning_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality", "compute_opt"]
+    compiler_covered: true
+    tier: "micro"
+
+  - id: loop_unroll
+    description: "Loop unrolling for hot inner loops."
+    transform_types: ["loop_unroll"]
+    requires_caps: ["compiler_vectorization"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt"]
+    compiler_covered: true
+    tier: "micro"
+
+  - id: prefetch_hints
+    description: "Add prefetch hints for predictable access."
+    transform_types: ["prefetch_hints"]
+    requires_caps: ["memory_tuning_knobs"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality"]
+
+  - id: branch_simplify
+    description: "Simplify branches and avoid redundant condition checks."
+    transform_types: ["branch_simplify"]
+    requires_caps: ["source_patch"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt"]
+    compiler_covered: true
+    tier: "micro"
+
+  - id: alignment_hints
+    description: "Add alignment/contiguous hints to improve vectorization."
+    transform_types: ["alignment_hints"]
+    requires_caps: ["compiler_vectorization"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt"]
+
+  - id: vectorization_enablers
+    description: "Enable vector-friendly access patterns."
+    transform_types: ["vectorization_enablers"]
+    requires_caps: ["compiler_vectorization"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt"]
+
+  - id: hoist_invariant
+    description: "Hoist loop-invariant computations."
+    transform_types: ["hoist_invariant"]
+    requires_caps: ["source_patch"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt"]
+    compiler_covered: true
+    tier: "micro"
+
+  - id: conditional_elision
+    description: "Move guarded updates inside conditionals."
+    transform_types: ["conditional_elision"]
+    requires_caps: ["source_patch"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt"]
+
+  - id: math_equivalence
+    description: "Math equivalence (pow->mul, fast exp)."
+    transform_types: ["math_equivalence"]
+    requires_caps: ["source_patch"]
+    risk: "high"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    requires_strict_correctness: true
+    patch_tags: ["compute_opt"]
+
+  - id: precision_policy
+    description: "Localized precision policy adjustments."
+    transform_types: ["precision_policy"]
+    requires_caps: ["source_patch"]
+    risk: "high"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    requires_strict_correctness: true
+    patch_tags: ["compute_opt"]
+
+  - id: vectorization_hints
+    description: "Add restrict/align/simd hints."
+    transform_types: ["vectorization_hints"]
+    requires_caps: ["compiler_vectorization"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt"]
+
+  - id: partitioning_rebalance
+    description: "Partitioning/load rebalance adjustments."
+    transform_types: ["partitioning_rebalance"]
+    requires_caps: ["load_balance_knobs"]
+    risk: "high"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    requires_strict_correctness: true
+    patch_tags: ["imbalance_reduce"]
+
+  # ──── Algorithm-level families (reference: LAMMPS OPT backend) ────
+
+  - id: param_table_pack
+    description: "Pack multiple coefficient arrays (cutsq, lj1-lj4, offset) into a single cache-aligned struct for one-cache-line lookup. Reference: pair_lj_cut_opt.cpp fast_alpha_t."
+    transform_types: ["param_table_pack"]
+    requires_caps: ["memory_tuning_knobs"]
+    requires_hotspot: ["pair"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality", "compute_opt", "algorithm"]
+    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
+
+  - id: special_pair_split
+    description: "Split sbindex==0 fast path from special-bond handling. ~99% of pairs skip factor_lj and NEIGHMASK. Reference: pair_lj_cut_opt.cpp lines 123-192."
+    transform_types: ["special_pair_split"]
+    requires_caps: ["source_patch"]
+    requires_hotspot: ["pair"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt", "algorithm"]
+    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
+
+  - id: flat_coeff_lookup
+    description: "Flatten 2D coefficient arrays cutsq[i][j] into 1D tabsix[i*ntypes+j] to eliminate pointer indirection. Usually combined with param_table_pack."
+    transform_types: ["flat_coeff_lookup"]
+    requires_caps: ["memory_tuning_knobs"]
+    requires_hotspot: ["pair"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality", "algorithm"]
+    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
+
+  - id: neighbor_prefetch
+    description: "Insert software prefetch for next neighbor's coordinates in inner loop: __builtin_prefetch(&x[jlist[jj+dist]])."
+    transform_types: ["neighbor_prefetch"]
+    requires_caps: ["memory_tuning_knobs"]
+    requires_hotspot: ["pair"]
+    risk: "low"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality"]
+    profiling_trigger: ["memory_bound", "cache_thrashing"]

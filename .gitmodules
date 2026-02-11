@@ -1,3 +1,6 @@
 [submodule "third_party/lammps"]
 	path = third_party/lammps
 	url = https://github.com/lammps/lammps.git
+[submodule "third_party/bwa"]
+	path = third_party/bwa
+	url = https://github.com/lh3/bwa.git

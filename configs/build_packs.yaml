@@ -1,0 +1,127 @@
+version: 1
+packs:
+  - id: o2_conservative
+    description: "Conservative O2 build for stability."
+    tags: ["compiler_sensitive"]
+    risk: "low"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O2"
+
+  - id: o3_native
+    description: "High optimization with native tuning."
+    tags: ["compiler_sensitive", "vectorization_helpful"]
+    risk: "medium"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3 -march=native"
+
+  - id: o3_native_lto
+    description: "O3 + native + link-time optimization."
+    tags: ["link_time_opt", "compiler_sensitive", "vectorization_helpful"]
+    risk: "medium"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3 -march=native"
+      - "-D CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
+
+  - id: o3_lto
+    description: "O3 + link-time optimization."
+    tags: ["link_time_opt", "compiler_sensitive"]
+    risk: "medium"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3"
+      - "-D CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
+
+  - id: fastmath
+    description: "Aggressive fast-math (requires strict correctness)."
+    tags: ["fastmath", "compiler_sensitive"]
+    risk: "high"
+    numeric_risk: "high"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-Ofast"
+
+  - id: o3_native_fastmath
+    description: "O3 + native + fast-math."
+    tags: ["fastmath", "compiler_sensitive"]
+    risk: "high"
+    numeric_risk: "high"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3 -march=native -ffast-math"
+
+  - id: o3_native_unroll
+    description: "O3 + native + unroll loops."
+    tags: ["compiler_sensitive", "vectorization_helpful"]
+    risk: "medium"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3 -march=native -funroll-loops"
+
+  - id: o3_native_vec
+    description: "O3 + native + vectorization flags."
+    tags: ["compiler_sensitive", "vectorization_helpful"]
+    risk: "medium"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3 -march=native -fvectorize -ffp-contract=fast"
+
+  - id: o3_native_fp_precise
+    description: "O3 + native + precise FP contraction."
+    tags: ["compiler_sensitive"]
+    risk: "medium"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3 -march=native -ffp-contract=off"
+
+  - id: pgo_generate
+    description: "PGO generate profile data."
+    tags: ["compiler_sensitive", "pgo"]
+    risk: "high"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3 -fprofile-generate"
+
+  - id: pgo_use
+    description: "PGO use profile data."
+    tags: ["compiler_sensitive", "pgo"]
+    risk: "high"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D CMAKE_BUILD_TYPE=Release"
+      - "-D CMAKE_CXX_FLAGS=-O3 -fprofile-use"
+
+  - id: pkg_openmp
+    description: "Enable OpenMP package (runtime kernels)."
+    tags: ["openmp_pkg", "compiler_sensitive"]
+    risk: "low"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D PKG_OPENMP=on"
+
+  - id: pkg_opt
+    description: "Enable OPT package (vectorized kernels)."
+    tags: ["opt_pkg", "vectorization_helpful"]
+    risk: "low"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D PKG_OPT=on"
+
+  - id: pkg_opt_openmp
+    description: "Enable OPT + OpenMP packages."
+    tags: ["opt_pkg", "openmp_pkg", "vectorization_helpful"]
+    risk: "low"
+    numeric_risk: "low"
+    cmake_args:
+      - "-D PKG_OPT=on"
+      - "-D PKG_OPENMP=on"

@@ -14,11 +14,30 @@ from schemas.profile_report import ProfileReport
 from schemas.review_ir import ReviewDecision
 
 
+def _format_diff_stats(stats: Optional[Dict[str, object]]) -> Optional[str]:
+    """Format diff statistics into a compact summary string."""
+    if not stats:
+        return None
+    files = stats.get("files")
+    lines = stats.get("lines_changed")
+    meaningful = stats.get("meaningful_lines")
+    parts = []
+    if isinstance(files, list) and files:
+        parts.append(f"{len(files)}个文件")
+    if isinstance(lines, int) and lines > 0:
+        if isinstance(meaningful, int) and meaningful != lines:
+            parts.append(f"{lines}行变更({meaningful}行有效)")
+        else:
+            parts.append(f"{lines}行变更")
+    return f"[{', '.join(parts)}]" if parts else None
+
+
 @dataclass
 class ConsoleUI:
     enabled: bool = True
     stream: TextIO = sys.stdout
     baseline_runtime: Optional[float] = None
+    verbose: bool = False
     show_output_preview: bool = True
     preview_bytes: int = 2048
 
@@ -71,7 +90,7 @@ class ConsoleUI:
         self._section("分析")
         rationale = rationale or "无"
         self._agent(
-            "AnalystAgent",
+            "PlannerAgent",
             [
                 f"瓶颈: {', '.join(bottlenecks) if bottlenecks else '无'}",
                 f"允许动作族: {', '.join(allowed_families) if allowed_families else '无'}",
@@ -107,19 +126,24 @@ class ConsoleUI:
         self._agent(
             "OptimizerAgent",
             [
-                f"排序模式: {ranking_mode}",
+                f"排序依据: {ranking_mode}",
                 f"选择模式: {selection_mode}",
                 f"候选数: {len(actions)}",
             ],
         )
         if actions:
+            self._print("  候选列表:")
             for idx, action in enumerate(actions, start=1):
-                effect = ",".join(action.expected_effect)
+                reason = action.notes or action.description or ""
+                reason = _shorten(reason, 120) if reason else ""
+                suffix = f" — {reason}" if reason else ""
                 self._print(
-                    f"  {idx}. {action.action_id} | 方向={action.family} | 风险={action.risk_level} | 预期效果={effect}"
+                    f"    {idx}. {action.action_id} (方向={action.family}, 风险={action.risk_level}){suffix}"
                 )
-                if action.description:
-                    self._print(f"     描述: {action.description}")
+                if self.verbose:
+                    effect = ",".join(action.expected_effect)
+                    if effect:
+                        self._print(f"       预期效果: {effect}")
         if llm_explanation:
             self._agent("OptimizerAgent", ["LLM 解释:"] + _split_lines(llm_explanation, "  - "))
 
@@ -135,6 +159,14 @@ class ConsoleUI:
                 f"说明: {ranked.scoring_notes or 'heuristic'}",
             ],
         )
+        if ranked.ranked:
+            self._print("  排序列表:")
+            for idx, item in enumerate(ranked.ranked, start=1):
+                action = item.action
+                score = f"{item.score:.2f}"
+                self._print(
+                    f"    {idx}. {action.action_id} (方向={action.family}, 分数={score})"
+                )
 
     def review_summary(self, decision: ReviewDecision) -> None:
         if not self.enabled:
@@ -158,6 +190,8 @@ class ConsoleUI:
         run_args: List[str],
         base_run_id: Optional[str] = None,
         base_action_id: Optional[str] = None,
+        run_cmd: Optional[str] = None,
+        build_cmds: Optional[List[str]] = None,
     ) -> None:
         if not self.enabled:
             return
@@ -174,16 +208,28 @@ class ConsoleUI:
                     f"作用范围: {', '.join(action.applies_to)}",
                 ],
             )
-            if action.description:
+            detail_lines = _action_change_summary(action, env_overrides)
+            if detail_lines:
+                self._print("  优化说明:")
+                for line in detail_lines:
+                    self._print(f"    - {line}")
+            if action.description and self.verbose:
                 self._print(f"  描述: {action.description}")
             if base_action_id or base_run_id:
                 base_action_id = base_action_id or "baseline"
                 base_run_id = base_run_id or "baseline"
-                self._print(f"  基于: {base_action_id} ({base_run_id})")
-        if env_overrides:
+                if self.verbose:
+                    self._print(f"  基于: {base_action_id} ({base_run_id})")
+        if env_overrides and self.verbose:
             self._print(f"  环境覆盖: {_fmt_env(env_overrides)}")
-        if run_args:
+        if run_cmd:
+            self._print(f"  运行指令: {run_cmd}")
+        elif run_args and self.verbose:
             self._print(f"  运行参数: {' '.join(run_args)}")
+        if build_cmds:
+            self._print("  构建指令:")
+            for cmd in build_cmds:
+                self._print(f"    - {cmd}")
 
     def profile_result(self, run_output, profile: ProfileReport) -> None:
         if not self.enabled:
@@ -247,6 +293,7 @@ class ConsoleUI:
         iteration: int,
         best_exp: Optional[ExperimentIR],
         best_overall: Optional[ExperimentIR],
+        best_combo: Optional[list[str]] = None,
     ) -> None:
         if not self.enabled:
             return
@@ -269,11 +316,122 @@ class ConsoleUI:
         self._print(
             f"  历史最优: {action_id} 耗时={best_overall.results.runtime_seconds:.4f}s 加速={speedup_str}"
         )
+        if best_combo:
+            self._print(f"  当前最优组合(生效): {' | '.join(best_combo)}")
+
+    def patch_debug(self, action_id: str, attempt: int, status: str, note: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        self._patch_line(
+            action_id=action_id,
+            step=f"debug#{attempt}",
+            status=status,
+            note=note,
+        )
+
+    def patch_proposal(
+        self,
+        action_id: str,
+        status: str,
+        note: Optional[str] = None,
+        diff_stats: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        stats_str = _format_diff_stats(diff_stats)
+        self._patch_line(
+            action_id=action_id,
+            step="proposal(LLM生成补丁)",
+            status=status,
+            note=note,
+            stats=stats_str,
+        )
+
+    def patch_review(
+        self,
+        action_id: str,
+        stage: str,
+        verdict: str,
+        note: Optional[str] = None,
+        diff_stats: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        _STAGE_DESC = {
+            "deterministic": "规则校验",
+            "target_check": "目标文件校验",
+            "llm": "LLM审查",
+        }
+        desc = _STAGE_DESC.get(stage, stage)
+        stats_str = _format_diff_stats(diff_stats)
+        self._patch_line(
+            action_id=action_id,
+            step=f"review.{stage}({desc})",
+            status=verdict,
+            note=note,
+            stats=stats_str,
+        )
+
+    def patch_apply_check(self, action_id: str, ok: bool, reason: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        verdict = "OK" if ok else "FAIL"
+        self._patch_line(
+            action_id=action_id,
+            step="apply_check(git apply试运行)",
+            status=verdict,
+            note=reason,
+        )
+
+    def patch_preflight(self, action_id: str, ok: bool, reason: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        verdict = "OK" if ok else "FAIL"
+        self._patch_line(
+            action_id=action_id,
+            step="preflight(编译检查)",
+            status=verdict,
+            note=reason,
+        )
+
+    def _patch_line(
+        self,
+        action_id: str,
+        step: str,
+        status: str,
+        note: Optional[str] = None,
+        stats: Optional[str] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        line = f"[Patch] 动作={action_id} 步骤={step} 状态={status}"
+        if stats:
+            line += f" {stats}"
+        if note:
+            line += f" 说明={note}"
+        self._print(line)
+
+    def worktree_error(self, exp_id: str, attempts: int, last_error: str) -> None:
+        if not self.enabled:
+            return
+        lines = [
+            f"实验ID: {exp_id}",
+            f"重试次数: {attempts}",
+        ]
+        if last_error:
+            lines.append(f"错误: {last_error}")
+        self._agent("GitWorktree", lines)
 
     def stop(self, reason: str) -> None:
         if not self.enabled:
             return
         self._section("停止")
+        self._print(f"  原因: {reason}")
+
+    def skip(self, reason: str) -> None:
+        if not self.enabled:
+            return
+        self._section("跳过")
         self._print(f"  原因: {reason}")
 
     def final(self, best: Optional[ExperimentIR], report_md: str, report_zh: Optional[str]) -> None:
@@ -334,6 +492,57 @@ def _format_timing(profile: ProfileReport) -> str:
     return " ".join(parts)
 
 
+def _action_change_summary(action: ActionIR, env_overrides: Dict[str, str]) -> List[str]:
+    lines: List[str] = []
+    params = action.parameters or {}
+    if action.notes:
+        lines.append(f"理由: {action.notes}")
+    expected = ",".join(action.expected_effect) if action.expected_effect else ""
+    if expected:
+        lines.append(f"预期效果: {expected}")
+    if env_overrides:
+        env_items = ", ".join(f"{key}={value}" for key, value in env_overrides.items())
+        lines.append(f"环境变量: {env_items}")
+    run_args_cfg = params.get("run_args")
+    if isinstance(run_args_cfg, dict):
+        flags = []
+        for item in run_args_cfg.get("set_flags", []) or []:
+            if not isinstance(item, dict):
+                continue
+            flag = item.get("flag")
+            values = item.get("values") or []
+            if flag:
+                if values:
+                    flags.append(f"{flag} {' '.join(str(v) for v in values)}")
+                else:
+                    flags.append(str(flag))
+        if flags:
+            lines.append(f"运行参数: {' | '.join(flags)}")
+    input_edit = params.get("input_edit")
+    if isinstance(input_edit, list) and input_edit:
+        edits = []
+        for item in input_edit:
+            if not isinstance(item, dict):
+                continue
+            line = item.get("line") or item.get("value")
+            if line:
+                edits.append(str(line))
+        if edits:
+            if len(edits) > 3:
+                edits = edits[:3] + ["..."]
+            lines.append(f"输入修改: {', '.join(edits)}")
+    build_pack = params.get("build_pack") or params.get("build_pack_id")
+    if build_pack:
+        lines.append(f"构建配置: {build_pack}")
+    backend = params.get("backend_enable")
+    if backend:
+        lines.append(f"后端选择: {backend}")
+    patch_family = params.get("patch_family")
+    if patch_family:
+        lines.append(f"补丁类型: {patch_family}")
+    return lines
+
+
 def _extract_variance_cv(exp: ExperimentIR) -> Optional[float]:
     cv = exp.results.derived_metrics.get("variance_cv")
     if cv is not None:
@@ -349,6 +558,12 @@ def _split_lines(text: str, prefix: str) -> List[str]:
     if not items:
         return []
     return [f"{prefix}{item}" for item in items]
+
+
+def _shorten(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
 
 
 def _read_preview_text(path: Optional[str], max_bytes: int) -> Optional[Tuple[str, bool, int]]:

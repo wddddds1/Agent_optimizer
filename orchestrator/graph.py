@@ -1,39 +1,104 @@
 from __future__ import annotations
 
+import base64
+import fnmatch
 import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
 import statistics
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from schemas.action_ir import ActionIR
+from schemas.action_ir import ActionIR, VerificationPlan
 from schemas.analysis_ir import AnalysisResult
 from schemas.experiment_ir import ExperimentIR
 from schemas.job_ir import JobIR, Budgets
 from schemas.profile_report import ProfileReport
+from schemas.patch_proposal_ir import PatchProposal
 from schemas.result_ir import ResultIR
 from skills.build_local import BuildOutput, build_job, collect_binary_provenance
-from skills.hardware_probe import get_system_topology
-from skills.patch_git import GitPatchContext, get_git_head, get_git_status
+from skills.system_caps import collect_system_caps
+from skills.profile_features import build_profile_features
+from skills.action_domain import enforce_candidate_policy, select_actions_for_direction
+from skills.experience_memory import ExperienceMemory
+from skills.patch_triage import validate_patch_action
+from skills.patch_review import review_patch_diff
+from skills.lammps_templates import get_template_context
+from skills.applications import apply_adapter as apply_app_adapter
+from skills.applications import input_edit_allowlist as app_input_allowlist
+from skills.patch_git import (
+    GitPatchContext,
+    WorktreeAddError,
+    _strip_patch_prefix,
+    get_git_head,
+    get_git_status,
+)
 from orchestrator.console import ConsoleUI
 from orchestrator.agents import (
-    AnalystAgent,
     ExecutorAgent,
+    IdeaAgent,
+    CodeSurveyAgent,
+    ActionSynthAgent,
     PlannerAgent,
     ProfilerAgent,
     OptimizerAgent,
+    PatchDebugAgent,
     ReporterAgent,
+    CodePatchAgent,
+    AgenticCodePatchAgent,
+    create_agentic_code_patch_agent,
+    DeepCodeAnalysisAgent,
+    ParameterExplorerAgent,
+    ReflectionAgent,
+    PatchReviewAgent,
     ReviewerAgent,
     RouterRankerAgent,
     TriageAgent,
     VerifierAgent,
 )
+from schemas.code_analysis_ir import DeepCodeAnalysisResult, OptimizationOpportunity
+from orchestrator.agent_llm import AgentConfig
 from orchestrator.memory import OptimizationMemory
 from orchestrator.llm_client import LLMClient
 from orchestrator.router import RuleContext, filter_actions
 from orchestrator.stop import StopState, should_stop
+
+_EXPECTED_EFFECTS = {
+    "comm_reduce",
+    "mem_locality",
+    "compute_opt",
+    "imbalance_reduce",
+    "io_reduce",
+}
+
+
+def _patch_family_effects(
+    patch_families: Optional[Dict[str, object]], family_id: Optional[str]
+) -> List[str]:
+    """Look up patch_tags for a family and return those that are valid expected_effects."""
+    if not patch_families or not family_id:
+        return []
+    for item in patch_families.get("families", []):
+        if isinstance(item, dict) and item.get("id") == family_id:
+            tags = item.get("patch_tags", [])
+            return [t for t in tags if t in _EXPECTED_EFFECTS]
+    return []
+
+
+def _patch_family_gates(
+    patch_families: Optional[Dict[str, object]], family_id: Optional[str]
+) -> List[str]:
+    """Return mandatory gates for a patch family, if any."""
+    if not patch_families or not family_id:
+        return []
+    for item in patch_families.get("families", []):
+        if isinstance(item, dict) and item.get("id") == family_id:
+            return list(item.get("mandatory_gates", []) or [])
+    return []
 
 
 def _best_pass_exp(experiments: List[ExperimentIR]) -> Optional[ExperimentIR]:
@@ -44,6 +109,904 @@ def _best_pass_exp(experiments: List[ExperimentIR]) -> Optional[ExperimentIR]:
         if best is None or exp.results.runtime_seconds < best.results.runtime_seconds:
             best = exp
     return best
+
+
+def _latest_backend_exp(experiments: List[ExperimentIR]) -> Optional[ExperimentIR]:
+    latest = None
+    for exp in experiments:
+        if exp.verdict != "PASS" or not exp.action:
+            continue
+        if exp.action.family == "runtime_backend_select":
+            latest = exp
+            continue
+        params = exp.action.parameters or {}
+        if params.get("backend_enable"):
+            latest = exp
+    return latest
+
+
+def _run_args_has_backend(run_args: List[str]) -> bool:
+    if not run_args:
+        return False
+    for idx, arg in enumerate(run_args):
+        if arg == "-sf" and idx + 1 < len(run_args) and run_args[idx + 1] == "omp":
+            return True
+    return False
+
+
+def _backend_from_args(run_args: List[str]) -> Optional[str]:
+    if not run_args:
+        return None
+    for idx, arg in enumerate(run_args):
+        if arg == "-sf" and idx + 1 < len(run_args):
+            return str(run_args[idx + 1])
+    return None
+
+
+def _is_parallel_threads_action(action: Optional[ActionIR]) -> bool:
+    if not action or not action.parameters:
+        return False
+    env = action.parameters.get("env", {})
+    if not isinstance(env, dict):
+        return False
+    return "OMP_NUM_THREADS" in env
+
+
+def _best_for_target(experiments: List[ExperimentIR], target: str) -> Optional[ExperimentIR]:
+    best = None
+    for exp in experiments:
+        if exp.action is None or exp.verdict != "PASS":
+            continue
+        applies_to = set(exp.action.applies_to or [])
+        if target == "runtime_tier":
+            if not ({"run_config", "input_script"} & applies_to):
+                continue
+        elif target not in applies_to:
+            continue
+        if best is None or exp.results.runtime_seconds < best.results.runtime_seconds:
+            best = exp
+    return best
+
+
+def _best_effective_for_target(
+    experiments: List[ExperimentIR],
+    target: str,
+    baseline_runtime: float,
+    min_improvement_pct: float,
+) -> Optional[ExperimentIR]:
+    best = None
+    for exp in experiments:
+        if exp.action is None or exp.verdict != "PASS":
+            continue
+        applies_to = set(exp.action.applies_to or [])
+        if target == "runtime_tier":
+            if not ({"run_config", "input_script"} & applies_to):
+                continue
+        elif target not in applies_to:
+            continue
+        if baseline_runtime <= 0:
+            continue
+        improvement = (baseline_runtime - exp.results.runtime_seconds) / baseline_runtime
+        if improvement < min_improvement_pct:
+            continue
+        if best is None or exp.results.runtime_seconds < best.results.runtime_seconds:
+            best = exp
+    return best
+
+
+def _best_effective_action_set(
+    experiments: List[ExperimentIR],
+    baseline_runtime: float,
+    min_improvement_pct: float,
+) -> Dict[str, str]:
+    targets = ["run_config", "input_script", "build_config", "source_patch"]
+    best_actions: Dict[str, str] = {}
+    for target in targets:
+        best = _best_effective_for_target(
+            experiments, target, baseline_runtime, min_improvement_pct
+        )
+        if best and best.action:
+            best_actions[target] = best.action.action_id
+    return best_actions
+
+
+def _best_action_chain(
+    experiments: List[ExperimentIR],
+    best_exp: Optional[ExperimentIR],
+) -> List[str]:
+    if not best_exp:
+        return []
+    by_run: Dict[str, ExperimentIR] = {exp.run_id: exp for exp in experiments}
+    chain: List[str] = []
+    current = best_exp
+    seen: set[str] = set()
+    while current and current.run_id not in seen:
+        seen.add(current.run_id)
+        if current.action:
+            chain.append(current.action.action_id)
+        if not current.base_run_id:
+            break
+        current = by_run.get(current.base_run_id)
+    chain.reverse()
+    return chain
+
+
+def _effective_action_combo(
+    experiments: List[ExperimentIR],
+    best_exp: Optional[ExperimentIR],
+) -> List[str]:
+    if not best_exp:
+        return []
+    by_run: Dict[str, ExperimentIR] = {exp.run_id: exp for exp in experiments}
+    applied: Dict[str, str] = {}
+    current = best_exp
+    seen: set[str] = set()
+    while current and current.run_id not in seen:
+        seen.add(current.run_id)
+        if current.action and current.action.applies_to:
+            for target in current.action.applies_to:
+                if target not in applied:
+                    applied[target] = current.action.action_id
+        if not current.base_run_id:
+            break
+        current = by_run.get(current.base_run_id)
+    ordered = ["run_config", "input_script", "build_config", "source_patch"]
+    combo: List[str] = []
+    for key in ordered:
+        if key in applied:
+            combo.append(f"{key}={applied[key]}")
+    for key in sorted(k for k in applied.keys() if k not in ordered):
+        combo.append(f"{key}={applied[key]}")
+    return combo
+
+
+def _extract_variance_cv(exp: ExperimentIR) -> Optional[float]:
+    if not exp or not exp.results:
+        return None
+    cv = exp.results.derived_metrics.get("variance_cv")
+    if isinstance(cv, (int, float)):
+        return float(cv)
+    cv = exp.results.correctness_metrics.get("variance_cv")
+    if isinstance(cv, (int, float)):
+        return float(cv)
+    return None
+
+
+def _action_env_overrides(action: Optional[ActionIR]) -> Dict[str, str]:
+    if not action or not action.parameters:
+        return {}
+    params = action.parameters or {}
+    env: Dict[str, str] = {}
+    for key in ("env", "env_overrides", "env_vars"):
+        value = params.get(key)
+        if isinstance(value, dict):
+            env.update({str(k): str(v) for k, v in value.items()})
+    return env
+
+
+def _is_volatile_action(action: Optional[ActionIR]) -> bool:
+    env = _action_env_overrides(action)
+    if not env:
+        return False
+    dynamic = env.get("OMP_DYNAMIC")
+    if isinstance(dynamic, str) and dynamic.lower() in {"1", "true", "yes", "on"}:
+        return True
+    nested = env.get("OMP_NESTED")
+    if isinstance(nested, str) and nested.lower() in {"1", "true", "yes", "on"}:
+        return True
+    max_levels = env.get("OMP_MAX_ACTIVE_LEVELS")
+    if isinstance(max_levels, str):
+        try:
+            if int(max_levels) > 1:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _merge_run_args_cfg(
+    base: Optional[Dict[str, object]],
+    extra: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    merged: Dict[str, object] = {}
+    if isinstance(base, dict):
+        merged.update(base)
+    if not isinstance(extra, dict):
+        return merged
+    set_flags = list(merged.get("set_flags", []))
+    seen = {item.get("flag") for item in set_flags if isinstance(item, dict)}
+    for item in extra.get("set_flags", []):
+        if not isinstance(item, dict):
+            continue
+        flag = item.get("flag")
+        if flag in seen:
+            continue
+        set_flags.append(item)
+        seen.add(flag)
+    if set_flags:
+        merged["set_flags"] = set_flags
+    return merged
+
+
+def _merge_action_params(actions: List[ActionIR]) -> Dict[str, object]:
+    params: Dict[str, object] = {}
+    env: Dict[str, str] = {}
+    run_args_cfg: Dict[str, object] = {}
+    for action in actions:
+        for key, value in (action.parameters or {}).items():
+            if key == "env" and isinstance(value, dict):
+                env.update({str(k): str(v) for k, v in value.items()})
+                continue
+            if key == "run_args" and isinstance(value, dict):
+                run_args_cfg = _merge_run_args_cfg(run_args_cfg, value)
+                continue
+            params[key] = value
+    if env:
+        params["env"] = env
+    if run_args_cfg:
+        params["run_args"] = run_args_cfg
+    return params
+
+
+def _actions_conflict(a: ActionIR, b: ActionIR) -> bool:
+    """Check if two actions conflict (cannot be composed).
+
+    Two actions conflict if they touch overlapping resources:
+    - Same family (e.g. two parallel_omp variants)
+    - Both are build_config
+    - source_patch touching the same files
+    - Overlapping env variables
+    - Overlapping run_args flags
+    """
+    # Same family always conflicts
+    if a.family == b.family:
+        return True
+    # build_config cannot compose with another build_config
+    if "build_config" in (a.applies_to or []) and "build_config" in (b.applies_to or []):
+        return True
+    # source_patch: conflict if touching same files
+    a_is_patch = "source_patch" in (a.applies_to or [])
+    b_is_patch = "source_patch" in (b.applies_to or [])
+    if a_is_patch and b_is_patch:
+        files_a = set((a.parameters or {}).get("patch_files", []))
+        files_b = set((b.parameters or {}).get("patch_files", []))
+        target_a = (a.parameters or {}).get("target_file", "")
+        target_b = (b.parameters or {}).get("target_file", "")
+        if target_a:
+            files_a.add(target_a)
+        if target_b:
+            files_b.add(target_b)
+        if files_a & files_b:
+            return True
+    # env variable overlap
+    env_a = set((a.parameters or {}).get("env", {}).keys()) if isinstance((a.parameters or {}).get("env"), dict) else set()
+    env_b = set((b.parameters or {}).get("env", {}).keys()) if isinstance((b.parameters or {}).get("env"), dict) else set()
+    if env_a & env_b:
+        return True
+    # run_args flag overlap
+    ra_a = (a.parameters or {}).get("run_args", {})
+    ra_b = (b.parameters or {}).get("run_args", {})
+    flags_a = {f.get("flag") for f in (ra_a.get("set_flags", []) if isinstance(ra_a, dict) else []) if isinstance(f, dict)}
+    flags_b = {f.get("flag") for f in (ra_b.get("set_flags", []) if isinstance(ra_b, dict) else []) if isinstance(f, dict)}
+    if flags_a & flags_b:
+        return True
+    return False
+
+
+def _select_non_conflicting(
+    experiments: List[ExperimentIR],
+    baseline_runtime: float,
+    min_improvement_pct: float,
+    variance_cfg: Optional[Dict[str, object]] = None,
+    variance_repeats: int = 2,
+    baseline_run_id: Optional[str] = None,
+) -> List[ExperimentIR]:
+    """Select the best non-conflicting set of improvements from an iteration.
+
+    Returns a list of experiments sorted by runtime (fastest first), where no
+    two experiments have conflicting actions. Uses a greedy approach: start
+    with the best, add remaining if they don't conflict.
+    """
+    runtime_lookup: Dict[str, float] = {}
+    for exp in experiments:
+        if exp and exp.results and exp.results.runtime_seconds > 0:
+            runtime_lookup[exp.run_id] = exp.results.runtime_seconds
+    if baseline_run_id and baseline_runtime > 0:
+        runtime_lookup.setdefault(baseline_run_id, baseline_runtime)
+    if not runtime_lookup and baseline_runtime <= 0:
+        return []
+
+    cv_max = 1.0
+    if isinstance(variance_cfg, dict):
+        cv_max = float(variance_cfg.get("cv_max", 1.0) or 1.0)
+
+    improved: List[ExperimentIR] = []
+    for exp in experiments:
+        if exp.verdict != "PASS" or not exp.action:
+            continue
+        base_runtime = baseline_runtime
+        if exp.base_run_id and exp.base_run_id in runtime_lookup:
+            base_runtime = runtime_lookup[exp.base_run_id]
+        if base_runtime <= 0:
+            continue
+        gain = (base_runtime - exp.results.runtime_seconds) / base_runtime
+        if gain < min_improvement_pct:
+            continue
+        # Skip unstable volatile actions
+        if _is_volatile_action(exp.action):
+            variance_cv = _extract_variance_cv(exp)
+            samples = exp.results.samples or []
+            if variance_cv is None or len(samples) < variance_repeats or variance_cv > cv_max:
+                continue
+        improved.append(exp)
+
+    # Sort by runtime (fastest first)
+    improved.sort(key=lambda e: e.results.runtime_seconds)
+
+    if len(improved) <= 1:
+        return improved
+
+    # Greedy: start with best, add non-conflicting
+    selected = [improved[0]]
+    for exp in improved[1:]:
+        conflicts = False
+        for sel in selected:
+            if _actions_conflict(exp.action, sel.action):
+                conflicts = True
+                break
+        if not conflicts:
+            selected.append(exp)
+
+    return selected
+
+
+def _build_final_composite_action(
+    components: List[ExperimentIR],
+    gates: Dict[str, object],
+) -> Optional[ActionIR]:
+    if len(components) < 2:
+        return None
+    actions = [exp.action for exp in components if exp.action]
+    if len(actions) < 2:
+        return None
+    applies: List[str] = sorted({t for action in actions for t in (action.applies_to or [])})
+    expected = sorted({e for action in actions for e in (action.expected_effect or [])})
+    params = _merge_action_params(actions)
+    variance_cfg = gates.get("variance", {}) if isinstance(gates, dict) else {}
+    thresholds = {}
+    if isinstance(variance_cfg, dict) and variance_cfg.get("cv_max") is not None:
+        thresholds["variance_cv_max"] = float(variance_cfg.get("cv_max"))
+    risk = "high" if any("source_patch" in action.applies_to for action in actions) else "medium"
+    return ActionIR(
+        action_id="final_composite",
+        family="final_composite",
+        description="Composite of best effective run/input/build/source_patch actions.",
+        applies_to=applies,
+        parameters=params,
+        expected_effect=expected,
+        risk_level=risk,
+        verification_plan=VerificationPlan(
+            gates=["runtime", "correctness", "variance"],
+            thresholds=thresholds,
+        ),
+    )
+
+
+def _opportunities_to_actions(
+    analysis: DeepCodeAnalysisResult,
+    patch_families: Optional[Dict[str, object]],
+    repo_root: Optional[Path] = None,
+    patch_root: str = "",
+) -> List[ActionIR]:
+    """Convert deep analysis opportunities to ActionIR for Phase 2 consumption."""
+    _EFFECTS = {"comm_reduce", "mem_locality", "compute_opt", "imbalance_reduce", "io_reduce"}
+
+    def _norm(raw: str) -> str:
+        """Normalize a path to repo-relative if repo_root is available."""
+        if not repo_root or not raw:
+            return raw
+        normed = _normalise_path_to_repo_rel(raw, repo_root, patch_root)
+        return normed if normed else raw
+
+    # Respect recommended_sequence if available, else sort by priority_rank
+    if analysis.recommended_sequence:
+        opp_map = {op.opportunity_id: op for op in analysis.opportunities}
+        ordered = [opp_map[oid] for oid in analysis.recommended_sequence if oid in opp_map]
+        remaining = [
+            op for op in analysis.opportunities
+            if op.opportunity_id not in set(analysis.recommended_sequence)
+        ]
+        ordered.extend(remaining)
+    else:
+        ordered = sorted(analysis.opportunities, key=lambda op: op.priority_rank)
+
+    actions: List[ActionIR] = []
+    for op in ordered:
+        effects = [e for e in op.expected_effect if e in _EFFECTS]
+        if not effects and op.family_hint:
+            effects = _patch_family_effects(patch_families, op.family_hint)
+        if not effects:
+            effects = ["compute_opt"]
+
+        gates = _patch_family_gates(patch_families, op.family_hint) if op.family_hint else []
+        if not gates:
+            gates = ["runtime", "correctness", "variance"]
+
+        norm_target_files = [_norm(tf) for tf in op.target_files]
+        norm_target_file = norm_target_files[0] if norm_target_files else ""
+
+        action = ActionIR(
+            action_id=f"deep.{op.opportunity_id}",
+            family="source_patch",
+            description=f"{op.title}: {op.mechanism}" if op.mechanism else op.title,
+            applies_to=["source_patch"],
+            parameters={
+                "patch_family": op.family_hint or op.category,
+                "target_file": norm_target_file,
+                "code_context": op.code_context,
+                "reference_code": op.reference_code,
+                "compiler_gap": op.compiler_gap,
+                "diagnosis": op.diagnosis,
+                "mechanism": op.mechanism,
+                "assembly_evidence": op.assembly_evidence,
+                "origin": "deep_code_analysis",
+                "deep_analysis_id": op.opportunity_id,
+                "implementation_complexity": op.implementation_complexity,
+                "depends_on": list(op.depends_on),
+                "conflicts_with": list(op.conflicts_with),
+                "composable_with": list(op.composable_with),
+                "target_files": norm_target_files,
+            },
+            expected_effect=effects,
+            risk_level=op.risk_level or "medium",
+            verification_plan=VerificationPlan(gates=gates),
+        )
+        actions.append(action)
+    return actions
+
+
+def _select_opportunity_batch(
+    opportunities: List[ActionIR],
+    min_batch: int = 3,
+    max_batch: int = 5,
+    succeeded_ids: Optional[set] = None,
+    failed_ids: Optional[set] = None,
+) -> List[ActionIR]:
+    """Select a batch of compatible opportunities for one iteration.
+
+    Algorithm:
+    1. Filter out opportunities whose dependencies are unmet or that have failed.
+    2. Build conflict pairs from ``conflicts_with``.
+    3. Greedily pick highest-priority opportunities that don't conflict with
+       those already selected, preferring composable partners.
+
+    The function does NOT check for file-level overlap (``_actions_conflict``)
+    because within one iteration actions compete independently (all built on
+    ``best_chain_exp``).  File-level conflicts are resolved later by
+    ``_select_non_conflicting``.
+    """
+    succeeded = succeeded_ids or set()
+    failed = failed_ids or set()
+
+    # --- 1. Filter ---
+    eligible: List[ActionIR] = []
+    for opp in opportunities:
+        params = opp.parameters or {}
+        da_id = params.get("deep_analysis_id", "")
+        if da_id in failed:
+            continue
+        deps = params.get("depends_on", [])
+        if deps and not all(d in succeeded for d in deps):
+            continue
+        eligible.append(opp)
+
+    if not eligible:
+        return []
+
+    # --- 2. Conflict pairs ---
+    conflict_map: Dict[str, set] = {}
+    for opp in eligible:
+        params = opp.parameters or {}
+        da_id = params.get("deep_analysis_id", "")
+        conflicts = set(params.get("conflicts_with", []))
+        conflict_map[da_id] = conflicts
+
+    # --- 3. Composability affinity ---
+    composable_map: Dict[str, set] = {}
+    for opp in eligible:
+        params = opp.parameters or {}
+        da_id = params.get("deep_analysis_id", "")
+        composable_map[da_id] = set(params.get("composable_with", []))
+
+    # --- 4. Greedy selection ---
+    selected: List[ActionIR] = []
+    selected_ids: set = set()
+
+    for opp in eligible:
+        if len(selected) >= max_batch:
+            break
+        da_id = (opp.parameters or {}).get("deep_analysis_id", "")
+        # Check conflict with already-selected
+        dominated = False
+        for sid in selected_ids:
+            if da_id in conflict_map.get(sid, set()) or sid in conflict_map.get(da_id, set()):
+                dominated = True
+                break
+        if dominated:
+            continue
+        selected.append(opp)
+        selected_ids.add(da_id)
+
+    # If below min_batch but more eligible exist, don't force — return what we have.
+    return selected
+
+
+def _sanitize_param_explorer_env(candidates: List[ActionIR]) -> None:
+    """Remove thread/binding env overrides from non-thread actions.
+
+    This ensures that once a good thread count is found, subsequent
+    non-thread actions inherit it from the base job instead of resetting
+    to OMP_NUM_THREADS=1 in their own env overrides.
+    """
+    thread_env_keys = {
+        "OMP_NUM_THREADS",
+        "OMP_PROC_BIND",
+        "OMP_PLACES",
+        "OMP_DYNAMIC",
+    }
+    thread_families = {
+        "parallel_omp",
+        "affinity_tune",
+        "parallel_mpi",
+        "mpi_omp_hybrid",
+        "runtime_backend_select",
+    }
+    for cand in candidates:
+        if not cand.parameters or "env" not in cand.parameters:
+            continue
+        if cand.family in thread_families:
+            continue
+        env = dict(cand.parameters.get("env") or {})
+        if not env:
+            continue
+        changed = False
+        for key in thread_env_keys:
+            if key in env:
+                env.pop(key, None)
+                changed = True
+        if changed:
+            if env:
+                cand.parameters["env"] = env
+            else:
+                cand.parameters.pop("env", None)
+
+
+def _run_parameter_exploration_phase(
+    job: JobIR,
+    actions: List[ActionIR],
+    baseline_exp: ExperimentIR,
+    executor: "ExecutorAgent",
+    profiler: "ProfilerAgent",
+    verifier: "VerifierAgent",
+    policy: Dict[str, object],
+    gates: Dict[str, object],
+    artifacts_dir: Path,
+    time_command: Optional[str],
+    wrappers_cfg: Optional[List[Dict[str, object]]],
+    build_cfg: Optional[Dict[str, object]],
+    build_packs: Optional[Dict[str, object]],
+    adapter_cfg: Optional[Dict[str, object]],
+    planner_cfg: Optional[Dict[str, object]],
+    experience_memory: "ExperienceMemory",
+    memory: "OptimizationMemory",
+    state: StopState,
+    trace_events: List[Dict[str, object]],
+    reporter: Optional[ConsoleUI],
+    repo_root: Path,
+    system_caps: Dict[str, object],
+    chain_min_improvement_pct: float,
+) -> Tuple[Optional[ExperimentIR], List[ExperimentIR]]:
+    """Phase 1: agentic parameter exploration + single-batch evaluation.
+
+    Returns:
+        (best_param_exp, all_experiments) — best_param_exp is None if exploration
+        failed or produced no improvements.
+    """
+    two_phase_cfg = (planner_cfg or {}).get("two_phase", {})
+    explorer_cfg = two_phase_cfg.get("parameter_explorer", {}) if isinstance(two_phase_cfg, dict) else {}
+
+    if reporter:
+        reporter._section("Phase 1: Agentic Parameter Exploration")
+
+    # Build AgentConfig from explorer settings
+    agent_config = AgentConfig(
+        enabled=True,
+        api_key_env=explorer_cfg.get("api_key_env", "DEEPSEEK_API_KEY"),
+        base_url=explorer_cfg.get("base_url", "https://api.deepseek.com"),
+        model=explorer_cfg.get("model", "deepseek-chat"),
+        temperature=float(explorer_cfg.get("temperature", 0.3)),
+        max_tokens=4096,
+        max_turns=int(explorer_cfg.get("max_turns", 20)),
+        max_tool_calls_per_turn=int(explorer_cfg.get("max_tool_calls_per_turn", 5)),
+    )
+
+    input_script_path = Path(job.input_script) if job.input_script else None
+
+    agent = ParameterExplorerAgent(
+        config=agent_config,
+        repo_root=repo_root / "third_party" / "lammps",
+        input_script_path=input_script_path,
+        experience_db=experience_memory,
+    )
+
+    # Build profile dict
+    profile_data = {}
+    if baseline_exp.profile_report:
+        pr = baseline_exp.profile_report
+        profile_data = {
+            "timing_breakdown": pr.timing_breakdown,
+            "system_metrics": pr.system_metrics,
+            "notes": pr.notes,
+        }
+
+    # Reconstruct action_space dict for the agent
+    action_space = {
+        "families": [],
+        "actions": [],
+    }
+    seen_families = set()
+    for a in actions:
+        if a.family not in seen_families:
+            seen_families.add(a.family)
+            action_space["families"].append({
+                "id": a.family,
+                "description": "",
+                "expected_effect": list(a.expected_effect) if a.expected_effect else [],
+            })
+        action_space["actions"].append(a.model_dump())
+
+    job_context = {
+        "app": job.app,
+        "case_id": job.case_id,
+        "tags": job.tags or [],
+        "system_caps": system_caps,
+    }
+
+    trace_events.append({
+        "event": "phase1_start",
+        "agent": "ParameterExplorerAgent",
+    })
+
+    # Run exploration
+    result = agent.explore(
+        profile=profile_data,
+        action_space=action_space,
+        job_context=job_context,
+    )
+
+    trace_events.append({
+        "event": "phase1_exploration_done",
+        "agent": "ParameterExplorerAgent",
+        "status": result.status,
+        "num_candidates": len(result.candidates),
+        "total_turns": result.total_turns,
+        "total_tokens": result.total_tokens,
+        "platform_summary": result.platform_summary,
+        "rationale": result.rationale[:500] if result.rationale else "",
+    })
+
+    if result.status != "OK" or not result.candidates:
+        if reporter:
+            reporter._print(
+                f"Phase 1 exploration: {result.status}, "
+                f"{len(result.candidates)} candidates — falling back to iterative mode"
+            )
+        return None, []
+
+    if reporter:
+        reporter._print(
+            f"Phase 1: {len(result.candidates)} parameter candidates proposed "
+            f"({result.total_turns} turns, {result.total_tokens} tokens)"
+        )
+
+    # Auto-inject backend_enable for parallel_omp actions so the LAMMPS
+    # adapter adds ``-sf omp`` to run_args.  Without this, setting
+    # OMP_NUM_THREADS alone has no effect because LAMMPS pair styles
+    # default to serial kernels.
+    _PARALLEL_FAMILIES = {"parallel_omp", "affinity_tune"}
+    for cand in result.candidates:
+        needs_backend = (
+            _is_parallel_threads_action(cand)
+            or (cand.family and cand.family in _PARALLEL_FAMILIES)
+        )
+        if needs_backend:
+            params = dict(cand.parameters or {})
+            if not params.get("backend_enable"):
+                params["backend_enable"] = "openmp"
+                cand.parameters = params
+
+    _sanitize_param_explorer_env(result.candidates)
+
+    # Ensure app-specific adapter logic runs for agent-proposed actions.
+    result.candidates = _apply_adapter(result.candidates, adapter_cfg, job)
+
+    # Filter out MPI launcher actions when the binary lacks real MPI support.
+    result.candidates = _filter_mpi_actions(result.candidates, job, reporter)
+
+    # Execute all candidates in a single batch
+    all_experiments: List[ExperimentIR] = []
+    baseline_runtime = baseline_exp.results.runtime_seconds
+    current_base_exp = baseline_exp
+    current_base_runtime = baseline_runtime
+    base_run_id = baseline_exp.run_id
+    base_action_id = baseline_exp.action.action_id if baseline_exp.action else None
+    base_job = baseline_exp.job
+
+    for i, candidate in enumerate(result.candidates):
+        exp_id = f"phase1-{candidate.action_id}"
+        if reporter:
+            reporter._print(f"  [{i + 1}/{len(result.candidates)}] {candidate.action_id}")
+
+        try:
+            exp = executor.execute(
+                exp_id=exp_id,
+                job=job,
+                base_job=base_job,
+                base_run_id=base_run_id,
+                base_action_id=base_action_id,
+                action=candidate,
+                actions_root=repo_root,
+                policy=policy,
+                gates=gates,
+                profiler=profiler,
+                verifier=verifier,
+                artifacts_dir=artifacts_dir,
+                time_command=time_command,
+                wrappers_cfg=wrappers_cfg,
+                build_cfg=build_cfg or {},
+                build_packs=build_packs,
+                adapter_cfg=adapter_cfg,
+                repeats=1,
+                runtime_agg="mean",
+                baseline_exp=baseline_exp,
+                baseline_exp_for_verify=baseline_exp,
+                baseline_runtime=baseline_runtime,
+                prior_samples=None,
+                trace_events=trace_events,
+                parent_run_id=None,
+                iteration=0,
+                llm_trace=None,
+                reporter=reporter,
+            )
+            all_experiments.append(exp)
+            memory.record(exp)
+            state.run_count += 1
+
+            experience_memory.record_experiment(exp, baseline_exp)
+            if exp.verdict == "PASS" and exp.results and exp.results.runtime_seconds > 0:
+                improvement = (
+                    (current_base_runtime - exp.results.runtime_seconds) / current_base_runtime
+                    if current_base_runtime > 0
+                    else 0.0
+                )
+                if improvement >= chain_min_improvement_pct:
+                    current_base_exp = exp
+                    current_base_runtime = exp.results.runtime_seconds
+                    base_run_id = exp.run_id
+                    base_action_id = exp.action.action_id if exp.action else "baseline"
+                    base_job = exp.job
+                    trace_events.append(
+                        {
+                            "event": "phase1_base_update",
+                            "agent": "Orchestrator",
+                            "run_id": exp.run_id,
+                            "action_id": base_action_id,
+                            "improvement": improvement,
+                        }
+                    )
+
+        except Exception as exc:
+            trace_events.append({
+                "event": "phase1_candidate_error",
+                "agent": "ExecutorAgent",
+                "action_id": candidate.action_id,
+                "error": str(exc),
+            })
+            continue
+
+    # Select best non-conflicting combination
+    winners = _select_non_conflicting(
+        all_experiments,
+        baseline_runtime,
+        chain_min_improvement_pct,
+        baseline_run_id=baseline_exp.run_id,
+    )
+
+    if not winners:
+        if reporter:
+            reporter._print("Phase 1: No candidates improved over baseline")
+        trace_events.append({
+            "event": "phase1_no_winners",
+            "agent": "Orchestrator",
+        })
+        return None, all_experiments
+
+    best_exp = winners[0]
+
+    if len(winners) > 1:
+        # Build composite action and validate
+        composite_action = _build_final_composite_action(winners, gates)
+        if composite_action:
+            comp_exp_id = "phase1-composite"
+            try:
+                comp_exp = executor.execute(
+                    exp_id=comp_exp_id,
+                    job=job,
+                    base_job=base_job,
+                    base_run_id=base_run_id,
+                    base_action_id=base_action_id,
+                    action=composite_action,
+                    actions_root=repo_root,
+                    policy=policy,
+                    gates=gates,
+                    profiler=profiler,
+                    verifier=verifier,
+                    artifacts_dir=artifacts_dir,
+                    time_command=time_command,
+                    wrappers_cfg=wrappers_cfg,
+                    build_cfg=build_cfg or {},
+                    build_packs=build_packs,
+                    adapter_cfg=adapter_cfg,
+                    repeats=1,
+                    runtime_agg="mean",
+                    baseline_exp=baseline_exp,
+                    baseline_exp_for_verify=baseline_exp,
+                    baseline_runtime=baseline_runtime,
+                    prior_samples=None,
+                    trace_events=trace_events,
+                    parent_run_id=None,
+                    iteration=0,
+                    llm_trace=None,
+                    reporter=reporter,
+                )
+                all_experiments.append(comp_exp)
+                memory.record(comp_exp)
+                state.run_count += 1
+
+                if (
+                    comp_exp.verdict == "PASS"
+                    and comp_exp.results.runtime_seconds < best_exp.results.runtime_seconds
+                ):
+                    best_exp = comp_exp
+                    if reporter:
+                        reporter._print("Phase 1: Composite outperforms single best")
+            except Exception as exc:
+                trace_events.append({
+                    "event": "phase1_composite_error",
+                    "agent": "ExecutorAgent",
+                    "error": str(exc),
+                })
+
+    speedup = baseline_runtime / best_exp.results.runtime_seconds if best_exp.results.runtime_seconds > 0 else 1.0
+    if reporter:
+        reporter._print(
+            f"Phase 1 result: {best_exp.run_id} — "
+            f"{best_exp.results.runtime_seconds:.3f}s "
+            f"({speedup:.2f}x vs baseline)"
+        )
+
+    trace_events.append({
+        "event": "phase1_done",
+        "agent": "Orchestrator",
+        "best_run_id": best_exp.run_id,
+        "best_runtime": best_exp.results.runtime_seconds,
+        "speedup": speedup,
+        "total_candidates": len(result.candidates),
+        "total_experiments": len(all_experiments),
+        "winners": len(winners),
+    })
+
+    return best_exp, all_experiments
 
 
 def _stop_reason(
@@ -187,8 +1150,2188 @@ def _best_summary(
     }
 
 
-def _system_caps() -> Dict[str, object]:
-    return get_system_topology()
+def _extract_phase_transitions(trace_events: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    transitions: List[Dict[str, object]] = []
+    for event in trace_events:
+        if event.get("event") != "phase_transition":
+            continue
+        transitions.append(
+            {
+                "iteration": event.get("iteration"),
+                "from_phase": event.get("from_phase"),
+                "to_phase": event.get("to_phase"),
+                "frozen_run_id": event.get("frozen_run_id"),
+                "frozen_build_id": event.get("frozen_build_id"),
+                "reason": event.get("reason"),
+            }
+        )
+    return transitions
+
+
+def _phase_targets(phase: str) -> set[str]:
+    if phase == "RUN_TUNE":
+        return {"run_config", "input_script"}
+    if phase == "BUILD_TUNE":
+        return {"build_config"}
+    if phase == "RUN_RETUNE":
+        return {"run_config", "input_script"}
+    if phase == "PATCH":
+        return {"source_patch"}
+    return {"run_config"}
+
+
+def _coverage_floor_families(
+    phase: str,
+    eligible_pool: List[ActionIR],
+    remaining_by_family: Dict[str, int],
+) -> List[str]:
+    families_by_target: Dict[str, set[str]] = {
+        "run_config": set(),
+        "input_script": set(),
+        "build_config": set(),
+        "source_patch": set(),
+    }
+    for action in eligible_pool:
+        if remaining_by_family.get(action.family, 0) <= 0:
+            continue
+        for target in action.applies_to or []:
+            if target in families_by_target:
+                families_by_target[target].add(action.family)
+    if phase in {"RUN_TUNE", "RUN_RETUNE"}:
+        return sorted(families_by_target["run_config"] | families_by_target["input_script"])
+    if phase == "BUILD_TUNE":
+        return sorted(families_by_target["build_config"])
+    if phase == "PATCH":
+        return sorted(families_by_target["source_patch"])
+    return []
+
+
+def _families_by_target(
+    eligible_pool: List[ActionIR],
+    remaining_by_family: Dict[str, int],
+) -> Dict[str, List[str]]:
+    families: Dict[str, set[str]] = {
+        "run_config": set(),
+        "input_script": set(),
+        "build_config": set(),
+        "source_patch": set(),
+    }
+    for action in eligible_pool:
+        if remaining_by_family.get(action.family, 0) <= 0:
+            continue
+        for target in action.applies_to or []:
+            if target in families:
+                families[target].add(action.family)
+    return {key: sorted(vals) for key, vals in families.items()}
+
+
+def _inject_family(
+    chosen: List[str],
+    candidates: List[str],
+    prefer: List[str],
+    max_families: int = 2,
+) -> List[str]:
+    if not candidates:
+        return chosen
+    if any(fam in chosen for fam in candidates):
+        return chosen
+    pick = None
+    for fam in prefer:
+        if fam in candidates:
+            pick = fam
+            break
+    if pick is None:
+        pick = candidates[0]
+    if pick in chosen:
+        return chosen
+    if len(chosen) >= max_families:
+        chosen = chosen[:-1] + [pick]
+    else:
+        chosen = chosen + [pick]
+    # keep unique order
+    deduped: List[str] = []
+    for fam in chosen:
+        if fam not in deduped:
+            deduped.append(fam)
+    return deduped
+
+
+def _dedupe_actions(actions: List[ActionIR]) -> List[ActionIR]:
+    deduped: List[ActionIR] = []
+    seen: set[str] = set()
+    for action in actions:
+        if action.action_id in seen:
+            continue
+        seen.add(action.action_id)
+        deduped.append(action)
+    return deduped
+
+
+def _best_non_patch_experiment(experiments: List[ExperimentIR]) -> Optional[ExperimentIR]:
+    best: Optional[ExperimentIR] = None
+    for exp in experiments:
+        if exp.verdict != "PASS":
+            continue
+        if exp.action and exp.action.family == "source_patch":
+            continue
+        if exp.results is None:
+            continue
+        if best is None or exp.results.runtime_seconds < best.results.runtime_seconds:
+            best = exp
+    return best
+
+
+def _load_patch_replay_actions(
+    artifacts_root: Path,
+    case_id: str,
+    backend: Optional[str],
+    min_gain_pct: float,
+    max_actions: int,
+    existing_action_ids: set[str],
+    patch_families_cfg: Dict[str, object],
+) -> List[ActionIR]:
+    sessions_root = artifacts_root / "sessions"
+    if not sessions_root.exists() or max_actions <= 0:
+        return []
+    families_meta: Dict[str, Dict[str, object]] = {}
+    for item in (patch_families_cfg or {}).get("families", []):
+        if isinstance(item, dict) and item.get("id"):
+            families_meta[item["id"]] = item
+    replay_candidates: List[Tuple[float, ExperimentIR]] = []
+    for session in sessions_root.iterdir():
+        runs_dir = session / "runs"
+        if not runs_dir.is_dir():
+            continue
+        for run_dir in runs_dir.iterdir():
+            exp_path = run_dir / "experiment.json"
+            if not exp_path.exists():
+                continue
+            try:
+                exp = ExperimentIR.model_validate_json(exp_path.read_text())
+            except Exception:
+                continue
+            if exp.action is None or exp.action.family != "source_patch":
+                continue
+            if exp.verdict != "PASS" or exp.results is None:
+                continue
+            if exp.job.case_id != case_id:
+                continue
+            if backend and exp.job.run_args:
+                if _backend_from_args(exp.job.run_args) not in (backend, None):
+                    continue
+            derived = exp.results.derived_metrics or {}
+            speedup = derived.get("speedup_vs_baseline_check") or derived.get("speedup_vs_baseline")
+            try:
+                speedup = float(speedup)
+            except (TypeError, ValueError):
+                speedup = None
+            if speedup is None:
+                continue
+            improvement_pct = (speedup - 1.0) * 100.0
+            if improvement_pct < min_gain_pct:
+                continue
+            patch_path = exp.patch_path
+            if not patch_path or not Path(patch_path).exists():
+                continue
+            replay_candidates.append((improvement_pct, exp))
+    replay_candidates.sort(key=lambda item: item[0], reverse=True)
+    actions: List[ActionIR] = []
+    for improvement_pct, exp in replay_candidates:
+        action = exp.action
+        if action is None:
+            continue
+        patch_family = (action.parameters or {}).get("patch_family")
+        meta = families_meta.get(patch_family, {})
+        expected_effect = meta.get("patch_tags") if isinstance(meta, dict) else None
+        if not expected_effect:
+            expected_effect = action.expected_effect or ["compute_opt"]
+        if isinstance(expected_effect, str):
+            expected_effect = [expected_effect]
+        expected_effect = [eff for eff in (expected_effect or []) if eff in _EXPECTED_EFFECTS]
+        if not expected_effect:
+            expected_effect = ["compute_opt"]
+        action_id = f"replay.{action.action_id}.{exp.run_id}"
+        if action_id in existing_action_ids:
+            continue
+        params = dict(action.parameters or {})
+        params["patch_path"] = exp.patch_path
+        params.setdefault("origin", "memory_replay")
+        params.setdefault("replay_run_id", exp.run_id)
+        replay = ActionIR(
+            action_id=action_id,
+            family="source_patch",
+            description=f"Replay patch from {exp.run_id}.",
+            applies_to=["source_patch"],
+            parameters=params,
+            preconditions=action.preconditions or [],
+            constraints=action.constraints or [],
+            expected_effect=expected_effect,
+            risk_level=action.risk_level or meta.get("risk", "medium"),
+            verification_plan=action.verification_plan,
+        )
+        actions.append(replay)
+        if len(actions) >= max_actions:
+            break
+    return actions
+
+
+def _summarize_input_script(text: str) -> Dict[str, str]:
+    summary: Dict[str, str] = {}
+    keys = {
+        "pair_style": "pair_style",
+        "kspace_style": "kspace_style",
+        "kspace_modify": "kspace_modify",
+        "neighbor": "neighbor",
+        "neigh_modify": "neigh_modify",
+        "thermo": "thermo",
+        "dump": "dump",
+        "comm_modify": "comm_modify",
+        "newton": "newton",
+    }
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for prefix, key in keys.items():
+            if line.startswith(prefix) and key not in summary:
+                summary[key] = line
+                break
+    return summary
+
+
+def _normalise_path_to_repo_rel(
+    raw: str, repo_root: Path, patch_root: str
+) -> Optional[str]:
+    """Resolve a file path to repo-relative, adding patch_root prefix if needed.
+
+    Standalone version usable outside the iteration-loop closure.
+    """
+    p = raw
+    if Path(p).is_absolute():
+        try:
+            p = Path(p).relative_to(repo_root).as_posix()
+        except ValueError:
+            return None
+    if patch_root and not p.startswith(patch_root):
+        candidate = f"{patch_root}/{p}"
+        if (repo_root / candidate).is_file():
+            return candidate
+    if (repo_root / p).is_file():
+        return p
+    return None
+
+
+def _hotspot_map(
+    input_text: str,
+    repo_root: Path,
+    run_args: List[str],
+    patch_root: str = "",
+    deep_analysis_result: Optional["DeepCodeAnalysisResult"] = None,
+) -> Dict[str, object]:
+    pair_files = _pair_style_files(input_text, repo_root, run_args)
+    hotspot_files = list(pair_files)
+    if deep_analysis_result and deep_analysis_result.hotspot_files:
+        for hf in deep_analysis_result.hotspot_files:
+            norm = _normalise_path_to_repo_rel(hf, repo_root, patch_root)
+            if norm and norm not in hotspot_files:
+                hotspot_files.insert(0, norm)
+    return {
+        "pair_style_files": pair_files,
+        "hotspot_files": hotspot_files,
+    }
+
+
+def _adapter_hints(job: JobIR, adapter_cfg: Optional[Dict[str, object]]) -> Dict[str, object]:
+    base_keys = [
+        "target_file",
+        "target_anchor",
+        "snippet_tag",
+        "origin",
+        "wrapper_id",
+    ]
+    if job.app != "lammps":
+        return {"parameter_keys": base_keys}
+    return {
+        "input_edit_allowlist": app_input_allowlist(),
+        "parameter_keys": [
+            *base_keys,
+            "neighbor_skin",
+            "neighbor_every",
+            "output_thermo_every",
+            "output_dump_every",
+            "comm_cutoff",
+            "comm_mode",
+            "newton_setting",
+            "kspace_accuracy",
+            "kspace_style",
+            "backend_enable",
+            "backend_threads",
+            "env",
+            "run_args",
+            "runtime_env",
+            "lib_env",
+            "mpi_env",
+            "io_env",
+        ],
+    }
+
+
+def _build_planner_context(
+    job: JobIR,
+    input_summary: Dict[str, str],
+    profile: ProfileReport,
+    profile_features: Dict[str, object],
+    hotspot_map: Dict[str, object],
+    system_caps: Dict[str, object],
+) -> Dict[str, object]:
+    return {
+        "job": {
+            "app": job.app,
+            "case_id": job.case_id,
+            "tags": job.tags,
+        },
+        "input_summary": input_summary,
+        "profile": {
+            "timing_breakdown": profile.timing_breakdown,
+            "system_metrics": profile.system_metrics,
+        },
+        "profile_features": profile_features,
+        "hotspot_map": hotspot_map,
+        "system_caps": system_caps,
+    }
+
+
+def _action_space_summary(
+    actions: List[ActionIR],
+    patch_families: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    families = sorted({action.family for action in actions})
+    patch_family_ids: List[str] = []
+    patch_family_defs: List[Dict[str, object]] = []
+    for item in (patch_families or {}).get("families", []):
+        if not isinstance(item, dict):
+            continue
+        family_id = item.get("id")
+        if not family_id:
+            continue
+        patch_family_ids.append(str(family_id))
+        patch_family_defs.append(
+            {
+                "id": str(family_id),
+                "description": item.get("description", ""),
+                "transform_types": item.get("transform_types", []),
+                "patch_tags": item.get("patch_tags", []),
+                "risk": item.get("risk", ""),
+                "requires_caps": item.get("requires_caps", []),
+                "reference_file": item.get("reference_file", ""),
+                "profiling_trigger": item.get("profiling_trigger", []),
+                "compiler_covered": bool(item.get("compiler_covered")),
+                "tier": item.get("tier", "algorithm"),
+            }
+        )
+    patch_actions = [action.action_id for action in actions if action.family == "source_patch"]
+    if len(patch_actions) > 50:
+        patch_actions = patch_actions[:50]
+    return {
+        "families": families,
+        "patch_families": patch_family_ids,
+        "patch_family_defs": patch_family_defs,
+        "source_patch_actions": patch_actions,
+    }
+
+
+def _summarize_code_survey(
+    code_survey_payload: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {"count": 0, "files": [], "patch_families": []}
+    if not code_survey_payload:
+        return summary
+    opportunities = code_survey_payload.get("opportunities", [])
+    if not isinstance(opportunities, list):
+        return summary
+    files: List[str] = []
+    families: List[str] = []
+    for item in opportunities:
+        if not isinstance(item, dict):
+            continue
+        file_path = item.get("file_path")
+        patch_family = item.get("patch_family")
+        if isinstance(file_path, str):
+            files.append(file_path)
+        if isinstance(patch_family, str):
+            families.append(patch_family)
+    summary["count"] = len(opportunities)
+    summary["files"] = sorted(set(files))
+    summary["patch_families"] = sorted(set(families))
+    return summary
+
+
+def _actions_from_opportunities(
+    opportunities: List[Dict[str, object]],
+    patch_families: Optional[Dict[str, object]],
+    max_actions: int = 4,
+) -> List[ActionIR]:
+    if not opportunities or not patch_families:
+        return []
+    families_cfg = patch_families.get("families")
+    if not isinstance(families_cfg, list):
+        return []
+    family_meta: Dict[str, Dict[str, object]] = {}
+    for entry in families_cfg:
+        if isinstance(entry, dict) and entry.get("id"):
+            family_meta[str(entry["id"])] = entry
+    normalized: List[Dict[str, object]] = []
+    for item in opportunities:
+        if not isinstance(item, dict):
+            continue
+        patch_family = item.get("patch_family")
+        file_path = item.get("file_path")
+        if not isinstance(patch_family, str) or patch_family not in family_meta:
+            continue
+        if not isinstance(file_path, str):
+            continue
+        normalized.append(item)
+    normalized.sort(
+        key=lambda item: float(item.get("confidence") or 0.0),
+        reverse=True,
+    )
+    actions: List[ActionIR] = []
+    for item in normalized[:max_actions]:
+        patch_family = str(item.get("patch_family"))
+        meta = family_meta.get(patch_family, {})
+        tag_list = meta.get("patch_tags") or []
+        expected_effect = [tag for tag in tag_list if tag in _EXPECTED_EFFECTS]
+        action_id = f"generated.patch.{patch_family}.{item.get('opportunity_id')}"
+        params: Dict[str, object] = {
+            "patch_family": patch_family,
+            "target_file": item.get("file_path"),
+            "target_anchor": item.get("anchor_hint"),
+            "snippet_tag": item.get("snippet_tag"),
+            "origin": "code_survey",
+        }
+        evidence = item.get("evidence")
+        if isinstance(evidence, list) and evidence:
+            params["evidence"] = evidence
+        actions.append(
+            ActionIR(
+                action_id=str(action_id),
+                family="source_patch",
+                description=str(meta.get("description") or patch_family),
+                applies_to=["source_patch"],
+                parameters=params,
+                expected_effect=expected_effect,
+                risk_level=str(meta.get("risk") or "medium"),
+                verification_plan=VerificationPlan(
+                    gates=list(meta.get("mandatory_gates") or ["runtime"]),
+                    thresholds={},
+                ),
+            )
+        )
+    return actions
+
+
+def _write_generated_actions(
+    run_dir: Path,
+    generated_actions: List[ActionIR],
+    ideas: Optional[Dict[str, object]] = None,
+    code_survey: Optional[Dict[str, object]] = None,
+) -> None:
+    payload = {
+        "actions": [action.model_dump() for action in generated_actions],
+        "ideas": ideas or {},
+        "code_survey": code_survey or {},
+    }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "generated_actions.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8"
+    )
+
+
+def _patch_rules(
+    adapter_cfg: Optional[Dict[str, object]],
+    policy: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    rules: Dict[str, object] = {}
+    if isinstance(policy, dict):
+        base = policy.get("source_patch_rules")
+        if isinstance(base, dict):
+            rules.update(base)
+    if isinstance(adapter_cfg, dict):
+        adapter_rules = adapter_cfg.get("patch_rules")
+        if isinstance(adapter_rules, dict):
+            rules.update(adapter_rules)
+        # Carry patch_root so review_patch_diff can match paths with prefix
+        patch_root = adapter_cfg.get("patch_root")
+        if patch_root:
+            rules["patch_root"] = patch_root
+    return rules
+
+
+def _patch_scope_config(policy: Optional[Dict[str, object]]) -> Dict[str, object]:
+    if not isinstance(policy, dict):
+        return {}
+    scope = policy.get("source_patch_scope")
+    if not isinstance(scope, dict):
+        return {}
+    levels = scope.get("levels")
+    if not isinstance(levels, list):
+        levels = []
+    start_level = scope.get("start_level")
+    if isinstance(start_level, str) and start_level not in levels:
+        start_level = None
+    return {
+        "levels": levels,
+        "start_level": start_level or (levels[0] if levels else None),
+        "promote": scope.get("promote", {}) if isinstance(scope.get("promote"), dict) else {},
+        "coverage": scope.get("coverage", {}) if isinstance(scope.get("coverage"), dict) else {},
+    }
+
+
+def _apply_patch_scope(
+    patch_rules: Dict[str, object],
+    scope_id: Optional[str],
+) -> Dict[str, object]:
+    if not scope_id:
+        return patch_rules
+    scope_levels = patch_rules.get("scope_levels")
+    if not isinstance(scope_levels, dict):
+        return patch_rules
+    scope_cfg = scope_levels.get(scope_id)
+    if not isinstance(scope_cfg, dict):
+        return patch_rules
+    merged = dict(patch_rules)
+    for key in (
+        "allowed_globs",
+        "hotspot_only",
+        "max_lines_changed",
+        "max_files_changed",
+        "max_snippets",
+        "max_context_chars",
+    ):
+        if key in scope_cfg:
+            merged[key] = scope_cfg[key]
+    merged["active_scope"] = scope_id
+    return merged
+
+
+def _untried_patch_families(
+    experiments: List[ExperimentIR],
+    patch_families: Optional[Dict[str, object]],
+) -> set[str]:
+    if not patch_families:
+        return set()
+    families = patch_families.get("families")
+    if not isinstance(families, list):
+        return set()
+    all_families = {
+        str(entry["id"])
+        for entry in families
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    tried: set[str] = set()
+    for exp in experiments:
+        action = exp.action
+        if not action or action.family != "source_patch":
+            continue
+        patch_family = (action.parameters or {}).get("patch_family")
+        if isinstance(patch_family, str):
+            tried.add(patch_family)
+    return all_families - tried
+
+
+def _exhausted_patch_families(
+    experiments: List[ExperimentIR],
+    max_failures_per_family: int = 2,
+) -> set[str]:
+    """Return patch families that have been tried and failed too many times."""
+    family_failures: Dict[str, int] = {}
+    family_passes: set[str] = set()
+    for exp in experiments:
+        action = exp.action
+        if not action or action.family != "source_patch":
+            continue
+        patch_family = (action.parameters or {}).get("patch_family")
+        if not isinstance(patch_family, str):
+            continue
+        if exp.verdict == "PASS":
+            family_passes.add(patch_family)
+        else:
+            family_failures[patch_family] = family_failures.get(patch_family, 0) + 1
+    # A family is exhausted if it has failed enough times AND never passed
+    return {
+        fam for fam, count in family_failures.items()
+        if count >= max_failures_per_family and fam not in family_passes
+    }
+
+
+def _filter_source_patch_for_coverage(
+    actions: List[ActionIR],
+    untried_families: set[str],
+) -> Tuple[List[ActionIR], bool]:
+    if not untried_families:
+        return actions, False
+    filtered: List[ActionIR] = []
+    for action in actions:
+        if action.family != "source_patch":
+            filtered.append(action)
+            continue
+        patch_family = (action.parameters or {}).get("patch_family")
+        if isinstance(patch_family, str) and patch_family in untried_families:
+            filtered.append(action)
+    if any(action.family == "source_patch" for action in filtered):
+        return filtered, True
+    return actions, False
+
+
+def _select_distinct_patch_families(
+    ranked: List["RankedAction"],
+    limit: int,
+) -> List["RankedAction"]:
+    selected: List["RankedAction"] = []
+    seen_families: set[str] = set()
+    for item in ranked:
+        action = item.action
+        if action.family == "source_patch":
+            patch_family = (action.parameters or {}).get("patch_family") or action.action_id
+            if patch_family in seen_families:
+                continue
+            seen_families.add(patch_family)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _expand_allowed_files(repo_root: Path, rules: Dict[str, object]) -> List[str]:
+    allowed = rules.get("allowed_globs")
+    if not isinstance(allowed, list):
+        return []
+    files: List[str] = []
+    for pattern in allowed:
+        if not isinstance(pattern, str):
+            continue
+        for path in repo_root.glob(pattern):
+            if path.is_file():
+                rel = path.relative_to(repo_root).as_posix()
+                files.append(rel)
+    return sorted(set(files))
+
+
+def _build_navigation_hints(
+    repo_root: Path,
+    files: List[str],
+    max_hints: int,
+) -> List[Dict[str, object]]:
+    """Build lightweight navigation hints for files the agent should examine.
+
+    Returns file pointers with optional hotspot locations.  The agentic
+    patcher uses its own ``read_file`` / ``grep`` tools to explore code —
+    these hints save the initial 3-4 tool calls needed to find the
+    starting point.
+    """
+    hints: List[Dict[str, object]] = []
+    if max_hints <= 0:
+        return hints
+    for rel in files:
+        if len(hints) >= max_hints:
+            break
+        path = repo_root / rel
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        hint: Dict[str, object] = {
+            "path": rel,
+            "total_lines": len(lines),
+        }
+        marker_line, _ = _find_marker_line(lines)
+        if marker_line is not None:
+            hint["hotspot_line"] = marker_line + 1  # 1-indexed
+            func_start = _find_function_start(lines, marker_line)
+            if func_start is not None:
+                hint["function_start"] = func_start + 1
+                sig = lines[func_start].strip()[:120]
+                hint["function_signature"] = sig
+        hints.append(hint)
+    return hints
+
+
+def _collect_code_snippets(
+    repo_root: Path,
+    files: List[str],
+    max_snippets: int,
+    max_chars: int,
+) -> List[Dict[str, object]]:
+    snippets: List[Dict[str, object]] = []
+    if max_snippets <= 0 or max_chars <= 0:
+        return snippets
+    budget_per = max(800, max_chars // max_snippets)
+    for rel in files:
+        if len(snippets) >= max_snippets:
+            break
+        path = repo_root / rel
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        blocks = _build_snippet_blocks(text, budget_per)
+        seen = set()
+        for block in blocks:
+            if len(snippets) >= max_snippets:
+                break
+            snippet = block["snippet"]
+            if not snippet or snippet in seen:
+                continue
+            seen.add(snippet)
+            anchor_hints = _anchor_hints_for_snippet(text, snippet)
+            features = _snippet_features(snippet)
+            snippets.append(
+                {
+                    "path": rel,
+                    "snippet": snippet,
+                    "tag": block.get("tag"),
+                    "start_line": block.get("start_line"),
+                    "end_line": block.get("end_line"),
+                    "anchor_hints": anchor_hints,
+                    "features": features,
+                }
+            )
+    return snippets
+
+
+def _timing_key_to_hotspot(key: str) -> Optional[str]:
+    lowered = key.lower()
+    if "pair" in lowered:
+        return "pair"
+    if "neigh" in lowered:
+        return "neigh"
+    if "comm" in lowered:
+        return "comm"
+    if "kspace" in lowered:
+        return "kspace"
+    if "compute" in lowered or "modify" in lowered:
+        return "compute"
+    return None
+
+
+def _slice_around_compute(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    lines = text.splitlines()
+    marker_line, _ = _find_marker_line(lines)
+    if marker_line is None:
+        return _slice_line_block(lines, 0, min(len(lines), 200), max_chars)[0]
+    start = max(0, marker_line - 40)
+    end = min(len(lines), marker_line + 120)
+    return _slice_line_block(lines, start, end, max_chars)[0]
+
+
+def _find_marker_line(lines: List[str]) -> Tuple[Optional[int], str]:
+    markers = [
+        "for (int jj",
+        "for (jj",
+        "for (int ii",
+        "for (ii",
+        "eval(",
+        "compute<",
+        "compute(",
+        "compute ",
+    ]
+    for marker in markers:
+        for idx, line in enumerate(lines):
+            if marker in line:
+                return idx, marker
+    return None, ""
+
+
+def _find_function_start(lines: List[str], from_idx: int) -> Optional[int]:
+    for idx in range(from_idx, -1, -1):
+        line = lines[idx]
+        if "compute" in line and "(" in line:
+            if "{" in line:
+                return idx
+            if idx + 1 < len(lines) and "{" in lines[idx + 1]:
+                return idx
+        if "::" in line and "(" in line and "{" in line:
+            return idx
+    return None
+
+
+def _extract_function_block(
+    lines: List[str],
+    start_idx: int,
+    max_chars: int,
+) -> Tuple[str, int, int]:
+    if start_idx < 0 or start_idx >= len(lines):
+        return "", start_idx, start_idx
+    brace_count = 0
+    started = False
+    end_idx: Optional[int] = None
+    for idx in range(start_idx, len(lines)):
+        for ch in lines[idx]:
+            if ch == "{":
+                brace_count += 1
+                started = True
+            elif ch == "}":
+                if not started:
+                    continue
+                brace_count -= 1
+                if brace_count == 0:
+                    end_idx = idx + 1
+                    break
+        if end_idx is not None:
+            break
+    if end_idx is None:
+        end_idx = min(len(lines), start_idx + 320)
+    return _slice_line_block(lines, start_idx, end_idx, max_chars)
+
+
+def _slice_line_block(
+    lines: List[str],
+    start: int,
+    end: int,
+    max_chars: int,
+) -> Tuple[str, int, int]:
+    if start < 0:
+        start = 0
+    if end > len(lines):
+        end = len(lines)
+    if start >= end:
+        return "", start, end
+    total = 0
+    out_lines = []
+    actual_end = start
+    for idx in range(start, end):
+        line = lines[idx]
+        line_len = len(line) + 1
+        if total + line_len > max_chars and out_lines:
+            break
+        out_lines.append(line)
+        total += line_len
+        actual_end = idx + 1
+    return "\n".join(out_lines), start, actual_end
+
+
+def _build_snippet_blocks(text: str, max_chars: int) -> List[Dict[str, object]]:
+    lines = text.splitlines()
+    marker_line, _ = _find_marker_line(lines)
+    if marker_line is None:
+        snippet, start, end = _slice_line_block(lines, 0, min(len(lines), 200), max_chars)
+        return [{"tag": "head", "snippet": snippet, "start_line": start + 1, "end_line": end}]
+    blocks: List[Dict[str, object]] = []
+    hot_start = max(0, marker_line - 5)
+    hot_end = min(len(lines), marker_line + 200)
+    snippet, start, end = _slice_line_block(lines, hot_start, hot_end, max_chars)
+    if snippet:
+        blocks.append({"tag": "hotspot", "snippet": snippet, "start_line": start + 1, "end_line": end})
+    decl_start = max(0, marker_line - 120)
+    decl_end = min(len(lines), marker_line + 5)
+    snippet, start, end = _slice_line_block(lines, decl_start, decl_end, max_chars)
+    if snippet:
+        blocks.append({"tag": "declarations", "snippet": snippet, "start_line": start + 1, "end_line": end})
+    func_start = _find_function_start(lines, marker_line)
+    if func_start is not None:
+        snippet, start, end = _extract_function_block(lines, func_start, max_chars)
+        if snippet:
+            blocks.append({"tag": "function_full", "snippet": snippet, "start_line": start + 1, "end_line": end})
+        helper_end = min(len(lines), func_start + 140)
+        snippet, start, end = _slice_line_block(lines, func_start, helper_end, max_chars)
+        if snippet:
+            blocks.append({"tag": "function_header", "snippet": snippet, "start_line": start + 1, "end_line": end})
+    extra_funcs = _find_named_functions(
+        lines,
+        ["compute_inner", "compute_middle", "compute_outer"],
+    )
+    for name, idx in extra_funcs:
+        snippet, start, end = _slice_line_block(lines, idx, min(len(lines), idx + 180), max_chars)
+        if snippet:
+            blocks.append(
+                {
+                    "tag": f"function_{name}",
+                    "snippet": snippet,
+                    "start_line": start + 1,
+                    "end_line": end,
+                }
+            )
+    return blocks
+
+
+def _find_named_functions(lines: List[str], names: List[str]) -> List[Tuple[str, int]]:
+    found: List[Tuple[str, int]] = []
+    for idx, line in enumerate(lines):
+        for name in names:
+            if name in line and "(" in line:
+                found.append((name, idx))
+    return found
+
+
+def _anchor_hints_for_snippet(
+    full_text: str,
+    snippet: str,
+    max_hints: int = 5,
+) -> List[str]:
+    lines = snippet.splitlines()
+    hints: List[str] = []
+    if len(lines) < 3:
+        return hints
+    for window in (5, 4, 3):
+        if len(hints) >= max_hints:
+            break
+        if len(lines) < window:
+            continue
+        for idx in range(0, len(lines) - window + 1):
+            block = "\n".join(lines[idx : idx + window])
+            if not block.strip():
+                continue
+            if _count_occurrences(full_text, block) == 1:
+                hints.append(block)
+            if len(hints) >= max_hints:
+                break
+    return hints
+
+
+_LOOP_HEADER_RE = re.compile(r"\b(for|while)\s*\(")
+_FOR_COND_RE = re.compile(r"\bfor\s*\(([^;]*);([^;]*);([^)]+)\)")
+_IF_RE = re.compile(r"\bif\s*\(")
+_FLAG_COND_RE = re.compile(r"\bif\s*\([^)]*\b[A-Z0-9_]*FLAG\b")
+
+
+def _loop_signature(line: str) -> str:
+    match = _FOR_COND_RE.search(line)
+    if not match:
+        return re.sub(r"\s+", "", line.strip())
+    cond = match.group(2)
+    return re.sub(r"\s+", "", cond.strip())
+
+
+def _snippet_features(snippet: str) -> Dict[str, object]:
+    lines = snippet.splitlines()
+    loop_headers: List[str] = []
+    loop_lines: List[int] = []
+    loop_signatures: List[str] = []
+    for idx, line in enumerate(lines):
+        if _LOOP_HEADER_RE.search(line):
+            loop_headers.append(line.strip())
+            loop_lines.append(idx)
+            loop_signatures.append(_loop_signature(line))
+    has_adjacent = False
+    adjacent_same_signature = False
+    for idx in range(1, len(loop_lines)):
+        if loop_lines[idx] - loop_lines[idx - 1] <= 8:
+            has_adjacent = True
+            if loop_signatures[idx] == loop_signatures[idx - 1]:
+                adjacent_same_signature = True
+            break
+    conditional_count = 0
+    has_flag_condition = False
+    for line in lines:
+        if _IF_RE.search(line):
+            conditional_count += 1
+        if _FLAG_COND_RE.search(line):
+            has_flag_condition = True
+    return {
+        "loop_count": len(loop_headers),
+        "loop_headers": loop_headers[:4],
+        "loop_signatures": loop_signatures[:4],
+        "has_adjacent_loops": has_adjacent,
+        "adjacent_loop_signature": adjacent_same_signature,
+        "conditional_count": conditional_count,
+        "has_flag_condition": has_flag_condition,
+    }
+
+
+def _snippet_feature_map(
+    snippets: List[Dict[str, object]],
+) -> Dict[Tuple[str, Optional[str]], Dict[str, object]]:
+    mapping: Dict[Tuple[str, Optional[str]], Dict[str, object]] = {}
+    aggregate: Dict[str, Dict[str, object]] = {}
+    for item in snippets:
+        path = item.get("path")
+        tag = item.get("tag")
+        features = item.get("features")
+        if isinstance(path, str) and isinstance(features, dict):
+            mapping[(path, tag if isinstance(tag, str) else None)] = features
+            agg = aggregate.setdefault(
+                path,
+                {
+                    "loop_count": 0,
+                    "loop_headers": [],
+                    "loop_signatures": [],
+                    "has_adjacent_loops": False,
+                    "adjacent_loop_signature": False,
+                    "conditional_count": 0,
+                    "has_flag_condition": False,
+                },
+            )
+            agg["loop_count"] = max(
+                int(agg.get("loop_count", 0) or 0),
+                int(features.get("loop_count", 0) or 0),
+            )
+            if features.get("loop_headers"):
+                agg["loop_headers"] = list(dict.fromkeys(agg["loop_headers"] + list(features["loop_headers"])))
+            if features.get("loop_signatures"):
+                agg["loop_signatures"] = list(
+                    dict.fromkeys(agg["loop_signatures"] + list(features["loop_signatures"]))
+                )
+            agg["has_adjacent_loops"] = bool(agg["has_adjacent_loops"] or features.get("has_adjacent_loops"))
+            agg["adjacent_loop_signature"] = bool(
+                agg["adjacent_loop_signature"] or features.get("adjacent_loop_signature")
+            )
+            agg["conditional_count"] = max(
+                int(agg.get("conditional_count", 0) or 0),
+                int(features.get("conditional_count", 0) or 0),
+            )
+            agg["has_flag_condition"] = bool(
+                agg["has_flag_condition"] or features.get("has_flag_condition")
+            )
+    for path, agg in aggregate.items():
+        mapping[(path, None)] = agg
+    return mapping
+
+
+def _structural_allowed(patch_family: str, features: Dict[str, object]) -> bool:
+    # Allow LLM autonomy; structural signals are soft evidence, not hard filters.
+    return True
+
+
+def _filter_opportunities_by_structure(
+    opportunities: List[Dict[str, object]],
+    snippet_features: Dict[Tuple[str, Optional[str]], Dict[str, object]],
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    if not opportunities or not snippet_features:
+        return opportunities, []
+    kept: List[Dict[str, object]] = []
+    dropped: List[Dict[str, object]] = []
+    for item in opportunities:
+        if not isinstance(item, dict):
+            continue
+        patch_family = item.get("patch_family")
+        file_path = item.get("file_path")
+        snippet_tag = item.get("snippet_tag")
+        if not isinstance(patch_family, str) or not isinstance(file_path, str):
+            kept.append(item)
+            continue
+        features = snippet_features.get(
+            (file_path, snippet_tag if isinstance(snippet_tag, str) else None)
+        ) or snippet_features.get((file_path, None))
+        if not isinstance(features, dict):
+            kept.append(item)
+            continue
+        if _structural_allowed(patch_family, features):
+            kept.append(item)
+        else:
+            dropped.append(
+                {
+                    "opportunity_id": item.get("opportunity_id"),
+                    "patch_family": patch_family,
+                    "file_path": file_path,
+                    "snippet_tag": snippet_tag,
+                }
+            )
+    return kept, dropped
+
+
+def _filter_generated_actions_by_structure(
+    actions: List[ActionIR],
+    snippet_features: Dict[Tuple[str, Optional[str]], Dict[str, object]],
+) -> Tuple[List[ActionIR], List[Dict[str, object]]]:
+    if not actions or not snippet_features:
+        return actions, []
+    kept: List[ActionIR] = []
+    dropped: List[Dict[str, object]] = []
+    for action in actions:
+        if action.family != "source_patch":
+            kept.append(action)
+            continue
+        params = dict(action.parameters or {})
+        patch_family = params.get("patch_family")
+        target_file = params.get("target_file")
+        snippet_tag = params.get("snippet_tag")
+        if not isinstance(patch_family, str) or not isinstance(target_file, str):
+            kept.append(action)
+            continue
+        features = snippet_features.get(
+            (target_file, snippet_tag if isinstance(snippet_tag, str) else None)
+        ) or snippet_features.get((target_file, None))
+        if not isinstance(features, dict):
+            kept.append(action)
+            continue
+        if _structural_allowed(patch_family, features):
+            kept.append(action)
+        else:
+            dropped.append(
+                {
+                    "action_id": action.action_id,
+                    "patch_family": patch_family,
+                    "target_file": target_file,
+                    "snippet_tag": snippet_tag,
+                }
+            )
+    return kept, dropped
+
+
+def _retry_patch_after_review(
+    patch_debugger: PatchDebugAgent,
+    patch_reviewer: PatchReviewAgent,
+    action: ActionIR,
+    profile: ProfileReport,
+    patch_rules: Dict[str, object],
+    allowed_files: List[str],
+    code_snippets: List[Dict[str, object]],
+    repo_root: Path,
+    patch_proposal: PatchProposal,
+    review_reasons: List[str],
+    debug_max_attempts: int,
+    snippet_files: List[str],
+    iteration: int,
+    trace_events: List[Dict[str, object]],
+    reporter: Optional[ConsoleUI],
+) -> Optional[PatchProposal]:
+    if debug_max_attempts <= 0:
+        return None
+    reason_text = "\n".join(review_reasons).strip() or "review_failed"
+    debug_snippets = list(code_snippets)
+    debug_allowed_files = list(allowed_files)
+    for attempt in range(debug_max_attempts):
+        debug_proposal = patch_debugger.repair(
+            action=action,
+            profile=profile,
+            patch_rules=patch_rules,
+            allowed_files=debug_allowed_files,
+            code_snippets=debug_snippets,
+            repo_root=repo_root,
+            patch_diff=patch_proposal.patch_diff,
+            build_log=reason_text,
+            feedback="review_failed",
+        )
+        if reporter:
+            note = reason_text
+            if debug_proposal and debug_proposal.missing_fields:
+                note = "; ".join(debug_proposal.missing_fields)
+            reporter.patch_debug(
+                action.action_id,
+                attempt + 1,
+                debug_proposal.status if debug_proposal else "NO_RESPONSE",
+                note,
+            )
+        trace_events.append(
+            {
+                "event": "patch_debug_review",
+                "agent": "PatchDebugAgent",
+                "iteration": iteration,
+                "action_id": action.action_id,
+                "attempt": attempt + 1,
+                "proposal": debug_proposal.model_dump() if debug_proposal else None,
+            }
+        )
+        if not debug_proposal:
+            continue
+        if debug_proposal.status == "NEED_MORE_CONTEXT":
+            base_context = int(patch_rules.get("max_context_chars", 0) or 0)
+            if base_context <= 0:
+                base_context = 60000
+            expand_budget = base_context
+            expand_cap = max(base_context * 4, 240000)
+            max_expand_rounds = int(patch_rules.get("max_context_expand_rounds", 0) or 3)
+            expand_round = 0
+            last_fingerprint = _snippet_fingerprint(debug_snippets)
+            while debug_proposal and debug_proposal.status == "NEED_MORE_CONTEXT":
+                expand_round += 1
+                if expand_round > max_expand_rounds:
+                    break
+                expand_budget = min(expand_budget + base_context, expand_cap)
+                expanded = _expand_snippets_for_missing_context(
+                    debug_proposal.missing_fields,
+                    repo_root,
+                    snippet_files,
+                    patch_rules,
+                    max_chars_override=expand_budget,
+                )
+                if not expanded:
+                    break
+                new_fingerprint = _snippet_fingerprint(expanded)
+                if new_fingerprint == last_fingerprint:
+                    break
+                last_fingerprint = new_fingerprint
+                snippet_paths = [item.get("path") for item in expanded if item.get("path")]
+                debug_allowed_files = snippet_paths or debug_allowed_files
+                debug_snippets = expanded
+                trace_events.append(
+                    {
+                        "event": "code_snippets_expanded",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "action_id": action.action_id,
+                        "round": expand_round,
+                        "snippets": [
+                            {
+                                "path": item.get("path"),
+                                "tag": item.get("tag"),
+                                "start_line": item.get("start_line"),
+                                "end_line": item.get("end_line"),
+                            }
+                            for item in expanded
+                        ],
+                    }
+                )
+                debug_proposal = patch_debugger.repair(
+                    action=action,
+                    profile=profile,
+                    patch_rules=patch_rules,
+                    allowed_files=debug_allowed_files,
+                    code_snippets=debug_snippets,
+                    repo_root=repo_root,
+                    patch_diff=patch_proposal.patch_diff,
+                    build_log=reason_text,
+                    feedback="review_failed",
+                )
+                if reporter:
+                    note = reason_text
+                    if debug_proposal and debug_proposal.missing_fields:
+                        note = "; ".join(debug_proposal.missing_fields)
+                    reporter.patch_debug(
+                        action.action_id,
+                        attempt + 1,
+                        debug_proposal.status if debug_proposal else "NO_RESPONSE",
+                        note,
+                    )
+                trace_events.append(
+                    {
+                        "event": "patch_debug_review_retry",
+                        "agent": "PatchDebugAgent",
+                        "iteration": iteration,
+                        "action_id": action.action_id,
+                        "attempt": attempt + 1,
+                        "proposal": debug_proposal.model_dump() if debug_proposal else None,
+                    }
+                )
+                if not debug_proposal or debug_proposal.status != "NEED_MORE_CONTEXT":
+                    break
+            if not debug_proposal or debug_proposal.status != "OK":
+                continue
+        if debug_proposal.status != "OK":
+            continue
+        patch_proposal = debug_proposal
+        format_ok, format_reason = _check_patch_format(repo_root, patch_proposal.patch_diff)
+        if not format_ok:
+            continue
+        det_ok, _, _ = review_patch_diff(patch_proposal.patch_diff, repo_root, patch_rules)
+        if not det_ok:
+            continue
+        # Skip LLM review by default (deterministic review is sufficient).
+        llm_review = None
+        _skip_llm = patch_rules.get("skip_llm_review", True)
+        if not _skip_llm:
+            llm_review = patch_reviewer.review(
+                patch_diff=patch_proposal.patch_diff,
+                patch_rules=patch_rules,
+                context={
+                    "action": action.action_id,
+                    "family": action.family,
+                    "risk_level": action.risk_level,
+                    "expected_effect": action.expected_effect,
+                    "profile": profile.model_dump(),
+                },
+            )
+        if llm_review:
+            trace_events.append(
+                {
+                    "event": "patch_review_llm",
+                    "agent": "PatchReviewAgent",
+                    "iteration": iteration,
+                    "action_id": action.action_id,
+                    "review": llm_review.model_dump(),
+                }
+            )
+            if llm_review.status != "OK" or llm_review.verdict != "PASS":
+                continue
+        return patch_proposal
+    return None
+
+
+def _build_memory_hints(
+    experience_memory: ExperienceMemory,
+    case_id: str,
+    app: str,
+    backend: Optional[str],
+    limit: int = 6,
+) -> List[Dict[str, object]]:
+    if not experience_memory.config.enabled or not experience_memory.records:
+        return []
+    cfg = experience_memory.config
+    hints: List[Dict[str, object]] = []
+    for record in experience_memory.records:
+        score = float(record.weight or 0.0)
+        if backend and record.backend and backend != record.backend:
+            score *= cfg.backend_mismatch_penalty
+        if record.case_id and record.case_id == case_id:
+            score *= cfg.case_match_boost
+        if record.app:
+            if record.app == app:
+                score *= cfg.app_match_boost
+            else:
+                score *= cfg.app_mismatch_penalty
+        if score == 0.0:
+            continue
+        hints.append(
+            {
+                "action_id": record.action_id,
+                "family": record.family,
+                "patch_family": record.patch_family,
+                "target_file": record.target_file,
+                "improvement_pct": record.improvement_pct,
+                "strength": record.strength,
+                "score": score,
+            }
+        )
+    hints.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    return hints[:limit]
+
+
+def _count_occurrences(text: str, block: str) -> int:
+    return len(re.findall(re.escape(block), text))
+
+
+def _expand_snippets_for_anchor(
+    repo_root: Path,
+    file_path: str,
+    anchor: str,
+    max_snippets: int,
+    max_chars: int,
+) -> List[Dict[str, object]]:
+    if max_snippets <= 0 or max_chars <= 0:
+        return []
+    path = (repo_root / file_path).resolve()
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8", errors="replace")
+    indices = [m.start() for m in re.finditer(re.escape(anchor), text)]
+    if not indices:
+        return []
+    lines = text.splitlines()
+    snippets: List[Dict[str, object]] = []
+    budget_per = max(800, max_chars // max_snippets)
+    seen = set()
+    for idx in indices:
+        line_no = text[:idx].count("\n")
+        for block in _build_anchor_snippet_blocks(lines, line_no, budget_per):
+            if len(snippets) >= max_snippets:
+                break
+            snippet = block["snippet"]
+            if not snippet or snippet in seen:
+                continue
+            seen.add(snippet)
+            anchor_hints = _anchor_hints_for_snippet(text, snippet)
+            snippets.append(
+                {
+                    "path": file_path,
+                    "snippet": snippet,
+                    "tag": block.get("tag"),
+                    "start_line": block.get("start_line"),
+                    "end_line": block.get("end_line"),
+                    "anchor_hints": anchor_hints,
+                }
+            )
+        if len(snippets) >= max_snippets:
+            break
+    return snippets
+
+
+def _build_anchor_snippet_blocks(
+    lines: List[str],
+    anchor_line: int,
+    max_chars: int,
+) -> List[Dict[str, object]]:
+    blocks: List[Dict[str, object]] = []
+    decl_start = max(0, anchor_line - 80)
+    decl_end = min(len(lines), anchor_line + 10)
+    snippet, start, end = _slice_line_block(lines, decl_start, decl_end, max_chars)
+    if snippet:
+        blocks.append({"tag": "anchor_declarations", "snippet": snippet, "start_line": start + 1, "end_line": end})
+    ctx_start = max(0, anchor_line - 20)
+    ctx_end = min(len(lines), anchor_line + 140)
+    snippet, start, end = _slice_line_block(lines, ctx_start, ctx_end, max_chars)
+    if snippet:
+        blocks.append({"tag": "anchor_context", "snippet": snippet, "start_line": start + 1, "end_line": end})
+    func_start = _find_function_start(lines, anchor_line)
+    if func_start is not None:
+        snippet, start, end = _extract_function_block(lines, func_start, max_chars)
+        if snippet:
+            blocks.append({"tag": "function_full", "snippet": snippet, "start_line": start + 1, "end_line": end})
+        func_end = min(len(lines), func_start + 140)
+        snippet, start, end = _slice_line_block(lines, func_start, func_end, max_chars)
+        if snippet:
+            blocks.append({"tag": "function_header", "snippet": snippet, "start_line": start + 1, "end_line": end})
+    return blocks
+
+
+def _parse_edit_failure_anchor(
+    missing_fields: List[str],
+) -> Optional[Tuple[str, str]]:
+    for item in missing_fields:
+        if not item.startswith("edit_apply_failed:"):
+            continue
+        payload = item.split("edit_apply_failed:", 1)[1].strip()
+        parts = payload.split(":")
+        if len(parts) < 4:
+            continue
+        error_kind = parts[0]
+        if error_kind not in {"anchor_not_unique", "anchor_not_found", "old_text_not_found"}:
+            continue
+        file_path = parts[1]
+        if parts[2] != "b64":
+            continue
+        encoded = ":".join(parts[3:])
+        try:
+            anchor = base64.b64decode(encoded.encode("ascii")).decode("utf-8")
+        except Exception:
+            continue
+        return file_path, anchor
+    return None
+
+
+def _parse_need_more_context_targets(
+    missing_fields: List[str],
+    repo_root: Path,
+) -> List[Tuple[str, Optional[str]]]:
+    targets: List[Tuple[str, Optional[str]]] = []
+    for item in missing_fields:
+        if "NEED_MORE_CONTEXT" not in item:
+            continue
+        files: List[str] = []
+        for match in re.finditer(r"file=([\\w./\\-*]+)", item):
+            path = match.group(1).strip(" ,.;")
+            files.append(path)
+        for match in re.finditer(r"([\\w./-]+\\.(?:c|cc|cpp|h))", item):
+            files.append(match.group(1))
+        anchor = _guess_context_anchor(item)
+        for path in files:
+            if "*" in path:
+                for cand in repo_root.glob(path):
+                    if cand.is_file():
+                        rel = cand.relative_to(repo_root).as_posix()
+                        targets.append((rel, anchor))
+            else:
+                targets.append((path, anchor))
+    deduped = []
+    seen = set()
+    for file_path, anchor in targets:
+        key = (file_path, anchor)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((file_path, anchor))
+    return deduped
+
+
+def _expand_snippets_for_missing_context(
+    missing_fields: Optional[List[str]],
+    repo_root: Path,
+    snippet_files: List[str],
+    patch_rules: Dict[str, object],
+    max_chars_override: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    expanded: List[Dict[str, object]] = []
+    if not missing_fields:
+        return expanded
+    max_snippets = int(patch_rules.get("max_snippets", 0) or 0)
+    max_context = int(patch_rules.get("max_context_chars", 0) or 0)
+    if max_chars_override is not None:
+        expand_budget = max_chars_override
+    else:
+        expand_budget = max_context if max_context > 0 else 0
+        if expand_budget:
+            expand_budget = min(expand_budget + max_context, 240000)
+    targets = _parse_need_more_context_targets(missing_fields, repo_root)
+    edit_anchor = _parse_edit_failure_anchor(missing_fields)
+    if edit_anchor:
+        targets.append(edit_anchor)
+    if not targets:
+        for file_path in snippet_files:
+            expanded.extend(
+                _expand_snippets_for_file(
+                    repo_root=repo_root,
+                    file_path=file_path,
+                    max_snippets=max_snippets,
+                    max_chars=expand_budget,
+                )
+            )
+    for file_path, anchor in targets:
+        if anchor:
+            expanded.extend(
+                _expand_snippets_for_anchor(
+                    repo_root=repo_root,
+                    file_path=file_path,
+                    anchor=anchor,
+                    max_snippets=max_snippets,
+                    max_chars=expand_budget,
+                )
+            )
+        if not expanded:
+            expanded.extend(
+                _expand_snippets_for_file(
+                    repo_root=repo_root,
+                    file_path=file_path,
+                    max_snippets=max_snippets,
+                    max_chars=expand_budget,
+                )
+            )
+    return expanded
+
+
+def _snippet_fingerprint(snippets: List[Dict[str, object]]) -> Tuple[Tuple[str, int, int], ...]:
+    items: List[Tuple[str, int, int]] = []
+    for item in snippets:
+        path = str(item.get("path") or "")
+        start = int(item.get("start_line") or 0)
+        end = int(item.get("end_line") or 0)
+        items.append((path, start, end))
+    return tuple(sorted(set(items)))
+
+
+def _guess_context_anchor(text: str) -> Optional[str]:
+    lowered = text.lower()
+    if "#pragma omp" in lowered:
+        return "#pragma omp"
+    if "for (int jj" in lowered or "for(int jj" in lowered:
+        return "for (int jj"
+    if "for (int ii" in lowered or "for(int ii" in lowered:
+        return "for (int ii"
+    if "inner loop" in lowered and "neighbor" in lowered:
+        return "for (jj"
+    if "for (jj" in lowered or "for(jj" in lowered:
+        return "for (jj"
+    if "for (ii" in lowered or "for(ii" in lowered:
+        return "for (ii"
+    if "eval" in lowered:
+        return "eval"
+    if "compute_inner" in lowered:
+        return "compute_inner"
+    if "compute_middle" in lowered:
+        return "compute_middle"
+    if "compute_outer" in lowered:
+        return "compute_outer"
+    if "compute" in lowered:
+        return "compute("
+    return None
+
+
+def _expand_snippets_for_file(
+    repo_root: Path,
+    file_path: str,
+    max_snippets: int,
+    max_chars: int,
+) -> List[Dict[str, object]]:
+    if max_snippets <= 0 or max_chars <= 0:
+        return []
+    path = (repo_root / file_path).resolve()
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8", errors="replace")
+    blocks = _build_snippet_blocks(text, max(800, max_chars // max_snippets))
+    snippets: List[Dict[str, object]] = []
+    seen = set()
+    for block in blocks:
+        if len(snippets) >= max_snippets:
+            break
+        snippet = block.get("snippet")
+        if not snippet or snippet in seen:
+            continue
+        seen.add(snippet)
+        snippets.append(
+            {
+                "path": file_path,
+                "snippet": snippet,
+                "tag": block.get("tag"),
+                "start_line": block.get("start_line"),
+                "end_line": block.get("end_line"),
+                "anchor_hints": _anchor_hints_for_snippet(text, snippet),
+            }
+        )
+    return snippets
+
+
+def _parse_pair_style(input_text: str) -> Optional[List[str]]:
+    for raw in input_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if not lower.startswith("pair_style"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        style = parts[1]
+        if style.startswith("hybrid"):
+            return [token for token in parts[2:] if not _looks_numeric(token)]
+        return [style]
+    return None
+
+
+def _looks_numeric(token: str) -> bool:
+    try:
+        float(token)
+        return True
+    except ValueError:
+        return False
+
+
+def _pair_style_files(
+    input_text: str,
+    repo_root: Path,
+    run_args: Optional[List[str]] = None,
+) -> List[str]:
+    styles = _parse_pair_style(input_text)
+    if not styles:
+        return []
+    files: List[str] = []
+    use_omp = _run_args_enable_omp(run_args or [])
+    use_opt = _run_args_enable_opt(run_args or [])
+    for style in styles:
+        cleaned = style.replace("/", "_").replace("-", "_")
+        candidate = repo_root / "third_party" / "lammps" / "src" / f"pair_{cleaned}.cpp"
+        if candidate.is_file():
+            files.append(candidate.relative_to(repo_root).as_posix())
+            if use_omp:
+                omp_candidate = candidate.with_name(f"pair_{cleaned}_omp.cpp")
+                if omp_candidate.is_file():
+                    files.append(omp_candidate.relative_to(repo_root).as_posix())
+                omp_subdir = (
+                    repo_root
+                    / "third_party"
+                    / "lammps"
+                    / "src"
+                    / "OPENMP"
+                    / f"pair_{cleaned}_omp.cpp"
+                )
+                if omp_subdir.is_file():
+                    files.append(omp_subdir.relative_to(repo_root).as_posix())
+            if use_opt:
+                opt_subdir = (
+                    repo_root
+                    / "third_party"
+                    / "lammps"
+                    / "src"
+                    / "OPT"
+                    / f"pair_{cleaned}_opt.cpp"
+                )
+                if opt_subdir.is_file():
+                    files.append(opt_subdir.relative_to(repo_root).as_posix())
+            continue
+        header = candidate.with_suffix(".h")
+        if header.is_file():
+            files.append(header.relative_to(repo_root).as_posix())
+            if use_omp:
+                omp_header = header.with_name(f"pair_{cleaned}_omp.h")
+                if omp_header.is_file():
+                    files.append(omp_header.relative_to(repo_root).as_posix())
+                omp_header_subdir = (
+                    repo_root
+                    / "third_party"
+                    / "lammps"
+                    / "src"
+                    / "OPENMP"
+                    / f"pair_{cleaned}_omp.h"
+                )
+                if omp_header_subdir.is_file():
+                    files.append(omp_header_subdir.relative_to(repo_root).as_posix())
+            if use_opt:
+                opt_header_subdir = (
+                    repo_root
+                    / "third_party"
+                    / "lammps"
+                    / "src"
+                    / "OPT"
+                    / f"pair_{cleaned}_opt.h"
+                )
+                if opt_header_subdir.is_file():
+                    files.append(opt_header_subdir.relative_to(repo_root).as_posix())
+    return files
+
+
+def _expand_globs(repo_root: Path, patterns: List[str]) -> List[str]:
+    files: List[str] = []
+    for pattern in patterns:
+        if not isinstance(pattern, str):
+            continue
+        for path in repo_root.glob(pattern):
+            if path.is_file():
+                files.append(path.relative_to(repo_root).as_posix())
+    return files
+
+
+def _variant_matches(
+    when_cfg: Dict[str, object],
+    run_args: List[str],
+    input_text: str,
+    env: Dict[str, str],
+) -> bool:
+    args_text = " ".join(str(arg) for arg in run_args)
+    run_contains = when_cfg.get("run_args_contains", [])
+    if isinstance(run_contains, list) and run_contains:
+        matched = False
+        for token in run_contains:
+            if isinstance(token, str) and token in args_text:
+                matched = True
+                break
+        if not matched:
+            return False
+    input_contains = when_cfg.get("input_contains", [])
+    if isinstance(input_contains, list) and input_contains:
+        matched = False
+        for token in input_contains:
+            if isinstance(token, str) and token in input_text:
+                matched = True
+                break
+        if not matched:
+            return False
+    input_regex = when_cfg.get("input_regex", [])
+    if isinstance(input_regex, list) and input_regex:
+        matched = False
+        for pattern in input_regex:
+            if not isinstance(pattern, str):
+                continue
+            try:
+                if re.search(pattern, input_text, flags=re.MULTILINE):
+                    matched = True
+                    break
+            except re.error:
+                continue
+        if not matched:
+            return False
+    env_has = when_cfg.get("env_has", [])
+    if isinstance(env_has, list) and env_has:
+        for key in env_has:
+            if not isinstance(key, str):
+                continue
+            if key not in env:
+                return False
+    env_equals = when_cfg.get("env_equals", {})
+    if isinstance(env_equals, dict) and env_equals:
+        for key, value in env_equals.items():
+            if key not in env:
+                return False
+            if value is not None and str(env.get(key)) != str(value):
+                return False
+    return True
+
+
+def _adapter_variant_files(
+    adapter_cfg: Optional[Dict[str, object]],
+    repo_root: Path,
+    run_args: List[str],
+    input_text: str,
+    env: Dict[str, str],
+) -> Tuple[List[str], List[str]]:
+    if not isinstance(adapter_cfg, dict):
+        return [], []
+    variants = adapter_cfg.get("variants")
+    if not isinstance(variants, list):
+        return [], []
+    matched_ids: List[str] = []
+    preferred: List[str] = []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        when_cfg = variant.get("when")
+        if not isinstance(when_cfg, dict):
+            continue
+        if not _variant_matches(when_cfg, run_args, input_text, env):
+            continue
+        matched_ids.append(str(variant.get("id", "variant")))
+        globs = variant.get("prefer_globs", [])
+        if isinstance(globs, list):
+            preferred.extend(_expand_globs(repo_root, globs))
+    return sorted(set(preferred)), matched_ids
+
+
+def _run_args_enable_omp(run_args: List[str]) -> bool:
+    args = [str(arg) for arg in run_args]
+    for idx, arg in enumerate(args):
+        if arg == "-sf" and idx + 1 < len(args) and args[idx + 1] == "omp":
+            return True
+        if arg == "-suffix" and idx + 1 < len(args) and args[idx + 1] == "omp":
+            return True
+        if arg == "-pk" and idx + 1 < len(args) and args[idx + 1] == "omp":
+            return True
+    return False
+
+
+def _run_args_enable_opt(run_args: List[str]) -> bool:
+    args = [str(arg) for arg in run_args]
+    for idx, arg in enumerate(args):
+        if arg == "-sf" and idx + 1 < len(args) and args[idx + 1] == "opt":
+            return True
+        if arg == "-suffix" and idx + 1 < len(args) and args[idx + 1] == "opt":
+            return True
+    return False
+
+
+def _select_hotspot_categories(timing_breakdown: Optional[Dict[str, float]]) -> List[str]:
+    if not timing_breakdown:
+        return []
+    ordered = sorted(
+        timing_breakdown.items(),
+        key=lambda item: item[1] if isinstance(item[1], (int, float)) else 0.0,
+        reverse=True,
+    )
+    categories: List[str] = []
+    for key, _value in ordered:
+        category = _timing_key_to_hotspot(str(key))
+        if category and category not in categories:
+            categories.append(category)
+        if len(categories) >= 2:
+            break
+    return categories
+
+
+def _select_snippet_files(
+    repo_root: Path,
+    patch_rules: Dict[str, object],
+    timing_breakdown: Optional[Dict[str, float]],
+    fallback_files: List[str],
+    preferred_files: List[str],
+    max_snippets: int,
+) -> List[str]:
+    if max_snippets <= 0:
+        return []
+    hotspot_globs = patch_rules.get("hotspot_globs")
+    hotspot_only = bool(patch_rules.get("hotspot_only", False))
+
+    def _is_hotspot(path: str) -> bool:
+        if not isinstance(hotspot_globs, dict):
+            return False
+        for patterns in hotspot_globs.values():
+            if not isinstance(patterns, list):
+                continue
+            for pattern in patterns:
+                if isinstance(pattern, str) and fnmatch.fnmatch(path, pattern):
+                    return True
+        return False
+    if not isinstance(hotspot_globs, dict):
+        return preferred_files or ([] if hotspot_only else fallback_files)
+    files: List[str] = []
+    for rel in preferred_files:
+        if hotspot_only and not _is_hotspot(rel):
+            continue
+        if rel not in files:
+            files.append(rel)
+        if len(files) >= max_snippets:
+            return files
+    categories = _select_hotspot_categories(timing_breakdown)
+    for category in categories:
+        patterns = hotspot_globs.get(category, [])
+        if not isinstance(patterns, list):
+            continue
+        for pattern in patterns:
+            if not isinstance(pattern, str):
+                continue
+            for path in repo_root.glob(pattern):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(repo_root).as_posix()
+                if rel not in files:
+                    files.append(rel)
+            if len(files) >= max_snippets:
+                break
+        if len(files) >= max_snippets:
+            break
+    if files:
+        return files
+    if hotspot_only:
+        return []
+    return preferred_files or fallback_files
+
+
+def _available_hotspots_for_files(
+    snippet_files: List[str],
+    patch_rules: Dict[str, object],
+) -> set[str]:
+    available: set[str] = set()
+    hotspot_globs = patch_rules.get("hotspot_globs")
+    if not isinstance(hotspot_globs, dict):
+        return available
+    for category, patterns in hotspot_globs.items():
+        if not isinstance(patterns, list):
+            continue
+        for rel in snippet_files:
+            if category in available:
+                break
+            for pattern in patterns:
+                if not isinstance(pattern, str):
+                    continue
+                if fnmatch.fnmatch(rel, pattern):
+                    available.add(category)
+                    break
+    return available
+
+
+def _filter_source_patch_by_hotspot(
+    actions: List[ActionIR],
+    patch_families: Optional[Dict[str, object]],
+    available_hotspots: set[str],
+) -> List[ActionIR]:
+    if not actions or not patch_families:
+        return actions
+    families = patch_families.get("families")
+    if not isinstance(families, list):
+        return actions
+    family_map: Dict[str, Dict[str, object]] = {}
+    for entry in families:
+        if isinstance(entry, dict) and "id" in entry:
+            family_map[str(entry["id"])] = entry
+    filtered: List[ActionIR] = []
+    for action in actions:
+        if action.family != "source_patch":
+            filtered.append(action)
+            continue
+        patch_family = (action.parameters or {}).get("patch_family")
+        if not isinstance(patch_family, str):
+            filtered.append(action)
+            continue
+        meta = family_map.get(patch_family, {})
+        required = set(meta.get("requires_hotspot") or [])
+        if required and not (required & available_hotspots):
+            continue
+        filtered.append(action)
+    return filtered
+
+
+def _quick_diff_stats(patch_text: str) -> Optional[Dict[str, object]]:
+    """Extract quick file/line stats from a unified diff for console display."""
+    if not patch_text:
+        return None
+    files: List[str] = []
+    lines_changed = 0
+    for line in patch_text.splitlines():
+        if line.startswith("+++ ") or line.startswith("--- "):
+            path = line[4:].split("\t", 1)[0].strip()
+            if path != "/dev/null":
+                if path.startswith(("a/", "b/")):
+                    path = path[2:]
+                if path and path not in files:
+                    files.append(path)
+        elif line.startswith("+") or line.startswith("-"):
+            if not line.startswith(("+++", "---")):
+                lines_changed += 1
+    if not files and lines_changed == 0:
+        return None
+    return {"files": files, "lines_changed": lines_changed}
+
+
+def _check_patch_format(repo_root: Path, patch_text: str) -> Tuple[bool, str]:
+    if not patch_text.strip():
+        return False, "empty patch"
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "apply", "--check", "-"],
+        input=patch_text,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True, ""
+    stderr = (result.stderr or "").strip()
+    if "corrupt patch" in stderr:
+        return False, stderr
+    return True, ""
+
+
+def _check_patch_apply(
+    repo_root: Path,
+    patch_text: str,
+    patch_root: Optional[Path],
+) -> Tuple[bool, str]:
+    check_root = repo_root
+    adjusted = patch_text
+    if patch_root:
+        prefix = patch_root.as_posix().rstrip("/") + "/"
+        adjusted = _strip_patch_prefix(patch_text, prefix)
+        check_root = (repo_root / patch_root).resolve()
+    result = subprocess.run(
+        ["git", "-C", str(check_root), "apply", "--check", "-"],
+        input=adjusted,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True, ""
+    stderr = (result.stderr or result.stdout or "").strip()
+    return False, stderr or "patch does not apply"
+
+
+def _summarize_build_log(log_path: Path, max_lines: int = 120, max_chars: int = 4000) -> str:
+    if not log_path.exists():
+        return ""
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    error_lines = [
+        line
+        for line in lines
+        if "error:" in line
+        or "fatal error" in line
+        or "undefined reference" in line
+        or "no such file or directory" in line
+    ]
+    if error_lines:
+        lines = error_lines[-max_lines:]
+    else:
+        lines = lines[-max_lines:]
+    text = "\n".join(lines).strip()
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
+def _preflight_patch_compile(
+    repo_root: Path,
+    exp_id: str,
+    patch_path: Path,
+    patch_root: Optional[Path],
+    input_script: Path,
+    allowlist: list[str],
+    build_cfg: Dict[str, object],
+    build_packs: Optional[Dict[str, object]],
+    action: ActionIR,
+    run_dir: Path,
+    worktree_retries: int = 2,
+) -> Tuple[bool, str, Optional[str]]:
+    preflight_dir = run_dir / "preflight"
+    preflight_dir.mkdir(parents=True, exist_ok=True)
+    build_log_path = preflight_dir / "build.log"
+    try:
+        with GitPatchContext(
+            repo_root=repo_root,
+            exp_id=f"{exp_id}-preflight",
+            artifacts_dir=preflight_dir,
+            input_script=input_script,
+            input_edit=None,
+            allowlist=allowlist,
+            patch_path=patch_path,
+            patch_root=patch_root,
+            worktree_retries=worktree_retries,
+        ) as ctx:
+            source_root = ctx.worktree_dir
+            final_build_cfg = _apply_build_config(build_cfg, action, build_packs)
+            build_job(final_build_cfg, source_root, preflight_dir)
+        return True, "", str(build_log_path)
+    except Exception as exc:
+        log_summary = _summarize_build_log(build_log_path)
+        reason = log_summary or str(exc)
+        return False, reason, str(build_log_path)
+
+
+def _phase_order(hierarchical_cfg: Optional[Dict[str, object]]) -> List[str]:
+    phases_cfg = hierarchical_cfg.get("phases", {}) if isinstance(hierarchical_cfg, dict) else {}
+    order = phases_cfg.get("default_order")
+    if isinstance(order, list) and all(isinstance(item, str) for item in order):
+        return [str(item) for item in order]
+    return ["RUN_TUNE", "BUILD_TUNE", "PATCH"]
+
+
+def _next_phase_in_order(
+    current: str,
+    order: List[str],
+    has_build: bool,
+    has_patch: bool,
+) -> str:
+    if current not in order:
+        return current
+    idx = order.index(current) + 1
+    while idx < len(order):
+        candidate = order[idx]
+        if candidate == "BUILD_TUNE" and not has_build:
+            idx += 1
+            continue
+        if candidate == "PATCH" and not has_patch:
+            idx += 1
+            continue
+        return candidate
+    return current
+
+
+def _freeze_thresholds(
+    hierarchical_cfg: Optional[Dict[str, object]],
+    phase: str,
+) -> Dict[str, object]:
+    freeze_cfg = hierarchical_cfg.get("freeze", {}) if isinstance(hierarchical_cfg, dict) else {}
+    if phase == "RUN_TUNE":
+        return freeze_cfg.get("run_config", {}) if isinstance(freeze_cfg, dict) else {}
+    if phase == "BUILD_TUNE":
+        return freeze_cfg.get("build_config", {}) if isinstance(freeze_cfg, dict) else {}
+    return {}
+
+
+def _phase_freeze_decision(
+    phase: str,
+    baseline_exp: ExperimentIR,
+    best_exp: Optional[ExperimentIR],
+    thresholds: Dict[str, object],
+    state: StopState,
+) -> Tuple[bool, str]:
+    if not best_exp:
+        return False, ""
+    baseline = baseline_exp.results.runtime_seconds
+    best = best_exp.results.runtime_seconds
+    if baseline <= 0 or best <= 0:
+        return False, ""
+    min_gain = float(thresholds.get("min_relative_gain", 0.0) or 0.0)
+    max_cv = thresholds.get("max_variance_cv")
+    patience = int(thresholds.get("patience_rounds", 0) or 0)
+    improvement = (baseline - best) / baseline
+    variance_cv = _extract_variance_cv(best_exp)
+    if improvement >= min_gain and (variance_cv is None or variance_cv <= float(max_cv)):
+        return True, f"{phase} freeze: gain {improvement:.3f} meets threshold"
+    if patience and state.no_improve_iters >= patience:
+        return True, f"{phase} freeze: stagnation for {state.no_improve_iters} rounds"
+    return False, ""
+
+
+def _filter_actions_by_targets(actions: List[ActionIR], targets: set[str]) -> List[ActionIR]:
+    return [action for action in actions if any(t in targets for t in action.applies_to)]
+
+
+def _family_targets(actions: List[ActionIR]) -> Dict[str, set[str]]:
+    mapping: Dict[str, set[str]] = {}
+    for action in actions:
+        fam = action.family
+        if fam not in mapping:
+            mapping[fam] = set()
+        for target in action.applies_to or []:
+            mapping[fam].add(target)
+    return mapping
+
+
+def _select_with_evidence(
+    ranked_items: List["RankedAction"],
+    limit: int,
+    max_explore_frac: float = 0.2,
+) -> List["RankedAction"]:
+    if limit <= 0:
+        return []
+    max_explore = max(1, int(round(limit * max_explore_frac)))
+    selected: List["RankedAction"] = []
+    explore_count = 0
+    for item in ranked_items:
+        evidence_score = 1.0
+        if isinstance(item.score_breakdown, dict):
+            evidence_score = float(item.score_breakdown.get("evidence_score", 1.0) or 1.0)
+        if evidence_score < 0.5:
+            if explore_count >= max_explore:
+                continue
+            explore_count += 1
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _has_actions_for_target(actions: List[ActionIR], target: str) -> bool:
+    return any(target in action.applies_to for action in actions)
+
+
+def _system_caps(repo_root: Path) -> Dict[str, object]:
+    return collect_system_caps(repo_root)
 
 
 def _best_improvement_pct(
@@ -221,16 +3364,20 @@ def _select_base_for_action(
     best_exp: Optional[ExperimentIR],
     refine_on_best: bool,
     refine_applies_to: set[str],
+    backend_exp: Optional[ExperimentIR] = None,
 ) -> tuple[JobIR, Optional[str], Optional[str]]:
     base_job = baseline_exp.job
     base_run_id = baseline_exp.run_id
     base_action_id = "baseline"
-    if refine_on_best and best_exp and best_exp.action:
-        applies_to = set(action.applies_to or [])
-        if applies_to and applies_to.issubset(refine_applies_to):
-            base_job = best_exp.job
-            base_run_id = best_exp.run_id
-            base_action_id = best_exp.action.action_id if best_exp.action else "baseline"
+    if best_exp and best_exp.action:
+        base_job = best_exp.job
+        base_run_id = best_exp.run_id
+        base_action_id = best_exp.action.action_id if best_exp.action else "baseline"
+    if _is_parallel_threads_action(action) and backend_exp:
+        if not _run_args_has_backend(base_job.run_args):
+            base_job = backend_exp.job
+            base_run_id = backend_exp.run_id
+            base_action_id = backend_exp.action.action_id if backend_exp.action else "baseline"
     return base_job, base_run_id, base_action_id
 
 
@@ -241,10 +3388,20 @@ def _prepare_actions(
     experiments: List[ExperimentIR],
     adapter_cfg: Optional[Dict[str, object]],
     job: JobIR,
+    fixed_threads: Optional[int] = None,
 ) -> List[ActionIR]:
     selected_policy = _select_candidate_policy(candidate_policy, job.case_id)
-    actions = _expand_dynamic_actions(base_actions, selected_policy, system_caps, experiments)
-    return _apply_adapter(actions, adapter_cfg, job)
+    actions = _expand_dynamic_actions(
+        base_actions,
+        selected_policy,
+        system_caps,
+        experiments,
+        fixed_threads=fixed_threads,
+    )
+    actions = _filter_fixed_threads(actions, fixed_threads)
+    actions = _apply_adapter(actions, adapter_cfg, job)
+    actions = _filter_mpi_actions(actions, job)
+    return actions
 
 
 def _select_candidate_policy(
@@ -254,12 +3411,30 @@ def _select_candidate_policy(
     if not isinstance(candidate_policy, dict):
         return {}
     cases = candidate_policy.get("cases", {})
-    if isinstance(cases, dict) and case_id in cases:
-        return cases.get(case_id) or {}
-    default = candidate_policy.get("default")
+    base: Dict[str, object] = {
+        key: value
+        for key, value in candidate_policy.items()
+        if key not in {"cases"}
+    }
+    default = base.get("default")
     if isinstance(default, dict):
-        return default
-    return candidate_policy
+        base = _deep_merge_dicts(base, default)
+    case_cfg = cases.get(case_id) if isinstance(cases, dict) else None
+    if isinstance(case_cfg, dict):
+        base = _deep_merge_dicts(base, case_cfg)
+    return base
+
+
+def _deep_merge_dicts(base: Dict[str, object], overlay: Dict[str, object]) -> Dict[str, object]:
+    merged: Dict[str, object] = dict(base)
+    for key, value in overlay.items():
+        if key == "default":
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)  # type: ignore[arg-type]
+        else:
+            merged[key] = value
+    return merged
 
 
 def _expand_dynamic_actions(
@@ -267,11 +3442,17 @@ def _expand_dynamic_actions(
     candidate_policy: Optional[Dict[str, object]],
     system_caps: Dict[str, object],
     experiments: List[ExperimentIR],
+    fixed_threads: Optional[int] = None,
 ) -> List[ActionIR]:
     policy = candidate_policy or {}
     families_cfg = policy.get("families", {}) if isinstance(policy, dict) else {}
     threads_cfg = families_cfg.get("parallel_omp", {}).get("threads", {})
-    thread_candidates = _thread_candidates(threads_cfg, system_caps, experiments)
+    thread_candidates = _thread_candidates(
+        threads_cfg,
+        system_caps,
+        experiments,
+        fixed_threads=fixed_threads,
+    )
     allowed_templates = _allowed_templates(threads_cfg)
     if not thread_candidates:
         return [action for action in actions if not action.parameters.get("dynamic_threads")]
@@ -292,9 +3473,23 @@ def _thread_candidates(
     cfg: Dict[str, object],
     system_caps: Dict[str, object],
     experiments: List[ExperimentIR],
+    fixed_threads: Optional[int] = None,
 ) -> List[int]:
+    if fixed_threads is not None:
+        return [int(fixed_threads)]
     if not cfg:
         return []
+    stop_on_peak = bool(cfg.get("stop_on_peak", False))
+    peak_min_improvement = float(cfg.get("peak_min_improvement_pct", 0.01))
+    peak_min_samples = int(cfg.get("peak_min_samples", 3))
+    if stop_on_peak:
+        peak_threads = _detect_thread_peak(
+            experiments,
+            min_improvement_pct=peak_min_improvement,
+            min_samples=peak_min_samples,
+        )
+        if peak_threads is not None:
+            return [peak_threads]
     mode = str(cfg.get("mode", "powers_of_two"))
     explicit_values = cfg.get("values") if mode == "explicit" else None
     min_threads = int(cfg.get("min", 1))
@@ -350,6 +3545,53 @@ def _thread_candidates(
                 candidates = sorted(set(candidates + [next_threads]))
                 candidates = _trim_candidates(candidates, max_pool, keep_bottom, keep_top)
     return candidates
+
+
+def _detect_thread_peak(
+    experiments: List[ExperimentIR],
+    min_improvement_pct: float,
+    min_samples: int,
+    family: str = "parallel_omp",
+) -> Optional[int]:
+    perf: Dict[int, float] = {}
+    for exp in experiments:
+        if not exp.action or exp.action.family != family:
+            continue
+        if exp.verdict != "PASS":
+            continue
+        env = exp.job.env or {}
+        threads_raw = env.get("OMP_NUM_THREADS")
+        if threads_raw is None:
+            continue
+        try:
+            threads = int(threads_raw)
+        except (TypeError, ValueError):
+            continue
+        runtime = exp.results.runtime_seconds
+        if runtime <= 0:
+            continue
+        best = perf.get(threads)
+        if best is None or runtime < best:
+            perf[threads] = runtime
+    if len(perf) < max(3, min_samples):
+        return None
+    ordered = sorted(perf.items(), key=lambda item: item[0])
+    threads_sorted = [t for t, _ in ordered]
+    best_threads = min(perf, key=perf.get)
+    if best_threads == threads_sorted[0] or best_threads == threads_sorted[-1]:
+        return None
+    lower = max(t for t in threads_sorted if t < best_threads)
+    higher = min(t for t in threads_sorted if t > best_threads)
+    best_time = perf[best_threads]
+    lower_time = perf.get(lower)
+    higher_time = perf.get(higher)
+    if lower_time is None or higher_time is None:
+        return None
+    lower_improve = (lower_time - best_time) / max(lower_time, 1.0e-12)
+    higher_improve = (higher_time - best_time) / max(higher_time, 1.0e-12)
+    if lower_improve >= min_improvement_pct and higher_improve >= min_improvement_pct:
+        return best_threads
+    return None
 
 
 def _resolve_threads_cap(max_raw: object, system_caps: Dict[str, object]) -> int:
@@ -500,6 +3742,12 @@ def _materialize_thread_action(
     env["OMP_NUM_THREADS"] = str(threads)
     env = _replace_thread_placeholders(env, threads)
     params["env"] = env
+    backend_threads = params.get("backend_threads")
+    if isinstance(backend_threads, str) and "{threads}" in backend_threads:
+        params["backend_threads"] = backend_threads.replace("{threads}", str(threads))
+    run_args_cfg = _replace_thread_placeholders_in_run_args(params.get("run_args"), threads)
+    if run_args_cfg:
+        params["run_args"] = run_args_cfg
     params["dynamic_threads"] = False
     action.parameters = params
     return action
@@ -512,6 +3760,32 @@ def _replace_thread_placeholders(env: Dict[str, str], threads: int) -> Dict[str,
             replaced[key] = value.replace("{threads}", str(threads))
         else:
             replaced[key] = value
+    return replaced
+
+
+def _replace_thread_placeholders_in_run_args(
+    run_args_cfg: object, threads: int
+) -> Dict[str, object] | None:
+    if not isinstance(run_args_cfg, dict):
+        return None
+    replaced: Dict[str, object] = dict(run_args_cfg)
+    set_flags = []
+    for entry in run_args_cfg.get("set_flags", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        values = entry.get("values", [])
+        if isinstance(values, list):
+            new_values = []
+            for val in values:
+                if isinstance(val, str) and "{threads}" in val:
+                    new_values.append(val.replace("{threads}", str(threads)))
+                else:
+                    new_values.append(val)
+            entry = dict(entry)
+            entry["values"] = new_values
+        set_flags.append(entry)
+    if set_flags:
+        replaced["set_flags"] = set_flags
     return replaced
 
 
@@ -528,19 +3802,70 @@ def _apply_adapter(
 ) -> List[ActionIR]:
     if not adapter_cfg or adapter_cfg.get("app") not in {job.app}:
         return actions
-    backend_map = adapter_cfg.get("backend_enable", {})
-    if not isinstance(backend_map, dict):
-        return actions
     adapted: List[ActionIR] = []
     for action in actions:
-        params = dict(action.parameters or {})
-        backend = params.get("backend_enable")
-        mapping = backend_map.get(str(backend)) if backend else None
-        if mapping and "run_args" in mapping:
-            params["run_args"] = _merge_run_args(params.get("run_args"), mapping.get("run_args"))
-        action.parameters = params
-        adapted.append(action)
+        adapted.append(apply_app_adapter(action, job, adapter_cfg))
     return adapted
+
+
+_MPI_FAMILIES = {"parallel_mpi", "mpi_omp_hybrid", "comm_tune"}
+
+
+def _has_launcher(action: ActionIR) -> bool:
+    """Return True if the action specifies a non-direct MPI launcher."""
+    params = action.parameters or {}
+    launcher = params.get("launcher")
+    if isinstance(launcher, dict) and launcher.get("type", "direct") != "direct":
+        return True
+    return False
+
+
+def _filter_mpi_actions(
+    actions: List[ActionIR],
+    job: JobIR,
+    reporter: Optional["ConsoleUI"] = None,
+) -> List[ActionIR]:
+    """Remove actions that require MPI when the binary lacks real MPI support."""
+    from skills.hardware_probe import check_binary_mpi_support
+
+    # Only check once; cache result
+    has_mpi = check_binary_mpi_support(job.lammps_bin)
+    if has_mpi:
+        return actions
+
+    filtered: List[ActionIR] = []
+    dropped = 0
+    for action in actions:
+        if _has_launcher(action):
+            dropped += 1
+            continue
+        filtered.append(action)
+    if dropped and reporter:
+        reporter._print(
+            f"  [MPI guard] Dropped {dropped} action(s): binary has no MPI support"
+        )
+    return filtered
+
+
+def _filter_fixed_threads(
+    actions: List[ActionIR],
+    fixed_threads: Optional[int],
+) -> List[ActionIR]:
+    if fixed_threads is None:
+        return actions
+    fixed_str = str(int(fixed_threads))
+    filtered: List[ActionIR] = []
+    for action in actions:
+        params = action.parameters or {}
+        env = params.get("env", {})
+        if isinstance(env, dict) and "OMP_NUM_THREADS" in env:
+            if str(env.get("OMP_NUM_THREADS")) != fixed_str:
+                continue
+        backend_threads = params.get("backend_threads")
+        if backend_threads is not None and str(backend_threads) != fixed_str:
+            continue
+        filtered.append(action)
+    return filtered
 
 
 def _merge_run_args(base: Optional[Dict[str, object]], extra: Optional[Dict[str, object]]) -> Dict[str, object]:
@@ -569,6 +3894,9 @@ def _select_validation_base(
     best_exp: ExperimentIR,
     experiments: List[ExperimentIR],
 ) -> tuple[JobIR, Optional[str], Optional[str]]:
+    if best_exp and best_exp.job:
+        best_action_id = best_exp.action.action_id if best_exp.action else "baseline"
+        return best_exp.job, best_exp.run_id, best_action_id
     if best_exp.base_run_id:
         base_exp = _find_experiment_by_run_id(experiments, best_exp.base_run_id)
         if base_exp:
@@ -613,6 +3941,19 @@ def _apply_confidence_policy(
     return filtered
 
 
+class TraceBuffer(list):
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self._path = path
+
+    def append(self, item) -> None:
+        super().append(item)
+        try:
+            self._path.write_text(json.dumps(self, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+
 def run_optimization(
     job: JobIR,
     actions: List[ActionIR],
@@ -624,8 +3965,14 @@ def run_optimization(
     top_k: int,
     selection_mode: str,
     direction_top_k: int,
+    direction_space: Optional[List[Dict[str, object]]],
     llm_client: Optional[LLMClient],
+    wrappers_cfg: Optional[List[Dict[str, object]]] = None,
     candidate_policy: Optional[Dict[str, object]] = None,
+    build_packs: Optional[Dict[str, object]] = None,
+    patch_families: Optional[Dict[str, object]] = None,
+    survey_guidance: Optional[Dict[str, object]] = None,
+    hierarchical_cfg: Optional[Dict[str, object]] = None,
     adapter_cfg: Optional[Dict[str, object]] = None,
     planner_cfg: Optional[Dict[str, object]] = None,
     reporter: Optional[ConsoleUI] = None,
@@ -634,25 +3981,126 @@ def run_optimization(
     baseline_stat: str = "mean",
     validate_top1_repeats: int = 0,
     min_improvement_pct: float = 0.0,
+    resume_state: Optional[Dict[str, object]] = None,
+    fixed_threads: Optional[int] = None,
+    skip_baseline: bool = False,
 ) -> Dict[str, object]:
     profiler = ProfilerAgent()
-    analyst = AnalystAgent(llm_client)
     planner = PlannerAgent(planner_cfg or {}, llm_client)
     optimizer = OptimizerAgent(llm_client)
     ranker = RouterRankerAgent(llm_client)
-    verifier = VerifierAgent()
+    verifier = VerifierAgent(llm_client)
     reviewer = ReviewerAgent(llm_client)
+    from orchestrator.agents.patch_planner import PatchPlannerAgent
+    patch_planner = PatchPlannerAgent(llm_client)
+    # Legacy agents kept for non-patch phases; will be removed in Phase 10.
+    idea_agent = IdeaAgent(llm_client)
+    code_survey_agent = CodeSurveyAgent(llm_client)
+    action_synth = ActionSynthAgent(llm_client)
+    # Check if agentic code patching is enabled
+    agentic_cfg = (planner_cfg or {}).get("agentic_code_patch", {})
+    use_agentic_patcher = isinstance(agentic_cfg, dict) and agentic_cfg.get("enabled", False)
+    if use_agentic_patcher:
+        # Use the new agentic code optimizer with tool use and multi-turn conversation
+        agentic_repo_root = Path(__file__).resolve().parents[1] / "third_party" / "lammps"
+        agentic_build_dir = Path(__file__).resolve().parents[1] / "build" / "lammps-macos-omp"
+        llm_config = {
+            "api_key_env": agentic_cfg.get("api_key_env", "DEEPSEEK_API_KEY"),
+            "base_url": agentic_cfg.get("base_url", "https://api.deepseek.com"),
+            "model": agentic_cfg.get("model", "deepseek-chat"),
+            "enabled": True,
+            "max_turns": agentic_cfg.get("max_turns", 25),
+            "max_tool_calls_per_turn": agentic_cfg.get("max_tool_calls_per_turn", 5),
+        }
+        code_patcher = create_agentic_code_patch_agent(
+            repo_root=agentic_repo_root,
+            build_dir=agentic_build_dir,
+            llm_config=llm_config,
+        )
+    else:
+        code_patcher = CodePatchAgent(llm_client)
+    patch_debugger = PatchDebugAgent(llm_client)
+    patch_reviewer = PatchReviewAgent(llm_client)
     executor = ExecutorAgent(_run_experiment)
     reporter_agent = ReporterAgent()
     triage = TriageAgent()
     memory = OptimizationMemory()
+    memory_cfg = (planner_cfg or {}).get("memory", {})
+    knowledge_root = (artifacts_dir.parent if artifacts_dir else Path("artifacts")) / "knowledge"
+    memory_path = knowledge_root / "experience.jsonl"
+    if isinstance(memory_cfg, dict) and isinstance(memory_cfg.get("path"), str):
+        memory_path = Path(memory_cfg["path"])
+    experience_memory = ExperienceMemory.from_config(
+        memory_cfg if isinstance(memory_cfg, dict) else {}, memory_path
+    )
     state = StopState()
-    trace_events: List[Dict[str, object]] = []
-    system_caps = _system_caps()
-    candidate_policy_summary = _select_candidate_policy(candidate_policy, job.case_id)
+    trace_events: List[Dict[str, object]] = TraceBuffer(artifacts_dir / "agent_trace.json")
+    phase = "RUN_TUNE"
+    frozen_run_id: Optional[str] = None
+    frozen_build_id: Optional[str] = None
+    seed_experiments: List[ExperimentIR] = []
+    resume_best_chain_exp: Optional[ExperimentIR] = None
+    resume_best_chain_id: Optional[str] = None
+    if isinstance(resume_state, dict):
+        start_phase = resume_state.get("start_phase")
+        if isinstance(start_phase, str) and start_phase:
+            phase = start_phase.upper()
+        frozen_run_id = resume_state.get("frozen_run_id") or frozen_run_id
+        frozen_build_id = resume_state.get("frozen_build_id") or frozen_build_id
+        resume_best_chain_id = resume_state.get("best_chain_run_id")
+        chain_path = resume_state.get("best_chain_exp_path")
+        if chain_path:
+            resume_best_chain_exp = _read_experiment(Path(chain_path))
+        for entry in resume_state.get("seed_experiments", []) or []:
+            if not entry:
+                continue
+            exp = _read_experiment(Path(entry))
+            if exp:
+                seed_experiments.append(exp)
+    seed_baseline: Optional[ExperimentIR] = None
+    seed_nonbaseline: List[ExperimentIR] = []
+    if seed_experiments:
+        for exp in seed_experiments:
+            if exp.action is None or (exp.action and exp.action.action_id == "baseline"):
+                if seed_baseline is None:
+                    seed_baseline = exp
+                else:
+                    seed_nonbaseline.append(exp)
+            else:
+                seed_nonbaseline.append(exp)
+    retune_remaining = int((planner_cfg or {}).get("retune_budget", 1))
+    post_patch_retune = int((planner_cfg or {}).get("post_patch_retune_budget", 0))
+    retune_cfg = (planner_cfg or {}).get("retune_policy", {})
+    retune_min_improvement = 0.0
+    retune_max_candidates = 0
+    retune_families: Optional[List[str]] = None
+    if isinstance(retune_cfg, dict):
+        retune_min_improvement = float(retune_cfg.get("min_improvement_pct", 0.0) or 0.0)
+        retune_max_candidates = int(retune_cfg.get("max_candidates", 0) or 0)
+        families = retune_cfg.get("families")
+        if isinstance(families, list):
+            retune_families = [str(item) for item in families]
+    retune_origin: Optional[str] = None
 
     start_time = time.monotonic()
     repo_root = Path(__file__).resolve().parents[1]
+    system_caps = _system_caps(repo_root)
+
+    # Inject detected MPI launcher into adapter_cfg so app adapters can use it
+    if system_caps.get("mpi_launcher") and isinstance(adapter_cfg, dict):
+        adapter_cfg.setdefault("mpi_launcher", system_caps["mpi_launcher"])
+
+    candidate_policy_summary = _select_candidate_policy(candidate_policy, job.case_id)
+    direction_list = [
+        direction.get("id")
+        for direction in (direction_space or [])
+        if isinstance(direction, dict) and direction.get("id")
+    ]
+    direction_map = {
+        direction.get("id"): direction
+        for direction in (direction_space or [])
+        if isinstance(direction, dict) and direction.get("id")
+    }
     if reporter:
         reporter.header(
             job=job,
@@ -668,34 +4116,95 @@ def run_optimization(
             min_improvement_pct=min_improvement_pct,
         )
     last_review_decision: Optional[Dict[str, object]] = None
-    baseline_exp = executor.execute(
-        exp_id="baseline",
-        job=job,
-        base_job=None,
-        base_run_id=None,
-        base_action_id=None,
-        action=None,
-        actions_root=repo_root,
-        policy=policy,
-        gates=gates,
-        profiler=profiler,
-        verifier=verifier,
-        artifacts_dir=artifacts_dir,
-        time_command=time_command,
-        build_cfg=build_cfg or {},
-        repeats=baseline_repeats,
-        runtime_agg=baseline_stat,
-        baseline_exp=None,
-        baseline_runtime=None,
-        prior_samples=None,
-        trace_events=trace_events,
-        parent_run_id=None,
-        iteration=None,
-        llm_trace=None,
-        reporter=reporter,
-    )
+    baseline_from_seed = False
+    if skip_baseline and seed_baseline:
+        baseline_exp = seed_baseline
+        baseline_from_seed = True
+        trace_events.append(
+            {
+                "event": "baseline_reused",
+                "agent": "Orchestrator",
+                "run_id": baseline_exp.run_id,
+                "path": str(baseline_exp.patch_path) if baseline_exp.patch_path else None,
+            }
+        )
+    elif skip_baseline and seed_nonbaseline:
+        baseline_exp = _best_pass_exp(seed_nonbaseline) or seed_nonbaseline[0]
+        baseline_from_seed = True
+        trace_events.append(
+            {
+                "event": "baseline_reused",
+                "agent": "Orchestrator",
+                "run_id": baseline_exp.run_id,
+                "path": str(baseline_exp.patch_path) if baseline_exp.patch_path else None,
+                "note": "baseline skipped; reusing best seed experiment",
+            }
+        )
+    else:
+        baseline_exp = executor.execute(
+            exp_id="baseline",
+            job=job,
+            base_job=None,
+            base_run_id=None,
+            base_action_id=None,
+            action=None,
+            actions_root=repo_root,
+            policy=policy,
+            gates=gates,
+            profiler=profiler,
+            verifier=verifier,
+            artifacts_dir=artifacts_dir,
+            time_command=time_command,
+            wrappers_cfg=wrappers_cfg,
+            build_cfg=build_cfg or {},
+            build_packs=build_packs,
+            adapter_cfg=adapter_cfg,
+            repeats=baseline_repeats,
+            runtime_agg=baseline_stat,
+            baseline_exp=None,
+            baseline_exp_for_verify=None,
+            baseline_runtime=None,
+            prior_samples=None,
+            trace_events=trace_events,
+            parent_run_id=None,
+            iteration=None,
+            llm_trace=None,
+            reporter=reporter,
+        )
     memory.record(baseline_exp)
-    state.run_count += 1
+    chain_min_improvement_pct = float(
+        (planner_cfg or {}).get("chain_min_improvement_pct", 0.001) or 0.001
+    )
+    memory.min_best_improvement_pct = chain_min_improvement_pct
+    best_chain_exp = baseline_exp
+    best_chain_runtime = baseline_exp.results.runtime_seconds
+    if seed_nonbaseline:
+        for exp in seed_nonbaseline:
+            memory.record(exp)
+        trace_events.append(
+            {
+                "event": "resume_seed",
+                "agent": "Orchestrator",
+                "phase": phase,
+                "frozen_run_id": frozen_run_id,
+                "frozen_build_id": frozen_build_id,
+                "seed_runs": [exp.run_id for exp in seed_nonbaseline],
+            }
+        )
+        if memory.best and memory.best.verdict == "PASS":
+            best_chain_exp = memory.best
+            best_chain_runtime = memory.best.results.runtime_seconds
+    if resume_best_chain_exp and resume_best_chain_exp.verdict == "PASS":
+        best_chain_exp = resume_best_chain_exp
+        best_chain_runtime = resume_best_chain_exp.results.runtime_seconds
+        memory.best = resume_best_chain_exp
+    if any(
+        exp.action and exp.action.family == "neighbor_tune" for exp in memory.experiments
+    ):
+        state.neighbor_tune_done = True
+        state.blocked_families.add("neighbor_tune")
+    if not baseline_from_seed:
+        state.run_count += 1
     if reporter:
         reporter.update_baseline(baseline_exp)
     _append_run_index(artifacts_dir, baseline_exp, parent_run_id=None, iteration=None)
@@ -728,12 +4237,193 @@ def run_optimization(
             llm_summary_zh=None,
             candidate_policy=candidate_policy_summary,
             review_decision=last_review_decision,
+            phase_transitions=_extract_phase_transitions(trace_events),
+            composite_exp=None,
+            min_improvement_pct=min_improvement_pct,
         )
         report_info["agent_trace"] = agent_trace_path
         return report_info
 
-    prev_best_time = baseline_exp.results.runtime_seconds
+    # --- Two-phase dispatch ---
+    two_phase_cfg = (planner_cfg or {}).get("two_phase", {})
+    use_two_phase = isinstance(two_phase_cfg, dict) and two_phase_cfg.get("enabled", False)
+
+    if use_two_phase:
+        best_param_exp, param_experiments = _run_parameter_exploration_phase(
+            job=job,
+            actions=actions,
+            baseline_exp=baseline_exp,
+            executor=executor,
+            profiler=profiler,
+            verifier=verifier,
+            policy=policy,
+            gates=gates,
+            artifacts_dir=artifacts_dir,
+            time_command=time_command,
+            wrappers_cfg=wrappers_cfg,
+            build_cfg=build_cfg,
+            build_packs=build_packs,
+            adapter_cfg=adapter_cfg,
+            planner_cfg=planner_cfg,
+            experience_memory=experience_memory,
+            memory=memory,
+            state=state,
+            trace_events=trace_events,
+            reporter=reporter,
+            repo_root=repo_root,
+            system_caps=system_caps,
+            chain_min_improvement_pct=chain_min_improvement_pct,
+        )
+
+        if best_param_exp and best_param_exp.verdict == "PASS":
+            best_chain_exp = best_param_exp
+            best_chain_runtime = best_param_exp.results.runtime_seconds
+            memory.best = best_param_exp
+            phase = "PATCH"  # Phase 2: directly enter source patch iteration
+            frozen_run_id = best_param_exp.run_id
+            trace_events.append({
+                "event": "two_phase_enter_patch",
+                "agent": "Orchestrator",
+                "best_param_run_id": best_param_exp.run_id,
+                "best_param_runtime": best_param_exp.results.runtime_seconds,
+            })
+        else:
+            # Exploration failed or no improvement — fall back to iterative mode
+            use_two_phase = False
+            trace_events.append({
+                "event": "two_phase_fallback",
+                "agent": "Orchestrator",
+                "reason": "exploration produced no improvement",
+            })
+
+    # --- Deep Code Analysis (runs once at start of Phase 2) ---
+    deep_analysis_opportunities: List[ActionIR] = []
+    _deep_analysis_result: Optional[DeepCodeAnalysisResult] = None
+    if use_two_phase and phase == "PATCH":
+        da_cfg = (planner_cfg or {}).get("two_phase", {})
+        da_cfg = da_cfg.get("deep_analysis", {}) if isinstance(da_cfg, dict) else {}
+        use_deep_analysis = isinstance(da_cfg, dict) and da_cfg.get("enabled", False)
+        if use_deep_analysis:
+            from orchestrator.agents.code_analysis_agent import (
+                DeepCodeAnalysisAgent,
+                DeepAnalysisResult,
+            )
+            if reporter:
+                reporter._section("Phase 2 Init: Deep Code Analysis")
+            da_agent_config = AgentConfig(
+                enabled=True,
+                api_key_env=da_cfg.get("api_key_env", "DEEPSEEK_API_KEY"),
+                base_url=da_cfg.get("base_url", "https://api.deepseek.com"),
+                model=da_cfg.get("model", "deepseek-chat"),
+                temperature=float(da_cfg.get("temperature", 0.3)),
+                max_tokens=int(da_cfg.get("max_tokens", 4096)),
+                max_turns=int(da_cfg.get("max_turns", 35)),
+                max_tool_calls_per_turn=int(da_cfg.get("max_tool_calls_per_turn", 5)),
+            )
+            # Determine hotspot files from input script
+            _da_input_text = _safe_read(Path(best_chain_exp.job.input_script))
+            _da_hotspot = _hotspot_map(
+                _da_input_text, repo_root, best_chain_exp.job.run_args or [],
+            )
+            _da_hotspot_files = _da_hotspot.get("hotspot_files", [])
+            _da_backend = _backend_from_args(best_chain_exp.job.run_args or [])
+            _da_exp_hints = (
+                experience_memory.format_hints_for_prompt(
+                    app=job.app, backend=_da_backend,
+                )
+                if experience_memory.config.enabled
+                else []
+            )
+            _da_profile = {
+                "timing_breakdown": best_chain_exp.profile_report.timing_breakdown,
+                "system_metrics": best_chain_exp.profile_report.system_metrics,
+                "notes": best_chain_exp.profile_report.notes,
+            } if best_chain_exp.profile_report else {}
+
+            da_agent = DeepCodeAnalysisAgent(
+                config=da_agent_config,
+                repo_root=Path(__file__).resolve().parents[1] / "third_party" / "lammps",
+                build_dir=Path(__file__).resolve().parents[1] / "build" / "lammps-macos-omp",
+                experience_db=experience_memory,
+            )
+            try:
+                da_result = da_agent.analyze(
+                    profile=_da_profile,
+                    hotspot_files=_da_hotspot_files,
+                    system_caps=system_caps,
+                    patch_families=patch_families,
+                    experience_hints=_da_exp_hints,
+                    backend_variant=_da_backend,
+                    input_script_path=job.input_script,
+                )
+            except Exception as exc:
+                da_result = DeepAnalysisResult(
+                    status="ERROR", analysis=None,
+                    total_turns=0, total_tokens=0,
+                )
+                trace_events.append({
+                    "event": "deep_analysis_error",
+                    "agent": "DeepCodeAnalysisAgent",
+                    "error": str(exc),
+                })
+            trace_events.append({
+                "event": "deep_code_analysis",
+                "agent": "DeepCodeAnalysisAgent",
+                "status": da_result.status,
+                "total_turns": da_result.total_turns,
+                "total_tokens": da_result.total_tokens,
+                "num_opportunities": (
+                    len(da_result.analysis.opportunities)
+                    if da_result.analysis else 0
+                ),
+            })
+            _deep_analysis_result = da_result.analysis if da_result.analysis else None
+            if da_result.analysis and da_result.analysis.opportunities:
+                _da_patch_root = ""
+                if isinstance(adapter_cfg, dict):
+                    _da_patch_root = adapter_cfg.get("patch_root", "") or ""
+                deep_analysis_opportunities = _opportunities_to_actions(
+                    da_result.analysis, patch_families,
+                    repo_root=repo_root, patch_root=_da_patch_root,
+                )
+                # Save report to artifacts
+                _da_report_path = artifacts_dir / "deep_analysis.json"
+                try:
+                    _da_report_path.write_text(
+                        da_result.analysis.model_dump_json(indent=2),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+                if reporter:
+                    reporter._print(
+                        f"Deep analysis: {len(da_result.analysis.opportunities)} "
+                        f"opportunities found ({da_result.total_turns} turns, "
+                        f"{da_result.total_tokens} tokens)"
+                    )
+            else:
+                if reporter:
+                    reporter._print(
+                        f"Deep analysis: {da_result.status}, "
+                        f"no opportunities — falling back to PatchPlanner"
+                    )
+
+    # --- Batch selection + reflection state ---
+    _batch_cfg = (planner_cfg or {}).get("batch_selection", {})
+    use_batch_selection = bool(_batch_cfg.get("enabled", False))
+    _batch_min = int(_batch_cfg.get("min_batch", 3))
+    _batch_max = int(_batch_cfg.get("max_batch", 5))
+    _refl_cfg = (planner_cfg or {}).get("reflection", {})
+    use_reflection = bool(_refl_cfg.get("enabled", False))
+    deep_succeeded_ids: set = set()
+    deep_failed_ids: set = set()
+    deep_skipped_ids: set = set()
+    last_reflection: Optional["ReflectionResult"] = None  # noqa: F821
+    reflection_agent = ReflectionAgent(llm_client) if use_reflection else None
+    prev_best_time = best_chain_runtime
     iteration = 0
+    # Accumulate patch failure descriptions for feedback to the code patch agent
+    patch_failure_feedback: List[str] = []
     refine_cfg = (planner_cfg or {}).get("refine_on_best", {})
     refine_enabled = bool(refine_cfg.get("enabled", False))
     refine_min_improvement = float(refine_cfg.get("min_improvement_pct", min_improvement_pct or 0.0))
@@ -747,6 +4437,23 @@ def run_optimization(
                 )
             break
         iteration += 1
+        prev_best_time_before = prev_best_time
+        # Capture baseline for this iteration (for marginal gain calculation)
+        iteration_baseline_exp = best_chain_exp
+        phase_started = phase
+        patch_only = phase_started == "PATCH" and bool(
+            (planner_cfg or {}).get("patch_only", True)
+        )
+        if state.patch_family_blocked_until:
+            expired = [fam for fam, until in state.patch_family_blocked_until.items() if iteration > until]
+            for fam in expired:
+                state.patch_family_blocked_until.pop(fam, None)
+            cooldown_blocked = {
+                fam for fam, until in state.patch_family_blocked_until.items() if iteration <= until
+            }
+            state.blocked_families.update(cooldown_blocked)
+        if state.neighbor_tune_done:
+            state.blocked_families.add("neighbor_tune")
 
         refine_on_best = _should_refine_on_best(
             baseline_exp=baseline_exp,
@@ -754,55 +4461,765 @@ def run_optimization(
             enabled=refine_enabled,
             min_improvement_pct=refine_min_improvement,
         )
-        ctx_job = memory.best.job if refine_on_best and memory.best else baseline_exp.job
+        ctx_job = best_chain_exp.job
         input_text = _safe_read(Path(ctx_job.input_script))
-        ctx = RuleContext(
-            job=ctx_job, input_text=input_text, run_args=ctx_job.run_args, env=ctx_job.env
+        # Reconstruct effective run_args/env with adapter-injected flags
+        # (e.g. "-sf omp") so that variant matching and hotspot detection
+        # see the actual runtime configuration, not the raw JobIR.
+        _eff_env, _eff_run_args, _ = _apply_run_config_action(
+            ctx_job, best_chain_exp.action
         )
-        profile_ref = memory.best.profile_report if memory.best else baseline_exp.profile_report
+        ctx = RuleContext(
+            job=ctx_job, input_text=input_text, run_args=_eff_run_args, env=_eff_env
+        )
+        _backend_variant: Optional[str] = None  # set later by _adapter_variant_files
+        profile_ref = best_chain_exp.profile_report
         history_summary = _build_history_summary(memory.experiments)
         cost_model = _build_cost_model(memory.experiments)
         tested_actions = [exp.action.action_id for exp in memory.experiments if exp.action]
-        iteration_actions = _prepare_actions(
-            base_actions=actions,
+        profile_features = build_profile_features(profile_ref)
+        best_threads = None
+        if ctx_job.env:
+            try:
+                best_threads = int(ctx_job.env.get("OMP_NUM_THREADS"))
+            except (TypeError, ValueError):
+                best_threads = None
+        if best_threads:
+            profile_features["best_threads"] = best_threads
+        input_summary = _summarize_input_script(input_text)
+        _iter_patch_root = ""
+        if isinstance(adapter_cfg, dict):
+            _iter_patch_root = adapter_cfg.get("patch_root", "") or ""
+        hotspot_map = _hotspot_map(
+            input_text, repo_root, ctx.run_args,
+            patch_root=_iter_patch_root,
+            deep_analysis_result=_deep_analysis_result,
+        )
+        memory_hints = _build_memory_hints(
+            experience_memory,
+            ctx_job.case_id,
+            ctx_job.app,
+            _backend_from_args(ctx_job.run_args or []),
+        )
+        planner_context = _build_planner_context(
+            job=job,
+            input_summary=input_summary,
+            profile=profile_ref,
+            profile_features=profile_features,
+            hotspot_map=hotspot_map,
+            system_caps=system_caps,
+        )
+        generated_actions: List[ActionIR] = []
+        generated_ideas_payload: Optional[Dict[str, object]] = None
+        code_survey_payload: Optional[Dict[str, object]] = None
+        snippet_feature_map: Dict[Tuple[str, Optional[str]], Dict[str, object]] = {}
+        if llm_client and llm_client.config.enabled:
+            available_families = sorted({action.family for action in actions})
+            existing_action_ids = sorted({action.action_id for action in actions})
+            action_space_summary = _action_space_summary(actions, patch_families)
+            survey_rules = _patch_rules(adapter_cfg, policy)
+            survey_allowed_files = _expand_allowed_files(repo_root, survey_rules)
+            survey_max_snippets = int(survey_rules.get("max_snippets", 0) or 0)
+            survey_max_context = int(survey_rules.get("max_context_chars", 0) or 0)
+            survey_preferred_files = _pair_style_files(input_text, repo_root, ctx.run_args)
+            survey_snippet_files = _select_snippet_files(
+                repo_root,
+                survey_rules,
+                profile_ref.timing_breakdown,
+                survey_allowed_files,
+                survey_preferred_files,
+                survey_max_snippets,
+            )
+            survey_snippets = _collect_code_snippets(
+                repo_root, survey_snippet_files, survey_max_snippets, survey_max_context
+            )
+            snippet_feature_map = _snippet_feature_map(survey_snippets)
+            # --- Deep Analysis path (takes priority when opportunities remain) ---
+            # Filter out skipped opportunities before selection
+            if deep_skipped_ids:
+                deep_analysis_opportunities = [
+                    a for a in deep_analysis_opportunities
+                    if (a.parameters or {}).get("deep_analysis_id") not in deep_skipped_ids
+                ]
+            if phase == "PATCH" and deep_analysis_opportunities:
+                if use_batch_selection and len(deep_analysis_opportunities) > 1:
+                    batch = _select_opportunity_batch(
+                        deep_analysis_opportunities,
+                        min_batch=_batch_min,
+                        max_batch=_batch_max,
+                        succeeded_ids=deep_succeeded_ids,
+                        failed_ids=deep_failed_ids,
+                    )
+                    if batch:
+                        batch_ids = {
+                            (a.parameters or {}).get("deep_analysis_id")
+                            for a in batch
+                        }
+                        deep_analysis_opportunities = [
+                            a for a in deep_analysis_opportunities
+                            if (a.parameters or {}).get("deep_analysis_id") not in batch_ids
+                        ]
+                        generated_actions.extend(batch)
+                        trace_events.append({
+                            "event": "deep_analysis_batch",
+                            "agent": "DeepCodeAnalysisAgent",
+                            "iteration": iteration,
+                            "batch_size": len(batch),
+                            "action_ids": [a.action_id for a in batch],
+                            "deep_analysis_ids": [
+                                (a.parameters or {}).get("deep_analysis_id") for a in batch
+                            ],
+                        })
+                    else:
+                        # All filtered out → clear queue, fallback to PatchPlanner
+                        deep_analysis_opportunities.clear()
+                else:
+                    # Single-pop fallback (batch disabled or only 1 remaining)
+                    gen_action = deep_analysis_opportunities.pop(0)
+                    generated_actions.append(gen_action)
+                    trace_events.append({
+                        "event": "deep_analysis_action",
+                        "agent": "DeepCodeAnalysisAgent",
+                        "iteration": iteration,
+                        "action_id": gen_action.action_id,
+                        "deep_analysis_id": gen_action.parameters.get("deep_analysis_id"),
+                    })
+            # --- PatchPlanner path (fallback when deep analysis exhausted) ---
+            elif phase == "PATCH" and survey_snippets:
+                patch_family_ids = [
+                    item.get("id")
+                    for item in (patch_families or {}).get("families", [])
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                _exp_hints = experience_memory.format_hints_for_prompt(
+                    app=job.app,
+                    backend=_backend_from_args(ctx.run_args or []),
+                ) if experience_memory.config.enabled else []
+                patch_plan = patch_planner.plan(
+                    profile=profile_ref,
+                    code_snippets=survey_snippets,
+                    patch_families=patch_families or {},
+                    allowed_files=survey_allowed_files,
+                    experience_hints=_exp_hints or memory_hints or [],
+                    backend_variant=_backend_variant,
+                    max_actions=int((planner_cfg or {}).get("max_candidates", 3)),
+                    existing_action_ids=existing_action_ids,
+                )
+                if patch_plan and patch_plan.status == "OK" and patch_plan.actions:
+                    for pa in patch_plan.actions:
+                        params = {
+                            "patch_family": pa.patch_family,
+                            "target_file": pa.target_file,
+                            "target_anchor": pa.target_anchor,
+                            "code_context": pa.code_context,
+                            "origin": "patch_planner",
+                        }
+                        if pa.wrapper_id:
+                            params["wrapper_id"] = pa.wrapper_id
+                        gen_action = ActionIR(
+                            action_id=pa.action_id,
+                            family="source_patch",
+                            description=pa.mechanism or pa.rationale,
+                            applies_to=["source_patch"],
+                            parameters=params,
+                            expected_effect=(
+                                [pa.expected_effect]
+                                if pa.expected_effect and pa.expected_effect in _EXPECTED_EFFECTS
+                                else _patch_family_effects(patch_families, pa.patch_family)
+                            ),
+                            risk_level=pa.risk_level or "medium",
+                            verification_plan=VerificationPlan(
+                                gates=_patch_family_gates(patch_families, pa.patch_family)
+                            ),
+                        )
+                        generated_actions.append(gen_action)
+                    trace_events.append(
+                        {
+                            "event": "patch_planner_actions",
+                            "agent": "PatchPlannerAgent",
+                            "iteration": iteration,
+                            "actions": [pa.action_id for pa in patch_plan.actions],
+                        }
+                    )
+            # --- Legacy survey→idea→synth path (for non-PATCH phases) ---
+            if not generated_actions and survey_snippets:
+                survey_context = {
+                    "action_space": action_space_summary,
+                    "code_snippets": survey_snippets,
+                    "job": planner_context["job"],
+                    "input_summary": input_summary,
+                    "profile": planner_context["profile"],
+                    "profile_features": profile_features,
+                    "hotspot_map": hotspot_map,
+                    "system_caps": system_caps,
+                    "memory_hints": memory_hints,
+                    "survey_guidance": survey_guidance or {},
+                }
+                survey_result = code_survey_agent.survey(survey_context)
+                if survey_result:
+                    code_survey_payload = survey_result.model_dump()
+                    if code_survey_payload and snippet_feature_map:
+                        filtered, dropped = _filter_opportunities_by_structure(
+                            list(code_survey_payload.get("opportunities", [])),
+                            snippet_feature_map,
+                        )
+                        code_survey_payload["opportunities"] = filtered
+                        if dropped:
+                            trace_events.append(
+                                {
+                                    "event": "code_survey_filtered",
+                                    "iteration": iteration,
+                                    "dropped": dropped,
+                                }
+                            )
+                    trace_events.append(
+                        {
+                            "event": "code_survey",
+                            "agent": "CodeSurveyAgent",
+                            "iteration": iteration,
+                            "opportunities": [
+                                item.get("opportunity_id")
+                                for item in code_survey_payload.get("opportunities", [])
+                            ],
+                        }
+                    )
+                planner_context["code_survey_summary"] = _summarize_code_survey(
+                    code_survey_payload
+                )
+                planner_context["action_space"] = action_space_summary
+            idea_context = {
+                "job": planner_context["job"],
+                "input_summary": input_summary,
+                "profile": planner_context["profile"],
+                "profile_features": profile_features,
+                "hotspot_map": hotspot_map,
+                "system_caps": system_caps,
+                "available_families": available_families,
+            }
+            ideas = idea_agent.propose(idea_context)
+            generated_ideas_payload = ideas.model_dump() if ideas else {
+                "ideas": [],
+                "status": "OK",
+                "missing_fields": [],
+            }
+            patch_family_ids = [
+                item.get("id")
+                for item in (patch_families or {}).get("families", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+            synth_context = {
+                "ideas": generated_ideas_payload,
+                "code_opportunities": code_survey_payload.get("opportunities", [])
+                if code_survey_payload
+                else [],
+                "job": planner_context["job"],
+                "input_summary": input_summary,
+                "profile": planner_context["profile"],
+                "profile_features": profile_features,
+                "hotspot_map": hotspot_map,
+                "system_caps": system_caps,
+                "available_families": available_families,
+                "existing_action_ids": existing_action_ids,
+                "adapter_hints": _adapter_hints(job, adapter_cfg),
+                "patch_families": patch_family_ids,
+                "patch_family_defs": action_space_summary.get("patch_family_defs", []),
+                "memory_hints": memory_hints,
+            }
+            synth_actions = action_synth.synthesize(synth_context)
+            if synth_actions:
+                generated_actions = _dedupe_actions(synth_actions.actions)
+                for action in generated_actions:
+                    params = dict(action.parameters or {})
+                    params.setdefault("origin", "generated")
+                    action.parameters = params
+            if not generated_actions and code_survey_payload:
+                generated_actions = _actions_from_opportunities(
+                    code_survey_payload.get("opportunities", []),
+                    patch_families,
+                    max_actions=int((planner_cfg or {}).get("max_candidates", 3)),
+                )
+                if generated_actions:
+                    for action in generated_actions:
+                        params = dict(action.parameters or {})
+                        params.setdefault("origin", "code_survey")
+                        action.parameters = params
+            if generated_actions:
+                generated_actions, dropped_actions = _filter_generated_actions_by_structure(
+                    generated_actions, snippet_feature_map
+                )
+                if dropped_actions:
+                    trace_events.append(
+                        {
+                            "event": "generated_actions_filtered",
+                            "iteration": iteration,
+                            "dropped": dropped_actions,
+                        }
+                    )
+            if generated_actions:
+                trace_events.append(
+                    {
+                        "event": "generated_actions",
+                        "agent": "ActionSynthAgent",
+                        "iteration": iteration,
+                        "actions": [action.action_id for action in generated_actions],
+                    }
+                )
+                for action in generated_actions:
+                    if action.family == "source_patch":
+                        action.applies_to = ["source_patch"]
+            if generated_actions and code_survey_payload:
+                opportunities = code_survey_payload.get("opportunities", [])
+                for action in generated_actions:
+                    if action.family != "source_patch":
+                        continue
+                    params = dict(action.parameters or {})
+                    if params.get("evidence"):
+                        continue
+                    target_file = params.get("target_file")
+                    patch_family = params.get("patch_family")
+                    for opp in opportunities:
+                        if not isinstance(opp, dict):
+                            continue
+                        if target_file and target_file != opp.get("file_path"):
+                            continue
+                        if patch_family and patch_family != opp.get("patch_family"):
+                            continue
+                        evidence = opp.get("evidence")
+                        if isinstance(evidence, list) and evidence:
+                            params["evidence"] = evidence
+                            action.parameters = params
+                            break
+            replay_cfg = (planner_cfg or {}).get("memory_replay", {})
+            if isinstance(replay_cfg, dict) and replay_cfg.get("enabled", False):
+                replay_max = int(replay_cfg.get("max_actions", 0) or 0)
+                replay_min_gain = float(replay_cfg.get("min_gain_pct", 1.0) or 1.0)
+                replay_root = Path("artifacts")
+                if artifacts_dir and artifacts_dir.parent:
+                    replay_root = artifacts_dir.parent.parent
+                replay_actions = _load_patch_replay_actions(
+                    replay_root,
+                    job.case_id,
+                    _backend_from_args(ctx.run_args or []),
+                    replay_min_gain,
+                    replay_max,
+                    {action.action_id for action in actions + generated_actions},
+                    patch_families or {},
+                )
+                if replay_actions:
+                    generated_actions.extend(replay_actions)
+                    trace_events.append(
+                        {
+                            "event": "memory_replay_actions",
+                            "agent": "Orchestrator",
+                            "iteration": iteration,
+                            "action_ids": [action.action_id for action in replay_actions],
+                        }
+                    )
+        all_actions = _prepare_actions(
+            base_actions=_dedupe_actions(list(actions) + generated_actions),
             candidate_policy=candidate_policy,
             system_caps=system_caps,
             experiments=memory.experiments,
             adapter_cfg=adapter_cfg,
             job=job,
+            fixed_threads=fixed_threads,
         )
-        analysis = analyst.analyze(profile_ref, history_summary, policy, job.tags)
-        if selection_mode == "direction":
-            analysis.allowed_families = _select_direction_families(iteration_actions, profile_ref)
-        if "allow_build" in job.tags:
-            analysis.allowed_families.append("build_config")
-        if "allow_source_patch" in job.tags:
-            analysis.allowed_families.append("source_patch")
-        analysis.allowed_families = sorted(set(analysis.allowed_families))
-        if selection_mode != "direction":
-            allowed_targets = set(analysis.allowed_families)
-            actions_by_target = [
-                action
-                for action in iteration_actions
-                if any(target in allowed_targets for target in action.applies_to)
-            ]
-            analysis.allowed_families = sorted({action.family for action in actions_by_target})
-            available_actions = _apply_confidence_policy(actions_by_target, analysis, policy)
-        else:
-            available_actions = _apply_confidence_policy(iteration_actions, analysis, policy)
-        eligible_actions = filter_actions(available_actions, ctx, analysis.allowed_families, policy)
-        analysis.allowed_families = sorted({action.family for action in eligible_actions})
-        allowed_after_confidence = sorted({action.family for action in available_actions})
-        if analysis.allowed_families:
-            analysis.allowed_families = sorted(
-                set(analysis.allowed_families) & set(allowed_after_confidence)
+        phase_targets = _phase_targets(phase)
+        iteration_actions = _filter_actions_by_targets(all_actions, phase_targets)
+        if not iteration_actions and all_actions:
+            iteration_actions = list(all_actions)
+            trace_events.append(
+                {
+                    "event": "phase_targets_fallback",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "phase": phase,
+                    "reason": "no actions in phase targets; fallback to full action pool",
+                }
             )
-        else:
-            analysis.allowed_families = allowed_after_confidence
+        selected_directions, direction_scores = _select_directions_by_signal(
+            direction_map,
+            profile_features,
+            candidate_policy_summary,
+            direction_top_k,
+        )
+        trace_events.append(
+            {
+                "event": "direction_selection",
+                "agent": "DirectionSelector",
+                "iteration": iteration,
+                "direction_scores": direction_scores,
+                "selected_directions": selected_directions,
+            }
+        )
+        analysis = planner.analyze(
+            profile_ref,
+            history_summary,
+            policy,
+            job.tags,
+            profile_features=profile_features,
+        )
+        direction_actions = list(iteration_actions)
+        direction_actions, domain_rejections = enforce_candidate_policy(
+            direction_actions, candidate_policy_summary or {}, profile_features
+        )
+        if domain_rejections:
+            trace_events.append(
+                {
+                    "event": "candidate_domain_reject",
+                    "agent": "ActionDomain",
+                    "iteration": iteration,
+                    "rejections": domain_rejections,
+                }
+            )
+        available_actions = _apply_confidence_policy(direction_actions, analysis, policy)
+        if not available_actions:
+            available_actions = list(iteration_actions)
+        eligible_pool = filter_actions(available_actions, ctx, None, policy)
+        if not eligible_pool and available_actions:
+            eligible_pool = list(available_actions)
+        if state.blocked_families:
+            eligible_pool = [
+                action for action in eligible_pool if action.family not in state.blocked_families
+            ]
+        if state.blocked_actions:
+            eligible_pool = [
+                action for action in eligible_pool if action.action_id not in state.blocked_actions
+            ]
+        fast_start_cfg = (planner_cfg or {}).get("fast_start", {})
+        fast_start_active = bool(fast_start_cfg.get("enabled", False))
+        fast_start_iters = int(fast_start_cfg.get("iterations", 0) or 0)
+        fast_start_targets = set(fast_start_cfg.get("targets", []) or [])
+        if phase == "PATCH":
+            fast_start_active = False
+        if fast_start_active and fast_start_iters > 0 and iteration <= fast_start_iters:
+            family_targets = _family_targets(eligible_pool)
+            fast_families = [
+                fam
+                for fam, targets in family_targets.items()
+                if fast_start_targets and targets.intersection(fast_start_targets)
+            ]
+            if fast_families:
+                analysis.allowed_families = sorted(set(fast_families))
+                analysis.rationale = (
+                    (analysis.rationale or "")
+                    + " | fast_start: focus on run/build families"
+                ).strip(" |")
+                trace_events.append(
+                    {
+                        "event": "fast_start_override",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "families": analysis.allowed_families,
+                        "targets": sorted(fast_start_targets),
+                    }
+                )
+        backend_exp = _latest_backend_exp(memory.experiments)
+        if (
+            phase == "RUN_RETUNE"
+            and backend_exp
+            and _run_args_has_backend(ctx.run_args)
+        ):
+            filtered_pool = [
+                action
+                for action in eligible_pool
+                if action.family != "runtime_backend_select"
+            ]
+            if filtered_pool:
+                eligible_pool = filtered_pool
+                analysis.allowed_families = [
+                    fam for fam in analysis.allowed_families if fam != "runtime_backend_select"
+                ]
+                trace_events.append(
+                    {
+                        "event": "retune_backend_locked",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "reason": "backend already selected; skip runtime_backend_select during RUN_RETUNE",
+                    }
+                )
+        patch_scope_cfg = _patch_scope_config(policy)
+        patch_rules = _patch_rules(adapter_cfg, policy)
+        scope_levels = patch_scope_cfg.get("levels") or []
+        scope_id = None
+        if scope_levels:
+            start_level = patch_scope_cfg.get("start_level")
+            if (
+                iteration == 1
+                and state.patch_scope_level == 0
+                and isinstance(start_level, str)
+                and start_level in scope_levels
+            ):
+                state.patch_scope_level = scope_levels.index(start_level)
+            scope_index = min(state.patch_scope_level, len(scope_levels) - 1)
+            scope_id = scope_levels[scope_index]
+            patch_rules = _apply_patch_scope(patch_rules, scope_id)
+            trace_events.append(
+                {
+                    "event": "source_patch_scope_selected",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "scope": scope_id,
+                }
+            )
+        debug_max_attempts = int(patch_rules.get("debug_max_attempts", 0) or 0)
+        worktree_retry_attempts = int(
+            patch_rules.get("worktree_retry_attempts", debug_max_attempts or 2) or 2
+        )
+        allowed_files = _expand_allowed_files(repo_root, patch_rules)
+        max_snippets = int(patch_rules.get("max_snippets", 0) or 0)
+        max_context = int(patch_rules.get("max_context_chars", 0) or 0)
+
+        # --- preferred_files: agent-driven first, rule-based fallback ---
+        _patch_root = patch_rules.get("patch_root", "") if isinstance(patch_rules, dict) else ""
+        if not _patch_root and isinstance(adapter_cfg, dict):
+            _patch_root = adapter_cfg.get("patch_root", "")
+
+        def _normalise_to_repo_rel(raw: str) -> Optional[str]:
+            """Resolve a file path to repo-relative, adding patch_root prefix if needed."""
+            return _normalise_path_to_repo_rel(raw, repo_root, _patch_root)
+
+        # Priority 1: deep analysis hotspot_files (agent judgment)
+        agent_preferred: List[str] = []
+        if _deep_analysis_result and _deep_analysis_result.hotspot_files:
+            for hf in _deep_analysis_result.hotspot_files:
+                rel = _normalise_to_repo_rel(hf)
+                if rel and rel not in agent_preferred:
+                    agent_preferred.append(rel)
+
+        # Priority 2: per-iteration action target_files from deep analysis opportunities
+        for action in eligible_pool:
+            if action.family != "source_patch":
+                continue
+            tfiles = (action.parameters or {}).get("target_files", [])
+            if isinstance(tfiles, list):
+                for tf in tfiles:
+                    rel = _normalise_to_repo_rel(tf)
+                    if rel and rel not in agent_preferred:
+                        agent_preferred.insert(0, rel)
+
+        # Priority 3: rule-based pair_style file inference (fallback)
+        rule_preferred = _pair_style_files(input_text, repo_root, ctx.run_args)
+
+        # Merge: agent > rule, deduplicated
+        preferred_files = list(agent_preferred)
+        for rf in rule_preferred:
+            if rf not in preferred_files:
+                preferred_files.append(rf)
+
+        # Variant file matching (still useful for filtering)
+        variant_files, variant_ids = _adapter_variant_files(
+            adapter_cfg,
+            repo_root,
+            ctx.run_args,
+            input_text,
+            ctx.env or {},
+        )
+        if variant_files:
+            prefer_mode = None
+            if isinstance(adapter_cfg, dict):
+                prefer_mode = adapter_cfg.get("variants_prefer_mode")
+            if prefer_mode == "exclusive":
+                if preferred_files:
+                    intersection = [p for p in preferred_files if p in variant_files]
+                    preferred_files = intersection or list(preferred_files)
+                if max_snippets and max_snippets > len(preferred_files):
+                    max_snippets = len(preferred_files)
+            else:
+                preferred_files = preferred_files + [
+                    vf for vf in variant_files if vf not in preferred_files
+                ]
+        _backend_variant = variant_ids[0] if variant_ids else None
+        trace_events.append(
+            {
+                "event": "preferred_files_resolved",
+                "agent": "Orchestrator",
+                "iteration": iteration,
+                "agent_preferred": agent_preferred,
+                "rule_preferred": rule_preferred,
+                "variant_ids": variant_ids,
+                "final_preferred": preferred_files,
+            }
+        )
+        snippet_files = _select_snippet_files(
+            repo_root,
+            patch_rules,
+            profile_ref.timing_breakdown,
+            allowed_files,
+            preferred_files,
+            max_snippets,
+        )
+        target_files: List[str] = []
+        for action in eligible_pool:
+            if action.family != "source_patch":
+                continue
+            params = action.parameters or {}
+            tf = params.get("target_file")
+            if isinstance(tf, str) and tf:
+                norm = _normalise_to_repo_rel(tf)
+                if norm and norm not in target_files:
+                    target_files.append(norm)
+            tfs = params.get("target_files")
+            if isinstance(tfs, list):
+                for t in tfs:
+                    if isinstance(t, str) and t:
+                        norm = _normalise_to_repo_rel(t)
+                        if norm and norm not in target_files:
+                            target_files.append(norm)
+        if target_files:
+            for item in target_files:
+                if item not in snippet_files:
+                    snippet_files.insert(0, item)
+            if max_snippets:
+                snippet_files = snippet_files[:max_snippets]
+        available_hotspots = _available_hotspots_for_files(snippet_files, patch_rules)
+        eligible_pool = _filter_source_patch_by_hotspot(
+            eligible_pool, patch_families or {}, available_hotspots
+        )
+        coverage_required = bool(
+            isinstance(patch_scope_cfg.get("coverage"), dict)
+            and patch_scope_cfg.get("coverage", {}).get("require_all_families", False)
+        )
+        if coverage_required:
+            untried_families = _untried_patch_families(memory.experiments, patch_families)
+            eligible_pool, coverage_applied = _filter_source_patch_for_coverage(
+                eligible_pool, untried_families
+            )
+            if coverage_applied:
+                trace_events.append(
+                    {
+                        "event": "source_patch_coverage_filter",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "untried_families": sorted(untried_families),
+                    }
+                )
+        # Filter out patch families that have repeatedly failed
+        exhausted = _exhausted_patch_families(memory.experiments)
+        if exhausted:
+            before_len = len(eligible_pool)
+            eligible_pool = [
+                a for a in eligible_pool
+                if not (
+                    a.family == "source_patch"
+                    and isinstance((a.parameters or {}).get("patch_family"), str)
+                    and (a.parameters or {}).get("patch_family") in exhausted
+                )
+            ]
+            if len(eligible_pool) < before_len:
+                trace_events.append(
+                    {
+                        "event": "exhausted_families_filtered",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "exhausted_families": sorted(exhausted),
+                    }
+                )
+
+        remaining_by_family: Dict[str, int] = {}
+        for action in eligible_pool:
+            if action.action_id in tested_actions:
+                continue
+            remaining_by_family[action.family] = remaining_by_family.get(action.family, 0) + 1
+
+        # Navigation hints: lightweight file pointers for the agentic patcher.
+        # The agent uses read_file/grep to explore code — hints only provide
+        # coordinates so the agent knows where to start.
+        nav_hints = _build_navigation_hints(repo_root, snippet_files, max_snippets)
+
+        # patch_allowed_files: use the adapter-level allowed_globs (already
+        # expanded into `allowed_files`), NOT snippet paths.  This lets the
+        # agent modify any file within the adapter's scope, not just the ones
+        # that happened to be in the snippet selection.
+        patch_allowed_files = allowed_files
+
+        if nav_hints:
+            trace_events.append(
+                {
+                    "event": "navigation_hints_selected",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "hints": nav_hints,
+                }
+            )
+        patch_no_candidates = False
+        if remaining_by_family.get("source_patch", 0) > 0 and not nav_hints:
+            patch_no_candidates = True
+            state.blocked_families.add("source_patch")
+            remaining_by_family.pop("source_patch", None)
+            trace_events.append(
+                {
+                    "event": "source_patch_blocked",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "reason": "no navigation hints available for hotspot files",
+                }
+            )
+            if reporter:
+                reporter.skip("source_patch 暂停: 未采集到热点代码片段")
+        families_in_pool = sorted({action.family for action in eligible_pool})
+        allowed_from_analysis = list(analysis.allowed_families or [])
+        coverage_floor = _coverage_floor_families(phase, eligible_pool, remaining_by_family)
+        if coverage_floor:
+            merged_allowed = sorted(set(allowed_from_analysis) | set(coverage_floor))
+            allowed_from_analysis = merged_allowed
+            analysis.allowed_families = merged_allowed
+            trace_events.append(
+                {
+                    "event": "allowed_families_floor",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "phase": phase,
+                    "coverage_floor": coverage_floor,
+                }
+            )
+        resolved_families: List[str] = []
+        if allowed_from_analysis:
+            resolved_families = [
+                fam for fam in allowed_from_analysis if remaining_by_family.get(fam, 0) > 0
+            ]
+        if not resolved_families:
+            resolved_families = [fam for fam, count in remaining_by_family.items() if count > 0]
+        if not resolved_families:
+            resolved_families = families_in_pool
+        analysis.allowed_families = sorted(resolved_families)
+        eligible_actions = [
+            action for action in eligible_pool if action.family in analysis.allowed_families
+        ]
+        if phase == "RUN_RETUNE" and retune_families:
+            allowed_set = set(retune_families)
+            filtered = [action for action in eligible_pool if action.family in allowed_set]
+            if filtered:
+                eligible_pool = filtered
+                if analysis.allowed_families:
+                    analysis.allowed_families = [
+                        fam for fam in analysis.allowed_families if fam in allowed_set
+                    ]
+                if not analysis.allowed_families:
+                    analysis.allowed_families = sorted(
+                        {action.family for action in eligible_pool}
+                    )
+                trace_events.append(
+                    {
+                        "event": "retune_family_filter",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "allowed_families": analysis.allowed_families,
+                    }
+                )
+        trace_events.append(
+            {
+                "event": "allowed_families_resolved",
+                "agent": "Orchestrator",
+                "iteration": iteration,
+                "allowed_families": analysis.allowed_families,
+                "remaining_by_family": remaining_by_family,
+            }
+        )
         trace_events.append(
             {
                 "event": "analysis",
-                "agent": "AnalystAgent",
+                "agent": "PlannerAgent",
                 "iteration": iteration,
                 "bottleneck": analysis.bottleneck,
                 "allowed_families": analysis.allowed_families,
@@ -818,14 +5235,122 @@ def run_optimization(
                 confidence=f"{analysis.confidence:.2f}",
                 rationale=analysis.rationale,
             )
-        availability: Dict[str, int] = {}
-        for action in eligible_actions:
-            if action.action_id in tested_actions:
-                continue
-            availability[action.family] = availability.get(action.family, 0) + 1
+        availability = {fam: remaining_by_family.get(fam, 0) for fam in analysis.allowed_families}
         plan = planner.plan(
-            iteration, analysis, job.budgets, history_summary, availability, cost_model
+            iteration,
+            analysis,
+            job.budgets,
+            history_summary,
+            availability,
+            cost_model,
+            context=planner_context,
         )
+        neighbor_batch = False
+        neighbor_batch_actions: List[ActionIR] = []
+        if (
+            "neighbor_tune" in plan.chosen_families
+            and "neighbor_tune" not in state.blocked_families
+            and not state.neighbor_tune_done
+        ):
+            neighbor_batch_actions = [
+                action for action in eligible_pool if action.family == "neighbor_tune"
+            ]
+            if neighbor_batch_actions:
+                neighbor_batch = True
+                plan.chosen_families = ["neighbor_tune"]
+                plan.max_candidates = max(plan.max_candidates, len(neighbor_batch_actions))
+                state.blocked_families.add("neighbor_tune")
+                state.neighbor_tune_done = True
+                trace_events.append(
+                    {
+                        "event": "neighbor_tune_batch_start",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "count": len(neighbor_batch_actions),
+                        "locked": True,
+                    }
+                )
+        if fast_start_active and fast_start_iters > 0 and iteration <= fast_start_iters:
+            per_family = int(fast_start_cfg.get("max_candidates_per_family", plan.max_candidates) or plan.max_candidates)
+            plan.max_candidates = min(plan.max_candidates, per_family)
+            trace_events.append(
+                {
+                    "event": "fast_start_limits",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "max_candidates_per_family": plan.max_candidates,
+                }
+            )
+        if phase == "RUN_RETUNE" and retune_max_candidates > 0:
+            plan.max_candidates = min(plan.max_candidates, retune_max_candidates)
+        patch_min_candidates = int((planner_cfg or {}).get("min_patch_candidates", 0) or 0)
+        if patch_min_candidates > 0 and "source_patch" in plan.chosen_families:
+            available_patch = remaining_by_family.get("source_patch", 0)
+            if available_patch > 0:
+                plan.max_candidates = max(
+                    plan.max_candidates, min(patch_min_candidates, available_patch)
+                )
+        if phase in {"RUN_TUNE", "RUN_RETUNE"}:
+            families_by_target = _families_by_target(eligible_pool, remaining_by_family)
+            before = list(plan.chosen_families)
+            plan.chosen_families = _inject_family(
+                plan.chosen_families,
+                families_by_target.get("run_config", []),
+                prefer=["parallel_omp", "affinity_tune"],
+            )
+            probe_cfg = (planner_cfg or {}).get("runtime_probe", {})
+            if isinstance(probe_cfg, dict):
+                metrics = (profile_features or {}).get("metrics", {})
+                neigh_ratio = float(metrics.get("neigh_ratio") or 0.0)
+                comm_ratio = float(metrics.get("comm_ratio") or 0.0)
+                io_ratio = float(metrics.get("io_ratio") or 0.0)
+                min_neigh = float(probe_cfg.get("min_neigh_ratio", 0.0) or 0.0)
+                min_comm = float(probe_cfg.get("min_comm_ratio", 0.0) or 0.0)
+                min_output = float(probe_cfg.get("min_output_ratio", 0.0) or 0.0)
+                input_candidates = families_by_target.get("input_script", [])
+                prefer_input: List[str] = []
+                if io_ratio >= min_output:
+                    prefer_input = ["output_tune", "neighbor_tune"]
+                elif neigh_ratio >= min_neigh or comm_ratio >= min_comm:
+                    prefer_input = ["neighbor_tune", "output_tune"]
+                if prefer_input and input_candidates:
+                    plan.chosen_families = _inject_family(
+                        plan.chosen_families,
+                        input_candidates,
+                        prefer=prefer_input,
+                    )
+            if before != plan.chosen_families:
+                trace_events.append(
+                    {
+                        "event": "plan_runtime_coverage",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "before": before,
+                        "after": plan.chosen_families,
+                    }
+                )
+        if phase == "PATCH":
+            survey_summary = planner_context.get("code_survey_summary", {})
+            opp_count = int(survey_summary.get("count") or 0) if isinstance(survey_summary, dict) else 0
+            if opp_count > 0:
+                before = list(plan.chosen_families)
+                plan.chosen_families = _inject_family(
+                    plan.chosen_families,
+                    ["source_patch"],
+                    prefer=["source_patch"],
+                    max_families=2,
+                )
+                if before != plan.chosen_families:
+                    trace_events.append(
+                        {
+                            "event": "plan_patch_coverage",
+                            "agent": "Orchestrator",
+                            "iteration": iteration,
+                            "before": before,
+                            "after": plan.chosen_families,
+                            "code_survey_count": opp_count,
+                        }
+                    )
         trace_events.append(
             {
                 "event": "plan",
@@ -838,6 +5363,23 @@ def run_optimization(
         if reporter:
             reporter.plan_summary(plan)
 
+        memory_keep_action_ids: List[str] = []
+        if experience_memory.config.enabled and available_actions:
+            memory_context = {
+                "case_id": job.case_id,
+                "app": job.app,
+                "backend": _backend_from_args(ctx_job.run_args or []),
+            }
+            all_scores = experience_memory.score_actions(available_actions, memory_context)
+            best_by_family: Dict[str, Tuple[float, str]] = {}
+            for action in available_actions:
+                score = float(all_scores.get(action.action_id, 0.0))
+                if score <= 0.0:
+                    continue
+                prev = best_by_family.get(action.family)
+                if prev is None or score > prev[0]:
+                    best_by_family[action.family] = (score, action.action_id)
+            memory_keep_action_ids = [item[1] for item in best_by_family.values()]
         candidate_lists = optimizer.propose(
             actions=available_actions,
             ctx=ctx,
@@ -845,6 +5387,7 @@ def run_optimization(
             policy=policy,
             profile=memory.best.profile_report if memory.best else baseline_exp.profile_report,
             exclude_action_ids=tested_actions,
+            memory_keep_action_ids=memory_keep_action_ids,
             system_caps=system_caps,
         )
         candidate_ids: List[str] = []
@@ -861,10 +5404,93 @@ def run_optimization(
                 "candidate_action_ids": candidate_ids,
             }
         )
-        ranked = ranker.rank(candidate_lists, ctx, policy, profile_ref)
-        ranked_actions = [item.action for item in ranked.ranked]
-        rank_limit = min(plan.max_candidates, top_k, max(len(ranked_actions), 1))
-        ranked_actions = ranked_actions[:rank_limit]
+        flat_candidates: List[ActionIR] = []
+        for candidate_list in candidate_lists:
+            flat_candidates.extend(candidate_list.candidates)
+        memory_context = {
+            "case_id": job.case_id,
+            "app": job.app,
+            "backend": _backend_from_args(ctx_job.run_args or []),
+        }
+        memory_scores = experience_memory.score_actions(flat_candidates, memory_context)
+        rank_cfg = (planner_cfg or {}).get("ranking", {})
+        patch_stats: Dict[str, Dict[str, int]] = {}
+        for action in flat_candidates:
+            action_id = action.action_id
+            patch_stats[action_id] = {
+                "context_miss": state.patch_action_context_misses.get(action_id, 0),
+                "preflight_fail": state.patch_action_preflight_fails.get(action_id, 0),
+                "build_fail": 0,
+            }
+        ranked = ranker.rank(
+            candidate_lists,
+            ctx,
+            policy,
+            profile_ref,
+            profile_features=profile_features,
+            hotspot_map=hotspot_map,
+            rank_cfg=rank_cfg if isinstance(rank_cfg, dict) else {},
+            tested_actions=tested_actions,
+            memory_scores=memory_scores,
+            patch_stats=patch_stats,
+        )
+        rank_limit = min(plan.max_candidates, top_k, max(len(ranked.ranked), 1))
+        if fast_start_active and fast_start_iters > 0 and iteration <= fast_start_iters:
+            max_total = int(fast_start_cfg.get("max_total_candidates", rank_limit) or rank_limit)
+            if ranked.ranked:
+                rank_limit = min(top_k, max_total, len(ranked.ranked))
+            else:
+                rank_limit = 0
+            trace_events.append(
+                {
+                    "event": "fast_start_rank_limit",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "rank_limit": rank_limit,
+                }
+            )
+        max_explore_frac = 0.2
+        if isinstance(rank_cfg, dict):
+            max_explore_frac = float(rank_cfg.get("max_explore_frac", max_explore_frac) or max_explore_frac)
+        ranked_subset = _select_with_evidence(ranked.ranked, rank_limit, max_explore_frac=max_explore_frac)
+        if ranked_subset and any(item.action.family == "source_patch" for item in ranked_subset):
+            ranked_subset = _select_distinct_patch_families(ranked_subset, rank_limit)
+        ranked_actions = [item.action for item in ranked_subset]
+        if neighbor_batch:
+            ranked_actions = sorted(neighbor_batch_actions, key=lambda action: action.action_id)
+            trace_events.append(
+                {
+                    "event": "neighbor_tune_batch_selected",
+                    "agent": "RouterRankerAgent",
+                    "iteration": iteration,
+                    "ranked_action_ids": [action.action_id for action in ranked_actions],
+                }
+            )
+        backend_exp = _latest_backend_exp(memory.experiments)
+        backend_needed = any(
+            _is_parallel_threads_action(action) for action in ranked_actions
+        ) and not _run_args_has_backend(job.run_args) and backend_exp is None
+        if backend_needed:
+            backend_action = next(
+                (action for action in ranked_actions if action.family == "runtime_backend_select"),
+                None,
+            )
+            if backend_action is None:
+                backend_action = next(
+                    (action for action in actions if action.family == "runtime_backend_select"),
+                    None,
+                )
+            if backend_action is not None:
+                ranked_actions = [backend_action]
+                trace_events.append(
+                    {
+                        "event": "backend_bootstrap",
+                        "agent": "RouterRankerAgent",
+                        "iteration": iteration,
+                        "action_id": backend_action.action_id,
+                        "reason": "parallel_omp requires backend selection first",
+                    }
+                )
         trace_events.append(
             {
                 "event": "ranked_actions",
@@ -884,22 +5510,1249 @@ def run_optimization(
             )
             reporter.rank_summary(ranked)
         if not ranked_actions:
+            if (
+                patch_no_candidates
+                and scope_levels
+                and state.patch_scope_level < len(scope_levels) - 1
+            ):
+                old_scope = scope_levels[state.patch_scope_level]
+                state.patch_scope_level += 1
+                state.patch_scope_no_candidates = 0
+                state.blocked_families.discard("source_patch")
+                trace_events.append(
+                    {
+                        "event": "source_patch_scope_promoted",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "from_scope": old_scope,
+                        "to_scope": scope_levels[state.patch_scope_level],
+                        "reason": "no_candidates_in_scope",
+                    }
+                )
+                if reporter:
+                    reporter.skip("source_patch scope 提升: 无可用候选")
+                continue
             if reporter:
                 reporter.stop("无可执行候选")
             break
 
         iteration_experiments: List[ExperimentIR] = []
         candidate_repeats = max(1, plan.evaluation.candidate_repeats_stage1)
+        variance_cfg = gates.get("variance", {}) if isinstance(gates, dict) else {}
+        variance_repeats = int(variance_cfg.get("repeats", 2) or 2)
+        frozen_run_exp = (
+            _find_experiment_by_run_id(memory.experiments, frozen_run_id)
+            if frozen_run_id
+            else None
+        )
+        frozen_build_exp = (
+            _find_experiment_by_run_id(memory.experiments, frozen_build_id)
+            if frozen_build_id
+            else None
+        )
+        patch_failures: List[str] = []
+        patch_blocked = False
+        source_patch_attempted = 0
         for action in ranked_actions:
             if state.run_count >= job.budgets.max_runs:
                 break
+            effective_repeats = candidate_repeats
+            if _is_volatile_action(action):
+                effective_repeats = max(effective_repeats, variance_repeats)
             exp_id = f"iter{iteration}-{action.action_id}"
-            base_job, base_run_id, base_action_id = _select_base_for_action(
-                action=action,
+            base_build_cfg = build_cfg or {}
+            if frozen_build_exp and frozen_build_exp.action:
+                base_build_cfg = _apply_build_config(
+                    base_build_cfg, frozen_build_exp.action, build_packs
+                )
+            refine_on_best = _should_refine_on_best(
                 baseline_exp=baseline_exp,
                 best_exp=memory.best,
-                refine_on_best=refine_on_best,
-                refine_applies_to=refine_applies_to,
+                enabled=refine_enabled,
+                min_improvement_pct=refine_min_improvement,
+            )
+            if action and "source_patch" in (action.applies_to or []):
+                source_patch_attempted += 1
+                if action.parameters is None:
+                    action.parameters = {}
+                if not action.parameters.get("patch_root"):
+                    adapter_root = (adapter_cfg or {}).get("patch_root")
+                    if isinstance(adapter_root, str) and adapter_root:
+                        action.parameters["patch_root"] = adapter_root
+                action_allowed_files = list(patch_allowed_files)
+                target_file = (action.parameters or {}).get("target_file")
+                patch_family = (action.parameters or {}).get("patch_family")
+
+                # Normalize target_file to repo-relative path
+                if isinstance(target_file, str) and target_file:
+                    norm_tf = _normalise_to_repo_rel(target_file)
+                    if norm_tf:
+                        target_file = norm_tf
+
+                # Build per-action navigation hints (filter to target_file if specified)
+                action_nav_hints = list(nav_hints)
+                if isinstance(target_file, str) and target_file:
+                    action_allowed_files = [target_file]
+                    target_hints = [h for h in action_nav_hints if h.get("path") == target_file]
+                    if target_hints:
+                        action_nav_hints = target_hints
+                    else:
+                        # Target file not in global hints — build a hint for it
+                        rel = target_file
+                        _tf_path = repo_root / rel
+                        if _tf_path.is_file():
+                            try:
+                                _tf_lines = _tf_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                                _tf_hint: Dict[str, object] = {"path": rel, "total_lines": len(_tf_lines)}
+                                _tf_marker, _ = _find_marker_line(_tf_lines)
+                                if _tf_marker is not None:
+                                    _tf_hint["hotspot_line"] = _tf_marker + 1
+                                    _tf_func = _find_function_start(_tf_lines, _tf_marker)
+                                    if _tf_func is not None:
+                                        _tf_hint["function_start"] = _tf_func + 1
+                                        _tf_hint["function_signature"] = _tf_lines[_tf_func].strip()[:120]
+                                action_nav_hints = [_tf_hint]
+                            except Exception:
+                                pass
+
+                # Lazy code snippet generation for non-agentic fallback paths
+                # (debug agent, NEED_MORE_CONTEXT expansion, worktree retries).
+                # The agentic patcher uses navigation hints + read_file instead.
+                _debug_snippet_files = [target_file] if isinstance(target_file, str) and target_file else snippet_files
+                base_context = int(patch_rules.get("max_context_chars", 0) or 0)
+                if base_context <= 0:
+                    base_context = 60000
+                action_code_snippets: Optional[List[Dict[str, object]]] = None
+                code_snippets: Optional[List[Dict[str, object]]] = None
+
+                def _get_debug_snippets() -> List[Dict[str, object]]:
+                    nonlocal action_code_snippets, code_snippets
+                    if action_code_snippets is None:
+                        action_code_snippets = _collect_code_snippets(
+                            repo_root, _debug_snippet_files, max_snippets, base_context,
+                        )
+                        code_snippets = action_code_snippets
+                    return action_code_snippets
+
+                # Fetch reference template for algorithm-level families.
+                _ref_template = None
+                if isinstance(patch_family, str):
+                    _ref_template = get_template_context(
+                        patch_family,
+                        backend=_backend_variant,
+                        repo_root=repo_root,
+                    )
+                # Guard against stale patch_path from a previous iteration.
+                # When iter1 generates a patch, it mutates action.parameters["patch_path"]
+                # (line 6209). If the same ActionIR object is reused in iter2 (via
+                # generated_actions), iter2 would skip proposal and try to reapply
+                # iter1's diff — which fails because the worktree is clean.
+                # Only replay actions (origin=memory_replay) should carry patch_path.
+                _origin = (action.parameters or {}).get("origin", "")
+                if _origin != "memory_replay" and action.parameters.get("patch_path"):
+                    _stale = action.parameters.pop("patch_path", None)
+                    action.parameters.pop("patch_files", None)
+                    trace_events.append({
+                        "event": "patch_path_stale_cleared",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "action_id": action.action_id,
+                        "stale_path": str(_stale),
+                    })
+                if not action.parameters.get("patch_path"):
+                    # Build failure feedback string from previous iterations
+                    _patch_feedback_str = None
+                    if patch_failure_feedback:
+                        _patch_feedback_str = (
+                            "PREVIOUS FAILED PATCHES (do NOT repeat similar optimizations):\n"
+                            + "\n".join(patch_failure_feedback[-10:])
+                        )
+                    patch_proposal = code_patcher.propose(
+                        action=action,
+                        profile=profile_ref,
+                        patch_rules=patch_rules,
+                        allowed_files=action_allowed_files,
+                        code_snippets=[],
+                        repo_root=repo_root,
+                        feedback=_patch_feedback_str,
+                        backend_variant=_backend_variant,
+                        reference_template=_ref_template,
+                        navigation_hints=action_nav_hints,
+                    )
+                    if reporter:
+                        note = None
+                        if patch_proposal and patch_proposal.missing_fields:
+                            note = "; ".join(patch_proposal.missing_fields)
+                        _proposal_stats = _quick_diff_stats(
+                            patch_proposal.patch_diff if patch_proposal else ""
+                        )
+                        reporter.patch_proposal(
+                            action.action_id,
+                            patch_proposal.status if patch_proposal else "NO_RESPONSE",
+                            note,
+                            diff_stats=_proposal_stats,
+                        )
+                    trace_events.append(
+                        {
+                            "event": "patch_llm_proposal",
+                            "agent": "CodePatchAgent",
+                            "iteration": iteration,
+                            "action_id": action.action_id,
+                            "proposal": patch_proposal.model_dump()
+                            if patch_proposal
+                            else None,
+                            "raw_response": (
+                                code_patcher.last_trace.get("response")
+                                if (not patch_proposal and code_patcher.last_trace)
+                                else None
+                            ),
+                        }
+                    )
+                    if not patch_proposal or patch_proposal.status != "OK":
+                        reason = "patch_proposal_missing"
+                        if patch_proposal:
+                            reason = patch_proposal.status
+                            if patch_proposal.missing_fields:
+                                reason = f"{reason}: {', '.join(patch_proposal.missing_fields)}"
+                        if not patch_proposal or patch_proposal.status == "NO_RESPONSE":
+                            patch_proposal = code_patcher.propose(
+                                action=action,
+                                profile=profile_ref,
+                                patch_rules=patch_rules,
+                                allowed_files=action_allowed_files,
+                                code_snippets=[],
+                                repo_root=repo_root,
+                                feedback="no_response_retry: respond with a valid structured patch",
+                                backend_variant=_backend_variant,
+                                reference_template=_ref_template,
+                                navigation_hints=action_nav_hints,
+                            )
+                            trace_events.append(
+                                {
+                                    "event": "patch_llm_retry",
+                                    "agent": "CodePatchAgent",
+                                    "iteration": iteration,
+                                    "action_id": action.action_id,
+                                    "proposal": patch_proposal.model_dump()
+                                    if patch_proposal
+                                    else None,
+                                }
+                            )
+                            if patch_proposal and patch_proposal.status == "OK":
+                                reason = "OK"
+                        patch_failures.append(reason)
+                        if patch_proposal and patch_proposal.status == "NEED_MORE_CONTEXT":
+                            state.patch_action_context_misses[action.action_id] = (
+                                state.patch_action_context_misses.get(action.action_id, 0) + 1
+                            )
+                            expanded_snippets = list(_get_debug_snippets())
+                            last_fingerprint = _snippet_fingerprint(expanded_snippets)
+                            expand_budget = base_context
+                            expand_cap = max(base_context * 4, 240000)
+                            max_expand_rounds = int(patch_rules.get("max_context_expand_rounds", 0) or 3)
+                            expand_round = 0
+                            while patch_proposal and patch_proposal.status == "NEED_MORE_CONTEXT":
+                                expand_round += 1
+                                if expand_round > max_expand_rounds:
+                                    break
+                                expand_budget = min(expand_budget + base_context, expand_cap)
+                                targets = _parse_need_more_context_targets(
+                                    patch_proposal.missing_fields or [], repo_root
+                                )
+                                snippet_files_for_expand = action_allowed_files or snippet_files
+                                if not snippet_files_for_expand:
+                                    snippet_files_for_expand = [
+                                        item.get("path")
+                                        for item in _get_debug_snippets()
+                                        if item.get("path")
+                                    ]
+                                if isinstance(target_file, str) and target_file:
+                                    snippet_files_for_expand = [target_file]
+                                expanded = _expand_snippets_for_missing_context(
+                                    patch_proposal.missing_fields or [],
+                                    repo_root,
+                                    snippet_files_for_expand,
+                                    patch_rules,
+                                    max_chars_override=expand_budget,
+                                )
+                                if not expanded:
+                                    expanded = _expand_snippets_for_file(
+                                        repo_root=repo_root,
+                                        file_path=snippet_files_for_expand[0]
+                                        if snippet_files_for_expand
+                                        else (snippet_files[0] if snippet_files else ""),
+                                        max_snippets=max_snippets,
+                                        max_chars=expand_cap,
+                                    )
+                                if not expanded:
+                                    break
+                                new_fingerprint = _snippet_fingerprint(expanded)
+                                if new_fingerprint == last_fingerprint:
+                                    expanded = _expand_snippets_for_file(
+                                        repo_root=repo_root,
+                                        file_path=snippet_files_for_expand[0]
+                                        if snippet_files_for_expand
+                                        else (snippet_files[0] if snippet_files else ""),
+                                        max_snippets=max_snippets,
+                                        max_chars=expand_cap,
+                                    )
+                                    new_fingerprint = _snippet_fingerprint(expanded)
+                                    if new_fingerprint == last_fingerprint:
+                                        break
+                                last_fingerprint = new_fingerprint
+                                expanded_snippets = expanded
+                                trace_events.append(
+                                    {
+                                        "event": "code_snippets_expanded",
+                                        "agent": "Orchestrator",
+                                        "iteration": iteration,
+                                        "round": expand_round,
+                                        "file": targets[0][0] if targets else None,
+                                        "snippets": [
+                                            {
+                                                "path": item.get("path"),
+                                                "tag": item.get("tag"),
+                                                "start_line": item.get("start_line"),
+                                                "end_line": item.get("end_line"),
+                                            }
+                                            for item in expanded
+                                        ],
+                                    }
+                                )
+                                reason = patch_proposal.status
+                                if patch_proposal.missing_fields:
+                                    reason = f"{reason}: {', '.join(patch_proposal.missing_fields)}"
+                                patch_proposal = code_patcher.propose(
+                                    action=action,
+                                    profile=profile_ref,
+                                    patch_rules=patch_rules,
+                                    allowed_files=action_allowed_files,
+                                    code_snippets=expanded_snippets,
+                                    repo_root=repo_root,
+                                    feedback=reason,
+                                    backend_variant=_backend_variant,
+                                    reference_template=_ref_template,
+                                )
+                                trace_events.append(
+                                    {
+                                        "event": "patch_llm_retry",
+                                        "agent": "CodePatchAgent",
+                                        "iteration": iteration,
+                                        "action_id": action.action_id,
+                                        "proposal": patch_proposal.model_dump()
+                                        if patch_proposal
+                                        else None,
+                                    }
+                                )
+                                if not patch_proposal or patch_proposal.status != "NEED_MORE_CONTEXT":
+                                    break
+                            if not patch_proposal or patch_proposal.status != "OK":
+                                state.blocked_actions.add(action.action_id)
+                                continue
+                        elif patch_proposal and "edit_apply_failed" in reason:
+                            expanded = None
+                            anchor_ctx = _parse_edit_failure_anchor(patch_proposal.missing_fields)
+                            if anchor_ctx:
+                                max_snippets = int(patch_rules.get("max_snippets", 0) or 0)
+                                max_context = int(patch_rules.get("max_context_chars", 0) or 0)
+                                expanded = _expand_snippets_for_anchor(
+                                    repo_root=repo_root,
+                                    file_path=anchor_ctx[0],
+                                    anchor=anchor_ctx[1],
+                                    max_snippets=max_snippets,
+                                    max_chars=max_context,
+                                )
+                                if expanded:
+                                    trace_events.append(
+                                        {
+                                            "event": "code_snippets_expanded",
+                                            "agent": "Orchestrator",
+                                            "iteration": iteration,
+                                            "file": anchor_ctx[0],
+                                            "snippets": [
+                                                {
+                                                    "path": item.get("path"),
+                                                    "tag": item.get("tag"),
+                                                    "start_line": item.get("start_line"),
+                                                    "end_line": item.get("end_line"),
+                                                }
+                                                for item in expanded
+                                            ],
+                                        }
+                                    )
+                            patch_retry = code_patcher.propose(
+                                action=action,
+                                profile=profile_ref,
+                                patch_rules=patch_rules,
+                                allowed_files=action_allowed_files,
+                                code_snippets=expanded or _get_debug_snippets(),
+                                repo_root=repo_root,
+                                feedback=reason,
+                                backend_variant=_backend_variant,
+                                reference_template=_ref_template,
+                            )
+                            trace_events.append(
+                                {
+                                    "event": "patch_llm_retry",
+                                    "agent": "CodePatchAgent",
+                                    "iteration": iteration,
+                                    "action_id": action.action_id,
+                                    "proposal": patch_retry.model_dump()
+                                    if patch_retry
+                                    else None,
+                                }
+                            )
+                            if not patch_retry or patch_retry.status != "OK":
+                                state.blocked_actions.add(action.action_id)
+                                continue
+                            patch_proposal = patch_retry
+                        else:
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                    format_ok, format_reason = _check_patch_format(
+                        repo_root, patch_proposal.patch_diff
+                    )
+                    if not format_ok:
+                        patch_failures.append(f"patch_format_invalid: {format_reason}")
+                        patch_retry = code_patcher.propose(
+                            action=action,
+                            profile=profile_ref,
+                            patch_rules=patch_rules,
+                            allowed_files=allowed_files,
+                            code_snippets=[],
+                            repo_root=repo_root,
+                            feedback=f"patch_format_invalid: {format_reason}",
+                            backend_variant=_backend_variant,
+                            reference_template=_ref_template,
+                            navigation_hints=action_nav_hints,
+                        )
+                        if reporter:
+                            note = None
+                            if patch_retry and patch_retry.missing_fields:
+                                note = "; ".join(patch_retry.missing_fields)
+                            reporter.patch_proposal(
+                                action.action_id,
+                                patch_retry.status if patch_retry else "NO_RESPONSE",
+                                note,
+                            )
+                        trace_events.append(
+                            {
+                                "event": "patch_llm_retry",
+                                "agent": "CodePatchAgent",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "proposal": patch_retry.model_dump()
+                                if patch_retry
+                                else None,
+                            }
+                        )
+                        if not patch_retry or patch_retry.status != "OK":
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                        patch_proposal = patch_retry
+                        format_ok, format_reason = _check_patch_format(
+                            repo_root, patch_proposal.patch_diff
+                        )
+                        if not format_ok:
+                            patch_failures.append(f"patch_format_invalid: {format_reason}")
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                    det_ok, det_reasons, det_info = review_patch_diff(
+                        patch_proposal.patch_diff, repo_root, patch_rules
+                    )
+                    trace_events.append(
+                        {
+                            "event": "patch_review_deterministic",
+                            "agent": "PatchReview",
+                            "iteration": iteration,
+                            "action_id": action.action_id,
+                            "ok": det_ok,
+                            "reasons": det_reasons,
+                            "info": det_info,
+                        }
+                    )
+                    if not det_ok:
+                        patch_failures.append(f"deterministic_review_failed: {', '.join(det_reasons)}")
+                        state.blocked_actions.add(action.action_id)
+                        if reporter:
+                            reporter.patch_review(
+                                action.action_id,
+                                "deterministic",
+                                "FAIL",
+                                "; ".join(det_reasons) if det_reasons else None,
+                                diff_stats=det_info,
+                            )
+                        continue
+                    # Target file enforcement: if the action specifies target_files
+                    # (e.g. from deep_analysis), verify the patch touches at least one.
+                    _action_targets = (action.parameters or {}).get("target_files", [])
+                    if isinstance(_action_targets, list) and _action_targets:
+                        _patch_files = det_info.get("files", [])
+                        _target_basenames = {
+                            Path(t).name for t in _action_targets if isinstance(t, str)
+                        }
+                        _patch_basenames = {
+                            Path(f).name for f in _patch_files if isinstance(f, str)
+                        }
+                        if _target_basenames and not (_target_basenames & _patch_basenames):
+                            _miss_msg = (
+                                f"patch targets {_patch_basenames or 'no files'} "
+                                f"but action expects {_target_basenames}"
+                            )
+                            patch_failures.append(f"target_file_mismatch: {_miss_msg}")
+                            state.blocked_actions.add(action.action_id)
+                            trace_events.append({
+                                "event": "patch_target_mismatch",
+                                "agent": "PatchReview",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "reason": _miss_msg,
+                            })
+                            if reporter:
+                                reporter.patch_review(
+                                    action.action_id, "target_check", "FAIL", _miss_msg,
+                                )
+                            continue
+
+                    if reporter:
+                        reporter.patch_review(
+                            action.action_id, "deterministic", "PASS",
+                            diff_stats=det_info,
+                        )
+                    # Skip LLM review when deterministic review passes --
+                    # LLM review added no value (only checked file paths and
+                    # line counts) and frequently produced false negatives
+                    # that triggered expensive retry loops.
+                    llm_review = None
+                    _skip_llm_review = patch_rules.get("skip_llm_review", True)
+                    if not _skip_llm_review:
+                        llm_review = patch_reviewer.review(
+                            patch_diff=patch_proposal.patch_diff,
+                            patch_rules=patch_rules,
+                            context={
+                                "action": action.action_id,
+                                "family": action.family,
+                                "risk_level": action.risk_level,
+                                "expected_effect": action.expected_effect,
+                                "profile": profile_ref.model_dump(),
+                            },
+                        )
+                    if llm_review:
+                        trace_events.append(
+                            {
+                                "event": "patch_review_llm",
+                                "agent": "PatchReviewAgent",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "review": llm_review.model_dump(),
+                            }
+                        )
+                        if reporter:
+                            reason = "; ".join(llm_review.reasons) if llm_review.reasons else None
+                            reporter.patch_review(
+                                action.action_id,
+                                "llm",
+                                f"{llm_review.status} {llm_review.verdict}",
+                                reason,
+                            )
+                        if llm_review.status != "OK" or llm_review.verdict != "PASS":
+                            patch_failures.append(
+                                f"llm_review_failed: {llm_review.status} {llm_review.verdict}"
+                            )
+                            patched = _retry_patch_after_review(
+                                patch_debugger=patch_debugger,
+                                patch_reviewer=patch_reviewer,
+                                action=action,
+                                profile=profile_ref,
+                                patch_rules=patch_rules,
+                                allowed_files=action_allowed_files,
+                                code_snippets=_collect_code_snippets(repo_root, snippet_files, max_snippets, max_context),
+                                repo_root=repo_root,
+                                patch_proposal=patch_proposal,
+                                review_reasons=llm_review.reasons or [],
+                                debug_max_attempts=debug_max_attempts,
+                                snippet_files=snippet_files,
+                                iteration=iteration,
+                                trace_events=trace_events,
+                                reporter=reporter,
+                            )
+                            if not patched:
+                                state.blocked_actions.add(action.action_id)
+                                continue
+                            patch_proposal = patched
+                    patch_root_value = action.parameters.get("patch_root")
+                    patch_root_path = Path(patch_root_value) if patch_root_value else None
+                    apply_ok, apply_reason = _check_patch_apply(
+                        repo_root, patch_proposal.patch_diff, patch_root_path
+                    )
+                    if reporter:
+                        reporter.patch_apply_check(action.action_id, apply_ok, apply_reason)
+                    trace_events.append(
+                        {
+                            "event": "patch_apply_check",
+                            "agent": "PatchApplyCheck",
+                            "iteration": iteration,
+                            "action_id": action.action_id,
+                            "ok": apply_ok,
+                            "reason": apply_reason,
+                        }
+                    )
+                    if not apply_ok:
+                        patch_failures.append(f"patch_apply_failed: {apply_reason}")
+                        state.blocked_actions.add(action.action_id)
+                        patch_retry = code_patcher.propose(
+                            action=action,
+                            profile=profile_ref,
+                            patch_rules=patch_rules,
+                            allowed_files=allowed_files,
+                            code_snippets=[],
+                            repo_root=repo_root,
+                            feedback=f"patch_apply_failed: {apply_reason}",
+                            backend_variant=_backend_variant,
+                            reference_template=_ref_template,
+                            navigation_hints=action_nav_hints,
+                        )
+                        if reporter:
+                            note = None
+                            if patch_retry and patch_retry.missing_fields:
+                                note = "; ".join(patch_retry.missing_fields)
+                            reporter.patch_proposal(
+                                action.action_id,
+                                patch_retry.status if patch_retry else "NO_RESPONSE",
+                                note,
+                            )
+                        trace_events.append(
+                            {
+                                "event": "patch_llm_retry_apply",
+                                "agent": "CodePatchAgent",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "proposal": patch_retry.model_dump()
+                                if patch_retry
+                                else None,
+                            }
+                        )
+                        if not patch_retry or patch_retry.status != "OK":
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                        patch_proposal = patch_retry
+                        format_ok, format_reason = _check_patch_format(
+                            repo_root, patch_proposal.patch_diff
+                        )
+                        if not format_ok:
+                            patch_failures.append(f"patch_format_invalid: {format_reason}")
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                        det_ok, det_reasons, det_info = review_patch_diff(
+                            patch_proposal.patch_diff, repo_root, patch_rules
+                        )
+                        trace_events.append(
+                            {
+                                "event": "patch_review_deterministic",
+                                "agent": "PatchReview",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "ok": det_ok,
+                                "reasons": det_reasons,
+                                "info": det_info,
+                            }
+                        )
+                        if not det_ok:
+                            patch_failures.append(
+                                f"deterministic_review_failed: {', '.join(det_reasons)}"
+                            )
+                            state.blocked_actions.add(action.action_id)
+                            if reporter:
+                                reporter.patch_review(
+                                    action.action_id,
+                                    "deterministic",
+                                    "FAIL",
+                                    "; ".join(det_reasons) if det_reasons else None,
+                                )
+                            continue
+                        if reporter:
+                            reporter.patch_review(action.action_id, "deterministic", "PASS")
+                        llm_review = patch_reviewer.review(
+                            patch_diff=patch_proposal.patch_diff,
+                            patch_rules=patch_rules,
+                            context={
+                                "action": action.action_id,
+                                "family": action.family,
+                                "risk_level": action.risk_level,
+                                "expected_effect": action.expected_effect,
+                                "profile": profile_ref.model_dump(),
+                            },
+                        )
+                        if llm_review:
+                            trace_events.append(
+                                {
+                                    "event": "patch_review_llm",
+                                    "agent": "PatchReviewAgent",
+                                    "iteration": iteration,
+                                    "action_id": action.action_id,
+                                    "review": llm_review.model_dump(),
+                                }
+                            )
+                            if reporter:
+                                reason = (
+                                    "; ".join(llm_review.reasons)
+                                    if llm_review.reasons
+                                    else None
+                                )
+                                reporter.patch_review(
+                                    action.action_id,
+                                    "llm",
+                                    f"{llm_review.status} {llm_review.verdict}",
+                                    reason,
+                                )
+                            if llm_review.status != "OK" or llm_review.verdict != "PASS":
+                                patch_failures.append(
+                                    f"llm_review_failed: {llm_review.status} {llm_review.verdict}"
+                                )
+                                patched = _retry_patch_after_review(
+                                    patch_debugger=patch_debugger,
+                                    patch_reviewer=patch_reviewer,
+                                    action=action,
+                                    profile=profile_ref,
+                                    patch_rules=patch_rules,
+                                    allowed_files=action_allowed_files,
+                                    code_snippets=_collect_code_snippets(repo_root, snippet_files, max_snippets, max_context),
+                                    repo_root=repo_root,
+                                    patch_proposal=patch_proposal,
+                                    review_reasons=llm_review.reasons or [],
+                                    debug_max_attempts=debug_max_attempts,
+                                    snippet_files=snippet_files,
+                                    iteration=iteration,
+                                    trace_events=trace_events,
+                                    reporter=reporter,
+                                )
+                                if not patched:
+                                    state.blocked_actions.add(action.action_id)
+                                    continue
+                                patch_proposal = patched
+                        apply_ok, apply_reason = _check_patch_apply(
+                            repo_root, patch_proposal.patch_diff, patch_root_path
+                        )
+                        if reporter:
+                            reporter.patch_apply_check(action.action_id, apply_ok, apply_reason)
+                        trace_events.append(
+                            {
+                                "event": "patch_apply_check",
+                                "agent": "PatchApplyCheck",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "ok": apply_ok,
+                                "reason": apply_reason,
+                            }
+                        )
+                        if not apply_ok:
+                            patch_failures.append(f"patch_apply_failed: {apply_reason}")
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                    run_dir = artifacts_dir / "runs" / f"iter{iteration}-{action.action_id}"
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    patch_path = run_dir / "patch_llm.diff"
+                    patch_path.write_text(patch_proposal.patch_diff, encoding="utf-8")
+                    action.parameters["patch_path"] = str(patch_path)
+                    if patch_proposal.touched_files:
+                        action.parameters["patch_files"] = patch_proposal.touched_files
+                    allowlist = policy.get("input_edit_allowlist", [])
+                    if not allowlist and job.app == "lammps":
+                        allowlist = app_input_allowlist()
+                    patch_root_value = action.parameters.get("patch_root")
+                    patch_root_path = Path(patch_root_value) if patch_root_value else None
+                    preflight_ok, preflight_reason, preflight_log = _preflight_patch_compile(
+                        repo_root=repo_root,
+                        exp_id=exp_id,
+                        patch_path=patch_path,
+                        patch_root=patch_root_path,
+                        input_script=Path(job.input_script),
+                        allowlist=allowlist,
+                        build_cfg=base_build_cfg,
+                        build_packs=build_packs,
+                        action=action,
+                        run_dir=run_dir,
+                        worktree_retries=worktree_retry_attempts,
+                    )
+                    if reporter:
+                        reporter.patch_preflight(action.action_id, preflight_ok, preflight_reason)
+                    trace_events.append(
+                        {
+                            "event": "patch_preflight_build",
+                            "agent": "PatchPreflight",
+                            "iteration": iteration,
+                            "action_id": action.action_id,
+                            "ok": preflight_ok,
+                            "reason": preflight_reason,
+                            "build_log": preflight_log,
+                        }
+                    )
+                    if not preflight_ok:
+                        patch_failures.append(f"patch_preflight_build_failed: {preflight_reason}")
+                        patch_retry = code_patcher.propose(
+                            action=action,
+                            profile=profile_ref,
+                            patch_rules=patch_rules,
+                            allowed_files=allowed_files,
+                            code_snippets=[],
+                            repo_root=repo_root,
+                            feedback=f"compile_error:\n{preflight_reason}",
+                            backend_variant=_backend_variant,
+                            reference_template=_ref_template,
+                            navigation_hints=action_nav_hints,
+                        )
+                        if reporter:
+                            note = None
+                            if patch_retry and patch_retry.missing_fields:
+                                note = "; ".join(patch_retry.missing_fields)
+                            reporter.patch_proposal(
+                                action.action_id,
+                                patch_retry.status if patch_retry else "NO_RESPONSE",
+                                note,
+                            )
+                        trace_events.append(
+                            {
+                                "event": "patch_llm_retry_compile",
+                                "agent": "CodePatchAgent",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "proposal": patch_retry.model_dump()
+                                if patch_retry
+                                else None,
+                            }
+                        )
+                        if not patch_retry or patch_retry.status != "OK":
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                        patch_proposal = patch_retry
+                        format_ok, format_reason = _check_patch_format(
+                            repo_root, patch_proposal.patch_diff
+                        )
+                        if not format_ok:
+                            patch_failures.append(f"patch_format_invalid: {format_reason}")
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                        det_ok, det_reasons, det_info = review_patch_diff(
+                            patch_proposal.patch_diff, repo_root, patch_rules
+                        )
+                        trace_events.append(
+                            {
+                                "event": "patch_review_deterministic",
+                                "agent": "PatchReview",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "ok": det_ok,
+                                "reasons": det_reasons,
+                                "info": det_info,
+                            }
+                        )
+                        if not det_ok:
+                            patch_failures.append(
+                                f"deterministic_review_failed: {', '.join(det_reasons)}"
+                            )
+                            state.blocked_actions.add(action.action_id)
+                            if reporter:
+                                reporter.patch_review(
+                                    action.action_id,
+                                    "deterministic",
+                                    "FAIL",
+                                    "; ".join(det_reasons) if det_reasons else None,
+                                )
+                            continue
+                        if reporter:
+                            reporter.patch_review(action.action_id, "deterministic", "PASS")
+                        llm_review = patch_reviewer.review(
+                            patch_diff=patch_proposal.patch_diff,
+                            patch_rules=patch_rules,
+                            context={
+                                "action": action.action_id,
+                                "family": action.family,
+                                "risk_level": action.risk_level,
+                                "expected_effect": action.expected_effect,
+                                "profile": profile_ref.model_dump(),
+                            },
+                        )
+                        if llm_review:
+                            trace_events.append(
+                                {
+                                    "event": "patch_review_llm",
+                                    "agent": "PatchReviewAgent",
+                                    "iteration": iteration,
+                                    "action_id": action.action_id,
+                                    "review": llm_review.model_dump(),
+                                }
+                            )
+                            if reporter:
+                                reason = (
+                                    "; ".join(llm_review.reasons)
+                                    if llm_review.reasons
+                                    else None
+                                )
+                                reporter.patch_review(
+                                    action.action_id,
+                                    "llm",
+                                    f"{llm_review.status} {llm_review.verdict}",
+                                    reason,
+                                )
+                            if llm_review.status != "OK" or llm_review.verdict != "PASS":
+                                patch_failures.append(
+                                    f"llm_review_failed: {llm_review.status} {llm_review.verdict}"
+                                )
+                                state.blocked_actions.add(action.action_id)
+                                continue
+                        patch_root_value = action.parameters.get("patch_root")
+                        patch_root_path = Path(patch_root_value) if patch_root_value else None
+                        apply_ok, apply_reason = _check_patch_apply(
+                            repo_root, patch_proposal.patch_diff, patch_root_path
+                        )
+                        if reporter:
+                            reporter.patch_apply_check(action.action_id, apply_ok, apply_reason)
+                        trace_events.append(
+                            {
+                                "event": "patch_apply_check",
+                                "agent": "PatchApplyCheck",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "ok": apply_ok,
+                                "reason": apply_reason,
+                            }
+                        )
+                        if not apply_ok:
+                            patch_failures.append(f"patch_apply_failed: {apply_reason}")
+                            state.blocked_actions.add(action.action_id)
+                            continue
+                        patch_path.write_text(patch_proposal.patch_diff, encoding="utf-8")
+                        action.parameters["patch_path"] = str(patch_path)
+                        if patch_proposal.touched_files:
+                            action.parameters["patch_files"] = patch_proposal.touched_files
+                        preflight_ok, preflight_reason, preflight_log = _preflight_patch_compile(
+                            repo_root=repo_root,
+                            exp_id=exp_id,
+                            patch_path=patch_path,
+                            patch_root=patch_root_path,
+                            input_script=Path(job.input_script),
+                            allowlist=allowlist,
+                            build_cfg=base_build_cfg,
+                            build_packs=build_packs,
+                            action=action,
+                            run_dir=run_dir,
+                            worktree_retries=worktree_retry_attempts,
+                        )
+                        trace_events.append(
+                            {
+                                "event": "patch_preflight_build",
+                                "agent": "PatchPreflight",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "ok": preflight_ok,
+                                "reason": preflight_reason,
+                                "build_log": preflight_log,
+                            }
+                        )
+                        if not preflight_ok:
+                            patch_failures.append(
+                                f"patch_preflight_build_failed: {preflight_reason}"
+                            )
+                            debug_ok = False
+                            if debug_max_attempts > 0 and preflight_log:
+                                build_log_text = _summarize_build_log(Path(preflight_log))
+                                debug_snippets = _get_debug_snippets()
+                                debug_allowed_files = action_allowed_files
+                                for attempt in range(debug_max_attempts):
+                                    debug_proposal = patch_debugger.repair(
+                                        action=action,
+                                        profile=profile_ref,
+                                        patch_rules=patch_rules,
+                                        allowed_files=debug_allowed_files,
+                                        code_snippets=debug_snippets,
+                                        repo_root=repo_root,
+                                        patch_diff=patch_proposal.patch_diff,
+                                        build_log=build_log_text,
+                                        feedback=preflight_reason,
+                                    )
+                                    if reporter:
+                                        note = preflight_reason or ""
+                                        if debug_proposal and debug_proposal.missing_fields:
+                                            note = "; ".join(debug_proposal.missing_fields)
+                                        reporter.patch_debug(
+                                            action.action_id,
+                                            attempt + 1,
+                                            debug_proposal.status if debug_proposal else "NO_RESPONSE",
+                                            note,
+                                        )
+                                    trace_events.append(
+                                        {
+                                            "event": "patch_debug_attempt",
+                                            "agent": "PatchDebugAgent",
+                                            "iteration": iteration,
+                                            "action_id": action.action_id,
+                                            "attempt": attempt + 1,
+                                            "proposal": debug_proposal.model_dump()
+                                            if debug_proposal
+                                            else None,
+                                        }
+                                    )
+                                    if not debug_proposal:
+                                        continue
+                                    if debug_proposal.status == "NEED_MORE_CONTEXT":
+                                        base_context = int(
+                                            patch_rules.get("max_context_chars", 0) or 0
+                                        )
+                                        if base_context <= 0:
+                                            base_context = 60000
+                                        expand_budget = base_context
+                                        expand_cap = max(base_context * 4, 240000)
+                                        max_expand_rounds = int(patch_rules.get("max_context_expand_rounds", 0) or 3)
+                                        expand_round = 0
+                                        last_fingerprint = _snippet_fingerprint(debug_snippets)
+                                        while (
+                                            debug_proposal
+                                            and debug_proposal.status == "NEED_MORE_CONTEXT"
+                                        ):
+                                            expand_round += 1
+                                            if expand_round > max_expand_rounds:
+                                                break
+                                            expand_budget = min(expand_budget + base_context, expand_cap)
+                                            expanded = _expand_snippets_for_missing_context(
+                                                debug_proposal.missing_fields,
+                                                repo_root,
+                                                snippet_files,
+                                                patch_rules,
+                                                max_chars_override=expand_budget,
+                                            )
+                                            if not expanded:
+                                                break
+                                            new_fingerprint = _snippet_fingerprint(expanded)
+                                            if new_fingerprint == last_fingerprint:
+                                                break
+                                            last_fingerprint = new_fingerprint
+                                            snippet_paths = [
+                                                item.get("path")
+                                                for item in expanded
+                                                if item.get("path")
+                                            ]
+                                            debug_allowed_files = snippet_paths or debug_allowed_files
+                                            debug_snippets = expanded
+                                            trace_events.append(
+                                                {
+                                                    "event": "code_snippets_expanded",
+                                                    "agent": "Orchestrator",
+                                                    "iteration": iteration,
+                                                    "action_id": action.action_id,
+                                                    "round": expand_round,
+                                                    "snippets": [
+                                                        {
+                                                            "path": item.get("path"),
+                                                            "tag": item.get("tag"),
+                                                            "start_line": item.get("start_line"),
+                                                            "end_line": item.get("end_line"),
+                                                        }
+                                                        for item in expanded
+                                                    ],
+                                                }
+                                            )
+                                            debug_proposal = patch_debugger.repair(
+                                                action=action,
+                                                profile=profile_ref,
+                                                patch_rules=patch_rules,
+                                                allowed_files=debug_allowed_files,
+                                                code_snippets=debug_snippets,
+                                                repo_root=repo_root,
+                                                patch_diff=patch_proposal.patch_diff,
+                                                build_log=build_log_text,
+                                                feedback=preflight_reason,
+                                            )
+                                            if reporter:
+                                                note = preflight_reason or ""
+                                                if debug_proposal and debug_proposal.missing_fields:
+                                                    note = "; ".join(
+                                                        debug_proposal.missing_fields
+                                                    )
+                                                reporter.patch_debug(
+                                                    action.action_id,
+                                                    attempt + 1,
+                                                    debug_proposal.status
+                                                    if debug_proposal
+                                                    else "NO_RESPONSE",
+                                                    note,
+                                                )
+                                            trace_events.append(
+                                                {
+                                                    "event": "patch_debug_retry",
+                                                    "agent": "PatchDebugAgent",
+                                                    "iteration": iteration,
+                                                    "action_id": action.action_id,
+                                                    "attempt": attempt + 1,
+                                                    "proposal": debug_proposal.model_dump()
+                                                    if debug_proposal
+                                                    else None,
+                                                }
+                                            )
+                                            if (
+                                                not debug_proposal
+                                                or debug_proposal.status != "NEED_MORE_CONTEXT"
+                                            ):
+                                                break
+                                        if not debug_proposal or debug_proposal.status != "OK":
+                                            continue
+                                    if debug_proposal.status != "OK":
+                                        continue
+                                    patch_proposal = debug_proposal
+                                    format_ok, format_reason = _check_patch_format(
+                                        repo_root, patch_proposal.patch_diff
+                                    )
+                                    if not format_ok:
+                                        patch_failures.append(
+                                            f"patch_format_invalid: {format_reason}"
+                                        )
+                                        continue
+                                    det_ok, det_reasons, det_info = review_patch_diff(
+                                        patch_proposal.patch_diff, repo_root, patch_rules
+                                    )
+                                    trace_events.append(
+                                        {
+                                            "event": "patch_review_deterministic",
+                                            "agent": "PatchReview",
+                                            "iteration": iteration,
+                                            "action_id": action.action_id,
+                                            "ok": det_ok,
+                                            "reasons": det_reasons,
+                                            "info": det_info,
+                                        }
+                                    )
+                                    if not det_ok:
+                                        patch_failures.append(
+                                            f"deterministic_review_failed: {', '.join(det_reasons)}"
+                                        )
+                                        continue
+                                    llm_review = patch_reviewer.review(
+                                        patch_diff=patch_proposal.patch_diff,
+                                        patch_rules=patch_rules,
+                                        context={
+                                            "action": action.action_id,
+                                            "family": action.family,
+                                            "risk_level": action.risk_level,
+                                            "expected_effect": action.expected_effect,
+                                            "profile": profile_ref.model_dump(),
+                                        },
+                                    )
+                                    if llm_review:
+                                        trace_events.append(
+                                            {
+                                                "event": "patch_review_llm",
+                                                "agent": "PatchReviewAgent",
+                                                "iteration": iteration,
+                                                "action_id": action.action_id,
+                                                "review": llm_review.model_dump(),
+                                            }
+                                        )
+                                        if (
+                                            llm_review.status != "OK"
+                                            or llm_review.verdict != "PASS"
+                                        ):
+                                            patch_failures.append(
+                                                f"llm_review_failed: {llm_review.status} {llm_review.verdict}"
+                                            )
+                                            continue
+                                    apply_ok, apply_reason = _check_patch_apply(
+                                        repo_root, patch_proposal.patch_diff, patch_root_path
+                                    )
+                                    trace_events.append(
+                                        {
+                                            "event": "patch_apply_check",
+                                            "agent": "PatchApplyCheck",
+                                            "iteration": iteration,
+                                            "action_id": action.action_id,
+                                            "ok": apply_ok,
+                                            "reason": apply_reason,
+                                        }
+                                    )
+                                    if not apply_ok:
+                                        patch_failures.append(
+                                            f"patch_apply_failed: {apply_reason}"
+                                        )
+                                        continue
+                                    patch_path.write_text(
+                                        patch_proposal.patch_diff, encoding="utf-8"
+                                    )
+                                    action.parameters["patch_path"] = str(patch_path)
+                                    if patch_proposal.touched_files:
+                                        action.parameters["patch_files"] = (
+                                            patch_proposal.touched_files
+                                        )
+                                    preflight_ok, preflight_reason, preflight_log = (
+                                        _preflight_patch_compile(
+                                            repo_root=repo_root,
+                                            exp_id=exp_id,
+                                            patch_path=patch_path,
+                                            patch_root=patch_root_path,
+                                            input_script=Path(job.input_script),
+                                            allowlist=allowlist,
+                                            build_cfg=base_build_cfg,
+                                            build_packs=build_packs,
+                                            action=action,
+                                            run_dir=run_dir,
+                                            worktree_retries=worktree_retry_attempts,
+                                        )
+                                    )
+                                    if reporter:
+                                        reporter.patch_preflight(
+                                            action.action_id,
+                                            preflight_ok,
+                                            preflight_reason,
+                                        )
+                                    trace_events.append(
+                                        {
+                                            "event": "patch_preflight_build",
+                                            "agent": "PatchPreflight",
+                                            "iteration": iteration,
+                                            "action_id": action.action_id,
+                                            "ok": preflight_ok,
+                                            "reason": preflight_reason,
+                                            "build_log": preflight_log,
+                                        }
+                                    )
+                                    if preflight_ok:
+                                        debug_ok = True
+                                        break
+                                    state.patch_action_preflight_fails[action.action_id] = (
+                                        state.patch_action_preflight_fails.get(action.action_id, 0) + 1
+                                    )
+                                    state.patch_family_preflight_fails[action.family] = (
+                                        state.patch_family_preflight_fails.get(action.family, 0) + 1
+                                    )
+                                    if state.patch_family_preflight_fails[action.family] >= 2:
+                                        state.patch_family_blocked_until[action.family] = iteration + 1
+                                if not debug_ok:
+                                    state.blocked_actions.add(action.action_id)
+                                    continue
+                            else:
+                                state.blocked_actions.add(action.action_id)
+                                continue
+            patch_ok, patch_reason = validate_patch_action(
+                action, patch_families or {}, gates, False
+            )
+            if not patch_ok:
+                trace_events.append(
+                    {
+                        "event": "patch_triage_reject",
+                        "agent": "PatchTriage",
+                        "iteration": iteration,
+                        "action_id": action.action_id,
+                        "reason": patch_reason,
+                    }
+                )
+                continue
+            base_exp = best_chain_exp
+            base_job = base_exp.job
+            base_run_id = base_exp.run_id
+            base_action_id = base_exp.action.action_id if base_exp.action else "baseline"
+            verify_baseline = base_exp
+            _write_generated_actions(
+                artifacts_dir / "runs" / exp_id,
+                generated_actions,
+                generated_ideas_payload,
+                code_survey_payload,
             )
             exp = executor.execute(
                 exp_id=exp_id,
@@ -915,10 +6768,14 @@ def run_optimization(
                 verifier=verifier,
                 artifacts_dir=artifacts_dir,
                 time_command=time_command,
-                build_cfg=build_cfg or {},
-                repeats=candidate_repeats,
+                wrappers_cfg=wrappers_cfg,
+                build_cfg=base_build_cfg,
+                build_packs=build_packs,
+                adapter_cfg=adapter_cfg,
+                repeats=effective_repeats,
                 runtime_agg="mean",
                 baseline_exp=baseline_exp,
+                baseline_exp_for_verify=verify_baseline,
                 baseline_runtime=baseline_exp.results.runtime_seconds,
                 prior_samples=None,
                 trace_events=trace_events,
@@ -927,21 +6784,482 @@ def run_optimization(
                 llm_trace=None,
                 reporter=reporter,
             )
+            debug_exp = None
+            if (
+                exp.verdict == "FAIL"
+                and action
+                and "source_patch" in (action.applies_to or [])
+                and debug_max_attempts > 0
+            ):
+                reason_text = " ".join(exp.reasons or [])
+                build_failed = (
+                    "Build command failed" in reason_text
+                    or "build did not produce lammps binary" in reason_text
+                )
+                run_dir = artifacts_dir / "runs" / exp.run_id
+                build_log_path = run_dir / "build.log"
+                patch_path_value = action.parameters.get("patch_path")
+                if build_failed and build_log_path.exists() and patch_path_value:
+                    patch_path = Path(patch_path_value)
+                    if patch_path.exists():
+                        patch_diff = patch_path.read_text(encoding="utf-8", errors="replace")
+                        build_log_text = _summarize_build_log(build_log_path)
+                        debug_snippets = _get_debug_snippets()
+                        debug_allowed_files = action_allowed_files
+                        for attempt in range(debug_max_attempts):
+                            debug_proposal = patch_debugger.repair(
+                                action=action,
+                                profile=profile_ref,
+                                patch_rules=patch_rules,
+                                allowed_files=debug_allowed_files,
+                                code_snippets=debug_snippets,
+                                repo_root=repo_root,
+                                patch_diff=patch_diff,
+                                build_log=build_log_text,
+                                feedback=reason_text,
+                            )
+                            if reporter:
+                                note = reason_text
+                                if debug_proposal and debug_proposal.missing_fields:
+                                    note = "; ".join(debug_proposal.missing_fields)
+                                reporter.patch_debug(
+                                    action.action_id,
+                                    attempt + 1,
+                                    debug_proposal.status if debug_proposal else "NO_RESPONSE",
+                                    note,
+                                )
+                            trace_events.append(
+                                {
+                                    "event": "patch_debug_attempt",
+                                    "agent": "PatchDebugAgent",
+                                    "iteration": iteration,
+                                    "action_id": action.action_id,
+                                    "attempt": attempt + 1,
+                                    "proposal": debug_proposal.model_dump()
+                                    if debug_proposal
+                                    else None,
+                                }
+                            )
+                            if not debug_proposal:
+                                continue
+                            if debug_proposal.status == "NEED_MORE_CONTEXT":
+                                base_context = int(
+                                    patch_rules.get("max_context_chars", 0) or 0
+                                )
+                                if base_context <= 0:
+                                    base_context = 60000
+                                expand_budget = base_context
+                                expand_cap = max(base_context * 4, 240000)
+                                max_expand_rounds = int(patch_rules.get("max_context_expand_rounds", 0) or 3)
+                                expand_round = 0
+                                last_fingerprint = _snippet_fingerprint(debug_snippets)
+                                while (
+                                    debug_proposal
+                                    and debug_proposal.status == "NEED_MORE_CONTEXT"
+                                ):
+                                    expand_round += 1
+                                    if expand_round > max_expand_rounds:
+                                        break
+                                    expand_budget = min(expand_budget + base_context, expand_cap)
+                                    expanded = _expand_snippets_for_missing_context(
+                                        debug_proposal.missing_fields,
+                                        repo_root,
+                                        snippet_files,
+                                        patch_rules,
+                                        max_chars_override=expand_budget,
+                                    )
+                                    if not expanded:
+                                        break
+                                    new_fingerprint = _snippet_fingerprint(expanded)
+                                    if new_fingerprint == last_fingerprint:
+                                        break
+                                    last_fingerprint = new_fingerprint
+                                    snippet_paths = [
+                                        item.get("path")
+                                        for item in expanded
+                                        if item.get("path")
+                                    ]
+                                    debug_allowed_files = snippet_paths or debug_allowed_files
+                                    debug_snippets = expanded
+                                    trace_events.append(
+                                        {
+                                            "event": "code_snippets_expanded",
+                                            "agent": "Orchestrator",
+                                            "iteration": iteration,
+                                            "action_id": action.action_id,
+                                            "round": expand_round,
+                                            "snippets": [
+                                                {
+                                                    "path": item.get("path"),
+                                                    "tag": item.get("tag"),
+                                                    "start_line": item.get("start_line"),
+                                                    "end_line": item.get("end_line"),
+                                                }
+                                                for item in expanded
+                                            ],
+                                        }
+                                    )
+                                    debug_proposal = patch_debugger.repair(
+                                        action=action,
+                                        profile=profile_ref,
+                                        patch_rules=patch_rules,
+                                        allowed_files=debug_allowed_files,
+                                        code_snippets=debug_snippets,
+                                        repo_root=repo_root,
+                                        patch_diff=patch_diff,
+                                        build_log=build_log_text,
+                                        feedback=reason_text,
+                                    )
+                                    if reporter:
+                                        note = reason_text
+                                        if debug_proposal and debug_proposal.missing_fields:
+                                            note = "; ".join(
+                                                debug_proposal.missing_fields
+                                            )
+                                        reporter.patch_debug(
+                                            action.action_id,
+                                            attempt + 1,
+                                            debug_proposal.status
+                                            if debug_proposal
+                                            else "NO_RESPONSE",
+                                            note,
+                                        )
+                                    trace_events.append(
+                                        {
+                                            "event": "patch_debug_retry",
+                                            "agent": "PatchDebugAgent",
+                                            "iteration": iteration,
+                                            "action_id": action.action_id,
+                                            "attempt": attempt + 1,
+                                            "proposal": debug_proposal.model_dump()
+                                            if debug_proposal
+                                            else None,
+                                        }
+                                    )
+                                    if (
+                                        not debug_proposal
+                                        or debug_proposal.status != "NEED_MORE_CONTEXT"
+                                    ):
+                                        break
+                                if not debug_proposal or debug_proposal.status != "OK":
+                                    continue
+                            if debug_proposal.status != "OK":
+                                continue
+                            debug_exp_id = f"{exp_id}-debug{attempt + 1}"
+                            debug_run_dir = artifacts_dir / "runs" / debug_exp_id
+                            debug_run_dir.mkdir(parents=True, exist_ok=True)
+                            debug_patch_path = debug_run_dir / f"patch.debug{attempt + 1}.diff"
+                            debug_patch_path.write_text(
+                                debug_proposal.patch_diff, encoding="utf-8"
+                            )
+                            action.parameters["patch_path"] = str(debug_patch_path)
+                            if debug_proposal.touched_files:
+                                action.parameters["patch_files"] = debug_proposal.touched_files
+                            debug_exp = executor.execute(
+                                exp_id=debug_exp_id,
+                                job=job,
+                                base_job=base_job,
+                                base_run_id=base_run_id,
+                                base_action_id=base_action_id,
+                                action=action,
+                                actions_root=repo_root,
+                                policy=policy,
+                                gates=gates,
+                                profiler=profiler,
+                                verifier=verifier,
+                                artifacts_dir=artifacts_dir,
+                                time_command=time_command,
+                                wrappers_cfg=wrappers_cfg,
+                                build_cfg=base_build_cfg,
+                                build_packs=build_packs,
+                                adapter_cfg=adapter_cfg,
+                                repeats=effective_repeats,
+                                runtime_agg="mean",
+                                baseline_exp=baseline_exp,
+                                baseline_exp_for_verify=verify_baseline,
+                                baseline_runtime=baseline_exp.results.runtime_seconds,
+                                prior_samples=None,
+                                trace_events=trace_events,
+                                parent_run_id=base_run_id,
+                                iteration=iteration,
+                                llm_trace=None,
+                                reporter=reporter,
+                            )
+                            if debug_exp.verdict == "PASS":
+                                break
+                        if debug_exp and debug_exp.verdict != "PASS":
+                            debug_exp = None
             memory.record(exp)
+            # Use iteration_baseline for marginal gain (improvement vs state before this action)
+            experience_memory.record_experiment(exp, iteration_baseline_exp)
             iteration_experiments.append(exp)
             state.run_count += 1
-            if exp.verdict == "FAIL":
+            if debug_exp:
+                memory.record(debug_exp)
+                experience_memory.record_experiment(debug_exp, iteration_baseline_exp)
+                iteration_experiments.append(debug_exp)
+                state.run_count += 1
+            final_exp = debug_exp or exp
+            if final_exp.verdict == "PASS" and best_chain_runtime > 0.0:
+                if _is_volatile_action(final_exp.action):
+                    variance_cv = _extract_variance_cv(final_exp)
+                    samples = final_exp.results.samples or []
+                    cv_max = float(variance_cfg.get("cv_max", 1.0) or 1.0)
+                    if variance_cv is None or len(samples) < variance_repeats or variance_cv > cv_max:
+                        trace_events.append(
+                            {
+                                "event": "best_chain_skip_unstable",
+                                "agent": "Orchestrator",
+                                "run_id": final_exp.run_id,
+                                "action_id": final_exp.action.action_id if final_exp.action else "baseline",
+                                "variance_cv": variance_cv,
+                                "samples": len(samples),
+                                "cv_max": cv_max,
+                            }
+                        )
+                        continue
+            if final_exp.verdict == "FAIL":
                 state.fail_count += 1
-                failure = triage.classify(exp, artifacts_dir / "runs" / exp.run_id)
+                failure = triage.classify(final_exp, artifacts_dir / "runs" / final_exp.run_id)
                 trace_events.append(
                     {
                         "event": "triage",
                         "agent": "TriageAgent",
-                        "run_id": exp.run_id,
+                        "run_id": final_exp.run_id,
                         "summary": failure.model_dump(),
                     }
                 )
-            _append_run_index(artifacts_dir, exp, parent_run_id=base_run_id, iteration=iteration)
+            _append_run_index(
+                artifacts_dir, exp, parent_run_id=base_run_id, iteration=iteration
+            )
+            if debug_exp:
+                _append_run_index(
+                    artifacts_dir,
+                    debug_exp,
+                    parent_run_id=base_run_id,
+                    iteration=iteration,
+                )
+
+        # --- Track deep analysis opportunity outcomes ---
+        for exp in iteration_experiments:
+            da_id = (exp.action.parameters or {}).get("deep_analysis_id") if exp.action else None
+            if not da_id:
+                continue
+            if exp.verdict == "PASS":
+                deep_succeeded_ids.add(da_id)
+            else:
+                deep_failed_ids.add(da_id)
+
+        # --- Post-loop: select non-conflicting improvements and compose ---
+        winners = _select_non_conflicting(
+            iteration_experiments,
+            best_chain_runtime,
+            chain_min_improvement_pct,
+            variance_cfg=variance_cfg,
+            variance_repeats=variance_repeats,
+            baseline_run_id=best_chain_exp.run_id if best_chain_exp else None,
+        )
+
+        if len(winners) == 1:
+            # Single best improvement — update best_chain directly
+            best_chain_exp = winners[0]
+            best_chain_runtime = winners[0].results.runtime_seconds
+            memory.best = winners[0]
+            trace_events.append(
+                {
+                    "event": "best_chain_update",
+                    "agent": "Orchestrator",
+                    "run_id": winners[0].run_id,
+                    "action_id": winners[0].action.action_id if winners[0].action else "baseline",
+                    "improvement_pct": (
+                        (prev_best_time - winners[0].results.runtime_seconds) / prev_best_time
+                        if prev_best_time > 0
+                        else 0.0
+                    ),
+                    "composition": "single",
+                }
+            )
+        elif len(winners) > 1:
+            # Multiple non-conflicting improvements — try composing them
+            composite_action = _build_final_composite_action(winners, gates)
+            composed = False
+            if composite_action and state.run_count < job.budgets.max_runs:
+                composite_action.action_id = f"iter{iteration}_composite"
+                composite_action.family = "iter_composite"
+                composite_action.description = (
+                    f"Composite of {len(winners)} non-conflicting improvements: "
+                    + ", ".join(w.action.action_id for w in winners if w.action)
+                )
+                trace_events.append(
+                    {
+                        "event": "iter_composite_start",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "components": [w.action.action_id for w in winners if w.action],
+                    }
+                )
+                composite_exp_id = f"iter{iteration}-composite"
+                composite_base = winners[0]  # Build from the fastest single winner
+                composite_exp = executor.execute(
+                    exp_id=composite_exp_id,
+                    job=job,
+                    base_job=composite_base.job,
+                    base_run_id=composite_base.run_id,
+                    base_action_id=composite_base.action.action_id if composite_base.action else "baseline",
+                    action=composite_action,
+                    actions_root=repo_root,
+                    policy=policy,
+                    gates=gates,
+                    profiler=profiler,
+                    verifier=verifier,
+                    artifacts_dir=artifacts_dir,
+                    time_command=time_command,
+                    wrappers_cfg=wrappers_cfg,
+                    build_cfg=build_cfg or {},
+                    build_packs=build_packs,
+                    adapter_cfg=adapter_cfg,
+                    repeats=max(1, plan.evaluation.candidate_repeats_stage1) if plan else 1,
+                    runtime_agg="mean",
+                    baseline_exp=baseline_exp,
+                    baseline_exp_for_verify=iteration_baseline_exp,
+                    baseline_runtime=baseline_exp.results.runtime_seconds,
+                    prior_samples=None,
+                    trace_events=trace_events,
+                    parent_run_id=composite_base.run_id,
+                    iteration=iteration,
+                    llm_trace=None,
+                    reporter=reporter,
+                )
+                memory.record(composite_exp)
+                experience_memory.record_experiment(composite_exp, iteration_baseline_exp)
+                state.run_count += 1
+                _append_run_index(
+                    artifacts_dir,
+                    composite_exp,
+                    parent_run_id=composite_base.run_id,
+                    iteration=iteration,
+                )
+                if (
+                    composite_exp.verdict == "PASS"
+                    and composite_exp.results.runtime_seconds < winners[0].results.runtime_seconds
+                ):
+                    # Composite is better than single best — use it
+                    best_chain_exp = composite_exp
+                    best_chain_runtime = composite_exp.results.runtime_seconds
+                    memory.best = composite_exp
+                    composed = True
+                    trace_events.append(
+                        {
+                            "event": "best_chain_update",
+                            "agent": "Orchestrator",
+                            "run_id": composite_exp.run_id,
+                            "action_id": composite_exp.action.action_id if composite_exp.action else "composite",
+                            "improvement_pct": (
+                                (prev_best_time - composite_exp.results.runtime_seconds) / prev_best_time
+                                if prev_best_time > 0
+                                else 0.0
+                            ),
+                            "composition": "composite",
+                            "components": [w.action.action_id for w in winners if w.action],
+                        }
+                    )
+                else:
+                    trace_events.append(
+                        {
+                            "event": "iter_composite_fallback",
+                            "agent": "Orchestrator",
+                            "iteration": iteration,
+                            "composite_verdict": composite_exp.verdict,
+                            "composite_runtime": composite_exp.results.runtime_seconds,
+                            "single_best_runtime": winners[0].results.runtime_seconds,
+                        }
+                    )
+                    if composite_exp.verdict == "FAIL":
+                        state.fail_count += 1
+
+            if not composed:
+                # Composite failed or wasn't attempted — fall back to single best
+                best_chain_exp = winners[0]
+                best_chain_runtime = winners[0].results.runtime_seconds
+                memory.best = winners[0]
+                trace_events.append(
+                    {
+                        "event": "best_chain_update",
+                        "agent": "Orchestrator",
+                        "run_id": winners[0].run_id,
+                        "action_id": winners[0].action.action_id if winners[0].action else "baseline",
+                        "improvement_pct": (
+                            (prev_best_time - winners[0].results.runtime_seconds) / prev_best_time
+                            if prev_best_time > 0
+                            else 0.0
+                        ),
+                        "composition": "single_fallback",
+                        "attempted_components": [w.action.action_id for w in winners if w.action],
+                    }
+                )
+
+        if neighbor_batch:
+            state.blocked_families.add("neighbor_tune")
+            state.neighbor_tune_done = True
+            trace_events.append(
+                {
+                    "event": "neighbor_tune_batch_complete",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "blocked": True,
+                }
+            )
+        elif (
+            not state.neighbor_tune_done
+            and any(
+                exp.action and exp.action.family == "neighbor_tune"
+                for exp in (iteration_experiments or [])
+            )
+        ):
+            state.neighbor_tune_done = True
+            state.blocked_families.add("neighbor_tune")
+            trace_events.append(
+                {
+                    "event": "neighbor_tune_locked",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "blocked": True,
+                }
+            )
+
+        if not iteration_experiments and source_patch_attempted and patch_failures:
+            patch_blocked = True
+            state.blocked_families.add("source_patch")
+            trace_events.append(
+                {
+                    "event": "source_patch_blocked",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "reason": "no valid patch generated",
+                    "details": patch_failures[:3],
+                }
+            )
+            if reporter:
+                reporter.skip("source_patch 暂停: 未生成可用补丁")
+
+        # --- Accumulate patch failure feedback for next iteration ---
+        if phase_started == "PATCH" and iteration_experiments:
+            for exp in iteration_experiments:
+                if (
+                    exp.action
+                    and exp.action.family in ("source_patch", "iter_composite")
+                    and exp.results.runtime_seconds > best_chain_runtime
+                ):
+                    slowdown = (
+                        (exp.results.runtime_seconds - best_chain_runtime)
+                        / best_chain_runtime * 100
+                    )
+                    pfam = (exp.action.parameters or {}).get("patch_family", "unknown")
+                    patch_failure_feedback.append(
+                        f"iter{iteration} {exp.action.action_id} "
+                        f"(family={pfam}): +{slowdown:.1f}% SLOWER. "
+                        f"Description: {exp.action.description[:120]}"
+                    )
 
         llm_iteration_summary = None
         if iteration_experiments and llm_client and llm_client.config.enabled:
@@ -975,17 +7293,185 @@ def run_optimization(
                 llm_summary_zh=llm_iteration_summary,
             )
             if reporter:
+                best_combo = _effective_action_combo(memory.experiments, best_chain_exp)
                 reporter.iteration_summary(
                     iteration,
                     _best_pass_exp(iteration_experiments),
-                    memory.best,
+                    best_chain_exp,
+                    best_combo,
                 )
 
-        if memory.best and memory.best.results.runtime_seconds + min_delta_seconds < prev_best_time:
+        # --- Reflection step (batch results → reprioritise remaining opportunities) ---
+        if (
+            phase == "PATCH"
+            and reflection_agent
+            and deep_analysis_opportunities
+            and iteration_experiments
+        ):
+            _baseline_rt = baseline_exp.results.runtime_seconds if baseline_exp else 0.0
+            _cumulative_gain = (
+                (_baseline_rt - best_chain_runtime) / _baseline_rt * 100.0
+                if _baseline_rt > 0 else 0.0
+            )
+            _batch_results = []
+            for exp in iteration_experiments:
+                _da_id = (
+                    (exp.action.parameters or {}).get("deep_analysis_id")
+                    if exp.action else None
+                )
+                if not _da_id:
+                    continue
+                _gain = (
+                    (_baseline_rt - exp.results.runtime_seconds) / _baseline_rt * 100.0
+                    if _baseline_rt > 0 else 0.0
+                )
+                _batch_results.append({
+                    "opportunity_id": _da_id,
+                    "verdict": exp.verdict,
+                    "gain_pct": round(_gain, 3),
+                    "failure_reason": (
+                        "; ".join(exp.reasons) if exp.reasons else ""
+                    ),
+                })
+            if _batch_results:
+                _remaining_opps = []
+                for _opp_action in deep_analysis_opportunities:
+                    _p = _opp_action.parameters or {}
+                    _remaining_opps.append({
+                        "opportunity_id": _p.get("deep_analysis_id", ""),
+                        "title": _opp_action.description,
+                        "category": _p.get("patch_family", ""),
+                        "family_hint": _p.get("patch_family"),
+                        "estimated_impact": _p.get("implementation_complexity", "medium"),
+                    })
+                _reflection_payload = {
+                    "iteration": iteration,
+                    "cumulative_gain_pct": round(_cumulative_gain, 3),
+                    "batch_results": _batch_results,
+                    "remaining_opportunities": _remaining_opps,
+                    "history_summary": history_summary,
+                    "strategy_rationale": (
+                        _deep_analysis_result.strategy_rationale
+                        if _deep_analysis_result else ""
+                    ),
+                }
+                _refl = reflection_agent.reflect(_reflection_payload)
+                if _refl:
+                    last_reflection = _refl
+                    # 1. Add skip_ids
+                    deep_skipped_ids.update(_refl.skip_ids)
+                    # 2. Reprioritise remaining opportunities
+                    if _refl.reprioritized_ids:
+                        _opp_map = {
+                            (a.parameters or {}).get("deep_analysis_id", ""): a
+                            for a in deep_analysis_opportunities
+                        }
+                        _reordered: List[ActionIR] = []
+                        for _rid in _refl.reprioritized_ids:
+                            if _rid in _opp_map and _rid not in deep_skipped_ids:
+                                _reordered.append(_opp_map.pop(_rid))
+                        # Append any remaining that weren't mentioned
+                        for _a in deep_analysis_opportunities:
+                            _aid = (_a.parameters or {}).get("deep_analysis_id", "")
+                            if _aid in _opp_map and _aid not in deep_skipped_ids:
+                                _reordered.append(_a)
+                        deep_analysis_opportunities = _reordered
+                    trace_events.append({
+                        "event": "reflection",
+                        "agent": "ReflectionAgent",
+                        "iteration": iteration,
+                        "reprioritized_ids": _refl.reprioritized_ids,
+                        "skip_ids": _refl.skip_ids,
+                        "strategy_note": _refl.strategy_note,
+                        "direction_hint": _refl.direction_hint,
+                    })
+                    if reporter:
+                        reporter._print(
+                            f"Reflection: reprioritized {len(_refl.reprioritized_ids)} "
+                            f"opportunities, skipped {len(_refl.skip_ids)}"
+                        )
+
+        best_improved = bool(
+            best_chain_exp
+            and best_chain_exp.results.runtime_seconds + min_delta_seconds < prev_best_time
+        )
+        if best_improved:
+            prev_best_time = best_chain_exp.results.runtime_seconds
+
+        if scope_levels:
+            patch_gain = False
+            if source_patch_attempted and iteration_experiments:
+                for exp in iteration_experiments:
+                    if not exp.action or exp.action.family != "source_patch":
+                        continue
+                    if exp.verdict != "PASS":
+                        continue
+                    if exp.results.runtime_seconds + min_delta_seconds < prev_best_time_before:
+                        patch_gain = True
+                        break
+            if source_patch_attempted:
+                if patch_gain:
+                    state.patch_scope_no_gain_iters = 0
+                else:
+                    state.patch_scope_no_gain_iters += 1
+                if patch_no_candidates:
+                    state.patch_scope_no_candidates += 1
+                else:
+                    state.patch_scope_no_candidates = 0
+                if patch_failures and not iteration_experiments:
+                    state.patch_scope_failures += 1
+                else:
+                    state.patch_scope_failures = 0
+            else:
+                state.patch_scope_no_gain_iters = 0
+                state.patch_scope_no_candidates = 0
+                state.patch_scope_failures = 0
+
+            promote_cfg = patch_scope_cfg.get("promote", {}) if patch_scope_cfg else {}
+            no_gain_iters = int(promote_cfg.get("no_gain_iters", 0) or 0)
+            no_candidates_iters = int(promote_cfg.get("no_candidates_iters", 0) or 0)
+            patch_failures_limit = int(promote_cfg.get("patch_failures", 0) or 0)
+            should_promote = False
+            if no_gain_iters and state.patch_scope_no_gain_iters >= no_gain_iters:
+                should_promote = True
+            if no_candidates_iters and state.patch_scope_no_candidates >= no_candidates_iters:
+                should_promote = True
+            if patch_failures_limit and state.patch_scope_failures >= patch_failures_limit:
+                should_promote = True
+            if should_promote and state.patch_scope_level < len(scope_levels) - 1:
+                old_scope = scope_levels[min(state.patch_scope_level, len(scope_levels) - 1)]
+                state.patch_scope_level += 1
+                state.patch_scope_no_gain_iters = 0
+                state.patch_scope_no_candidates = 0
+                state.patch_scope_failures = 0
+                state.blocked_families.discard("source_patch")
+                trace_events.append(
+                    {
+                        "event": "source_patch_scope_promoted",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "from_scope": old_scope,
+                        "to_scope": scope_levels[state.patch_scope_level],
+                        "reason": "scope_promotion",
+                    }
+                )
+
+        iteration_best = _best_pass_exp(iteration_experiments) if iteration_experiments else None
+        iteration_family = (
+            iteration_best.action.family
+            if iteration_best and iteration_best.action and iteration_best.action.family
+            else None
+        )
+        if iteration_best is None:
+            pass
+        elif state.last_family is None or iteration_family != state.last_family:
             state.no_improve_iters = 0
-            prev_best_time = memory.best.results.runtime_seconds
+            state.last_family = iteration_family
         else:
-            state.no_improve_iters += 1
+            if best_improved and memory.best and memory.best.action and memory.best.action.family == iteration_family:
+                state.no_improve_iters = 0
+            else:
+                state.no_improve_iters += 1
 
         tested_actions = {exp.action.action_id for exp in memory.experiments if exp.action}
         refreshed_actions = _prepare_actions(
@@ -995,13 +7481,33 @@ def run_optimization(
             experiments=memory.experiments,
             adapter_cfg=adapter_cfg,
             job=job,
+            fixed_threads=fixed_threads,
         )
         remaining_candidates = _remaining_candidates_by_family(refreshed_actions, tested_actions)
+        if state.blocked_families:
+            for family in list(state.blocked_families):
+                remaining_candidates.pop(family, None)
         history_summary = _build_history_summary(memory.experiments)
         cost_model = _build_cost_model(memory.experiments)
         iteration_summaries = _collect_iteration_summaries(
             memory.experiments, baseline_exp.results.runtime_seconds
         )
+        phase_order = _phase_order(hierarchical_cfg)
+        phase_thresholds = _freeze_thresholds(hierarchical_cfg, phase)
+        freeze_target = "runtime_tier" if phase in {"RUN_TUNE", "RUN_RETUNE"} else "build_config"
+        best_phase_exp = _best_for_target(memory.experiments, freeze_target)
+        if (
+            phase == "RUN_TUNE"
+            and best_phase_exp
+            and best_phase_exp.action
+            and best_phase_exp.action.family == "runtime_backend_select"
+        ):
+            best_phase_exp = None
+        freeze_hit, freeze_reason = (False, "")
+        if phase in {"RUN_TUNE", "BUILD_TUNE"} and phase_thresholds:
+            freeze_hit, freeze_reason = _phase_freeze_decision(
+                phase, baseline_exp, best_phase_exp, phase_thresholds, state
+            )
         review_payload = {
             "iteration": iteration,
             "budgets": {
@@ -1015,6 +7521,7 @@ def run_optimization(
                 "run_count": state.run_count,
                 "fail_count": state.fail_count,
                 "no_improve_iters": state.no_improve_iters,
+                "last_family": state.last_family,
             },
             "history_summary": history_summary,
             "cost_model": cost_model,
@@ -1023,26 +7530,157 @@ def run_optimization(
             "best_summary": _best_summary(baseline_exp, memory.best),
             "context": {
                 "selection_mode": selection_mode,
+                "phase": phase,
+                "retune_remaining": retune_remaining,
                 "tags": job.tags,
+            },
+            "phase_freeze": {
+                "freeze_hit": freeze_hit,
+                "freeze_reason": freeze_reason,
+                "thresholds": phase_thresholds,
+                "phase_order": phase_order,
+            },
+            "reflection": {
+                "strategy_note": last_reflection.strategy_note if last_reflection else "",
+                "direction_hint": last_reflection.direction_hint if last_reflection else "",
             },
         }
         review_decision = reviewer.review(review_payload)
-        last_review_decision = review_decision.model_dump()
+        final_review = review_decision
+        if patch_blocked and not review_decision.should_stop:
+            final_review = review_decision.model_copy(
+                update={
+                    "suggested_next_step": "switch_family",
+                    "reason": f"{review_decision.reason} | source_patch blocked".strip(" |"),
+                }
+            )
+        if freeze_hit and not review_decision.should_stop:
+            if review_decision.suggested_next_step != "switch_family":
+                final_review = review_decision.model_copy(
+                    update={
+                        "suggested_next_step": "switch_family",
+                        "reason": f"{review_decision.reason} | {freeze_reason}".strip(" |"),
+                    }
+                )
+                trace_events.append(
+                    {
+                        "event": "phase_freeze_override",
+                        "agent": "ReviewerAgent",
+                        "iteration": iteration,
+                        "reason": freeze_reason,
+                    }
+                )
+        last_review_decision = final_review.model_dump()
         trace_events.append(
             {
                 "event": "review_decision",
                 "agent": "ReviewerAgent",
                 "iteration": iteration,
-                "decision": review_decision.model_dump(),
+                "decision": final_review.model_dump(),
                 "payload": review_payload,
             }
         )
         if reporter:
-            reporter.review_summary(review_decision)
-        if review_decision.should_stop:
+            reporter.review_summary(final_review)
+        if final_review.should_stop:
             if reporter:
-                reporter.stop(f"reviewer_stop: {review_decision.reason}")
+                reporter.stop(f"reviewer_stop: {final_review.reason}")
             break
+        if final_review.suggested_next_step == "switch_family":
+            if patch_only and phase == "PATCH":
+                next_phase = "PATCH"
+            else:
+                next_phase = phase
+                if phase == "RUN_TUNE":
+                    best_run = _best_for_target(memory.experiments, "runtime_tier") or baseline_exp
+                    frozen_run_id = best_run.run_id
+                    next_phase = _next_phase_in_order(
+                        phase,
+                        phase_order,
+                        has_build=_has_actions_for_target(actions, "build_config"),
+                        has_patch=_has_actions_for_target(actions, "source_patch"),
+                    )
+                elif phase == "BUILD_TUNE":
+                    best_build = _best_for_target(memory.experiments, "build_config")
+                    if best_build:
+                        frozen_build_id = best_build.run_id
+                    next_phase = "RUN_RETUNE" if retune_remaining > 0 else "PATCH"
+                    if next_phase == "RUN_RETUNE" and retune_min_improvement > 0.0:
+                        improvement = _best_improvement_pct(baseline_exp, memory.best)
+                        if improvement < retune_min_improvement:
+                            retune_remaining = 0
+                            next_phase = "PATCH"
+                            trace_events.append(
+                                {
+                                    "event": "retune_skipped",
+                                    "agent": "ReviewerAgent",
+                                    "iteration": iteration,
+                                    "reason": f"improvement {improvement:.3f} < {retune_min_improvement:.3f}",
+                                }
+                            )
+                elif phase == "RUN_RETUNE":
+                    best_run = _best_for_target(memory.experiments, "runtime_tier")
+                    if best_run:
+                        frozen_run_id = best_run.run_id
+                    has_build = _has_actions_for_target(actions, "build_config")
+                    has_patch = _has_actions_for_target(actions, "source_patch")
+                    if retune_origin == "patch" and has_build:
+                        next_phase = "BUILD_TUNE"
+                    else:
+                        next_phase = _next_phase_in_order(
+                            "BUILD_TUNE",
+                            phase_order,
+                            has_build=has_build,
+                            has_patch=has_patch,
+                        )
+                elif phase == "PATCH":
+                    if use_two_phase:
+                        # In two-phase mode, parameter tuning is complete;
+                        # stay in PATCH for source-code optimization.
+                        next_phase = "PATCH"
+                    elif patch_blocked:
+                        retune_remaining = max(retune_remaining, 1)
+                        next_phase = "RUN_RETUNE"
+                    elif post_patch_retune > 0:
+                        retune_remaining = post_patch_retune
+                        next_phase = "RUN_RETUNE"
+                        if retune_min_improvement > 0.0:
+                            improvement = _best_improvement_pct(baseline_exp, memory.best)
+                            if improvement < retune_min_improvement:
+                                retune_remaining = 0
+                                next_phase = "PATCH"
+                                trace_events.append(
+                                    {
+                                        "event": "retune_skipped",
+                                        "agent": "ReviewerAgent",
+                                        "iteration": iteration,
+                                        "reason": f"improvement {improvement:.3f} < {retune_min_improvement:.3f}",
+                                    }
+                                )
+            if next_phase != phase:
+                trace_events.append(
+                    {
+                        "event": "phase_transition",
+                        "agent": "ReviewerAgent",
+                        "iteration": iteration,
+                        "from_phase": phase,
+                        "to_phase": next_phase,
+                        "frozen_run_id": frozen_run_id,
+                        "frozen_build_id": frozen_build_id,
+                        "reason": review_decision.reason,
+                    }
+                )
+                if phase == "RUN_RETUNE":
+                    retune_origin = None
+                phase = next_phase
+                if phase == "RUN_RETUNE":
+                    retune_remaining = max(retune_remaining, 1)
+                    if retune_origin is None:
+                        retune_origin = "patch" if phase_started == "PATCH" else "build"
+        if phase_started == "RUN_RETUNE" and retune_remaining > 0:
+            retune_remaining -= 1
+            if retune_remaining <= 0 and phase == "RUN_RETUNE":
+                phase = "PATCH"
 
     validation_exp = None
     if (
@@ -1058,6 +7696,19 @@ def run_optimization(
             best_exp=memory.best,
             experiments=memory.experiments,
         )
+        backend_exp = _latest_backend_exp(memory.experiments)
+        verify_baseline = baseline_exp
+        if memory.best and memory.best.action:
+            if any(t in memory.best.action.applies_to for t in ["build_config", "source_patch"]):
+                base_exp_for_verify = (
+                    _find_experiment_by_run_id(memory.experiments, base_run_id)
+                    if base_run_id
+                    else None
+                )
+                if base_exp_for_verify:
+                    verify_baseline = base_exp_for_verify
+            elif backend_exp and _run_args_has_backend(base_job.run_args):
+                verify_baseline = backend_exp
         validation_exp = executor.execute(
             exp_id=exp_id,
             job=job,
@@ -1072,10 +7723,14 @@ def run_optimization(
             verifier=verifier,
             artifacts_dir=artifacts_dir,
             time_command=time_command,
+            wrappers_cfg=wrappers_cfg,
             build_cfg=build_cfg or {},
+            build_packs=build_packs,
+            adapter_cfg=adapter_cfg,
             repeats=repeats,
             runtime_agg=baseline_stat,
             baseline_exp=baseline_exp,
+            baseline_exp_for_verify=verify_baseline,
             baseline_runtime=baseline_exp.results.runtime_seconds,
             prior_samples=memory.best.results.samples,
             trace_events=trace_events,
@@ -1093,6 +7748,67 @@ def run_optimization(
             validation_exp,
             parent_run_id=base_run_id or memory.best.run_id,
             iteration=iteration,
+        )
+
+    composite_exp = None
+    baseline_runtime = baseline_exp.results.runtime_seconds
+    best_exp = best_chain_exp
+    if best_exp and best_exp.verdict == "PASS" and state.run_count < job.budgets.max_runs:
+        exp_id = "final-composite"
+        final_action = ActionIR(
+            action_id="final_best",
+            family="final_best",
+            description="Final validation run for current best state.",
+            applies_to=[],
+            parameters={},
+        )
+        trace_events.append(
+            {
+                "event": "final_composite_start",
+                "agent": "Orchestrator",
+                "action_id": final_action.action_id,
+                "components": [best_exp.action.action_id if best_exp.action else "baseline"],
+            }
+        )
+        composite_exp = executor.execute(
+            exp_id=exp_id,
+            job=job,
+            base_job=best_exp.job,
+            base_run_id=best_exp.run_id,
+            base_action_id=best_exp.action.action_id if best_exp.action else "baseline",
+            action=final_action,
+            actions_root=repo_root,
+            policy=policy,
+            gates=gates,
+            profiler=profiler,
+            verifier=verifier,
+            artifacts_dir=artifacts_dir,
+            time_command=time_command,
+            wrappers_cfg=wrappers_cfg,
+            build_cfg=build_cfg or {},
+            build_packs=build_packs,
+            adapter_cfg=adapter_cfg,
+            repeats=1,
+            runtime_agg=baseline_stat,
+            baseline_exp=baseline_exp,
+            baseline_exp_for_verify=baseline_exp,
+            baseline_runtime=baseline_runtime,
+            prior_samples=None,
+            trace_events=trace_events,
+            parent_run_id=best_exp.run_id,
+            iteration=None,
+            llm_trace=None,
+            reporter=reporter,
+        )
+        memory.record(composite_exp)
+        state.run_count += 1
+        if composite_exp.verdict == "FAIL":
+            state.fail_count += 1
+        _append_run_index(
+            artifacts_dir,
+            composite_exp,
+            parent_run_id=best_exp.run_id,
+            iteration=None,
         )
 
     success_info = _evaluate_success(
@@ -1129,8 +7845,25 @@ def run_optimization(
         llm_summary_zh,
         candidate_policy=candidate_policy_summary,
         review_decision=last_review_decision,
+        phase_transitions=_extract_phase_transitions(trace_events),
+        composite_exp=composite_exp,
+        min_improvement_pct=min_improvement_pct,
     )
     report_info["agent_trace"] = agent_trace_path
+    best_run_exp = _best_for_target(memory.experiments, "runtime_tier")
+    best_build_exp = _best_for_target(memory.experiments, "build_config")
+    best_state_path = _write_best_state(
+        artifacts_dir=artifacts_dir,
+        baseline_exp=baseline_exp,
+        best_exp=memory.best,
+        best_chain_exp=best_chain_exp,
+        best_run_exp=best_run_exp,
+        best_build_exp=best_build_exp,
+        phase=phase,
+        frozen_run_id=frozen_run_id,
+        frozen_build_id=frozen_build_id,
+    )
+    report_info["best_state"] = best_state_path
     if reporter:
         reporter.final(
             best=memory.best,
@@ -1138,6 +7871,40 @@ def run_optimization(
             report_zh=report_info.get("report_zh"),
         )
     return report_info
+
+
+def _resolve_worktree_path(path_str: str, repo_root: Path) -> str:
+    """If *path_str* points inside a (possibly stale) git worktree, map it
+    back to the equivalent path under *repo_root*."""
+    wt_marker = "/worktrees/"
+    idx = path_str.find(wt_marker)
+    if idx == -1:
+        return path_str
+    # <prefix>/worktrees/<run_id>/<repo_relative_path>
+    after = path_str[idx + len(wt_marker):]
+    slash = after.find("/")
+    if slash == -1:
+        return path_str
+    repo_rel = after[slash + 1:]
+    candidate = repo_root / repo_rel
+    if candidate.exists():
+        return str(candidate)
+    # Path does not exist under repo_root either; return original
+    return path_str
+
+
+def _normalize_worktree_paths(job_snapshot: "JobIR", repo_root: Path) -> "JobIR":
+    """Return a copy of *job_snapshot* with workdir/input_script resolved out
+    of stale worktree paths."""
+    workdir = str(job_snapshot.workdir)
+    input_script = str(job_snapshot.input_script)
+    new_workdir = _resolve_worktree_path(workdir, repo_root)
+    new_input = _resolve_worktree_path(input_script, repo_root)
+    if new_workdir != workdir or new_input != input_script:
+        job_snapshot = job_snapshot.model_copy(deep=True)
+        job_snapshot.workdir = new_workdir
+        job_snapshot.input_script = new_input
+    return job_snapshot
 
 
 def _run_experiment(
@@ -1154,10 +7921,14 @@ def _run_experiment(
     verifier: VerifierAgent,
     artifacts_dir: Path,
     time_command: Optional[str],
+    wrappers_cfg: Optional[List[Dict[str, object]]],
     build_cfg: Dict[str, object],
+    build_packs: Optional[Dict[str, object]],
+    adapter_cfg: Optional[Dict[str, object]],
     repeats: int,
     runtime_agg: str,
     baseline_exp: Optional[ExperimentIR],
+    baseline_exp_for_verify: Optional[ExperimentIR],
     baseline_runtime: Optional[float],
     prior_samples: Optional[List[float]],
     trace_events: Optional[List[Dict[str, object]]],
@@ -1171,17 +7942,46 @@ def _run_experiment(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     base_job_snapshot = base_job or job
-    env_overrides, run_args = _apply_run_config_action(base_job_snapshot, action)
+    # Normalize workdir/input_script if they point inside a stale worktree
+    base_job_snapshot = _normalize_worktree_paths(base_job_snapshot, actions_root)
+    env_overrides, run_args, launcher_cfg = _apply_run_config_action(base_job_snapshot, action)
     run_args = _ensure_log_path(run_args, run_dir)
+    run_kind = "baseline" if action is None else "experiment"
+    wrapper_id = None
+    if action and action.parameters:
+        wrapper_id = action.parameters.get("wrapper_id") or action.parameters.get("wrapper")
+    wrapper_command, wrapper_env = _resolve_wrappers(
+        wrappers_cfg, run_kind, run_dir, wrapper_id
+    )
+    run_env_overrides = dict(env_overrides)
+    run_env_overrides.update(wrapper_env)
     run_trace: List[Dict[str, object]] = []
+    run_cmd = None
+    build_cmds: Optional[List[str]] = None
+    build_cfg_final = _apply_build_config(build_cfg, action, build_packs)
+    if _requires_build(action):
+        build_cmds = _format_build_commands(build_cfg_final, run_dir, actions_root)
+        lammps_bin = Path(build_cfg_final.get("lammps_bin") or "lmp")
+        run_bin = run_dir / "build" / lammps_bin
+    else:
+        run_bin = Path(base_job_snapshot.lammps_bin)
+    run_cmd = _format_run_command(
+        run_bin,
+        run_args,
+        run_env_overrides,
+        launcher_cfg,
+        wrapper_command=wrapper_command,
+    )
     if reporter:
         reporter.run_start(
             exp_id=exp_id,
             action=action,
-            env_overrides=env_overrides,
+            env_overrides=run_env_overrides,
             run_args=run_args,
             base_run_id=base_run_id,
             base_action_id=base_action_id,
+            run_cmd=run_cmd,
+            build_cmds=build_cmds,
         )
     _append_trace(
         trace_events,
@@ -1193,7 +7993,7 @@ def _run_experiment(
             "action_id": action.action_id if action else "baseline",
             "base_run_id": base_run_id,
             "base_action_id": base_action_id,
-            "env_overrides": env_overrides,
+            "env_overrides": run_env_overrides,
             "run_args": run_args,
         },
     )
@@ -1214,6 +8014,7 @@ def _run_experiment(
     binary_provenance: Optional[Dict[str, object]] = None
     repro_script_path: Optional[str] = None
     run_output = None
+    baseline_check_output = None
 
     job_snapshot = base_job_snapshot.model_copy(deep=True)
     job_snapshot.env.update(env_overrides)
@@ -1223,6 +8024,8 @@ def _run_experiment(
     patch_params = _extract_patch_params(action, actions_root)
     requires_patch = bool(action and any(t in action.applies_to for t in ["input_script", "source_patch"]))
     allowlist = policy.get("input_edit_allowlist", [])
+    if not allowlist and job.app == "lammps":
+        allowlist = app_input_allowlist()
 
     if requires_patch and not _is_under_repo(input_script, actions_root):
         result = ResultIR(
@@ -1293,6 +8096,15 @@ def _run_experiment(
         _write_run_trace(run_dir, run_trace)
         return exp
 
+    worktree_retries = 2
+    if isinstance(adapter_cfg, dict):
+        patch_rules = adapter_cfg.get("patch_rules")
+        if isinstance(patch_rules, dict):
+            worktree_retries = int(
+                patch_rules.get("worktree_retry_attempts", patch_rules.get("debug_max_attempts", 2))
+                or 2
+            )
+
     ctx_mgr = (
         GitPatchContext(
             repo_root=actions_root,
@@ -1303,6 +8115,7 @@ def _run_experiment(
             allowlist=allowlist,
             patch_path=patch_params.get("patch_path"),
             patch_root=patch_params.get("patch_root"),
+            worktree_retries=worktree_retries,
         )
         if requires_patch
         else nullcontext()
@@ -1314,11 +8127,21 @@ def _run_experiment(
                 patch_path = str(ctx.patch_path)
                 git_before = ctx.git_commit_before
                 git_after = ctx.git_commit_after
-                workdir = ctx.worktree_dir
+                workdir = ctx.map_to_worktree(Path(base_job_snapshot.workdir))
                 input_script = ctx.map_to_worktree(input_script)
                 job_snapshot.workdir = str(workdir)
                 job_snapshot.input_script = str(input_script)
                 source_root = ctx.worktree_dir
+                if action and "input_script" in (action.applies_to or []):
+                    snapshot_path = run_dir / "input_script.snapshot"
+                    snapshot_path.write_text(
+                        Path(input_script).read_text(encoding="utf-8"),
+                        encoding="utf-8",
+                    )
+                    job_snapshot.input_script = str(snapshot_path)
+                    job_snapshot.run_args = _replace_in_arg(job_snapshot.run_args, str(snapshot_path))
+                    run_args = _replace_in_arg(run_args, str(snapshot_path))
+                    job_snapshot.workdir = base_job_snapshot.workdir
             else:
                 git_before = get_git_head(actions_root)
                 git_after = git_before
@@ -1326,7 +8149,7 @@ def _run_experiment(
             if _requires_build(action):
                 if not build_cfg:
                     raise RuntimeError("build config missing for build/source_patch action")
-                final_build_cfg = _apply_build_config(build_cfg, action)
+                final_build_cfg = _apply_build_config(build_cfg, action, build_packs)
                 build_config_diff_path = _write_build_config_diff(run_dir, build_cfg, final_build_cfg)
                 build_output = build_job(final_build_cfg, source_root, run_dir)
                 if not build_output.lammps_bin_path:
@@ -1354,8 +8177,49 @@ def _run_experiment(
             )
 
             run_output, profile = profiler.run(
-                job_snapshot, run_args, env_overrides, workdir, run_dir, time_command, repeats
+                job_snapshot,
+                run_args,
+                run_env_overrides,
+                workdir,
+                run_dir,
+                time_command,
+                wrapper_command=wrapper_command,
+                repeats=repeats,
+                launcher_cfg=launcher_cfg,
             )
+            if action and "source_patch" in (action.applies_to or []):
+                baseline_check_dir = run_dir / "baseline_check"
+                baseline_check_dir.mkdir(parents=True, exist_ok=True)
+                baseline_job = base_job_snapshot.model_copy(deep=True)
+                baseline_job.env.update(run_env_overrides)
+                baseline_run_args = _ensure_log_path(run_args, baseline_check_dir)
+                baseline_workdir = Path(base_job_snapshot.workdir)
+                baseline_wrapper, baseline_wrapper_env = _resolve_wrappers(
+                    wrappers_cfg, "baseline_check", baseline_check_dir, wrapper_id
+                )
+                baseline_env_overrides = dict(run_env_overrides)
+                baseline_env_overrides.update(baseline_wrapper_env)
+                baseline_check_output, baseline_check_profile = profiler.run(
+                    baseline_job,
+                    baseline_run_args,
+                    baseline_env_overrides,
+                    baseline_workdir,
+                    baseline_check_dir,
+                    time_command,
+                    wrapper_command=baseline_wrapper,
+                    repeats=1,
+                )
+                _append_trace(
+                    trace_events,
+                    run_trace,
+                    {
+                        "event": "baseline_check",
+                        "agent": "ProfilerAgent",
+                        "run_id": run_id,
+                        "runtime_seconds": baseline_check_output.runtime_seconds,
+                        "log_path": baseline_check_output.log_path,
+                    },
+                )
             _append_trace(
                 trace_events,
                 run_trace,
@@ -1382,7 +8246,34 @@ def _run_experiment(
             result = _build_result_ir(
                 run_output, profile, baseline_runtime, runtime_agg, prior_samples
             )
+            if baseline_check_output:
+                result.derived_metrics["baseline_check_runtime"] = baseline_check_output.runtime_seconds
+                if result.runtime_seconds:
+                    result.derived_metrics["speedup_vs_baseline_check"] = (
+                        baseline_check_output.runtime_seconds / result.runtime_seconds
+                    )
+                result.logs.extend(
+                    [
+                        baseline_check_output.stdout_path,
+                        baseline_check_output.stderr_path,
+                        baseline_check_output.log_path,
+                    ]
+                )
     except Exception as exc:
+        if isinstance(exc, WorktreeAddError):
+            _append_trace(
+                trace_events,
+                run_trace,
+                {
+                    "event": "worktree_add_failed",
+                    "agent": "GitPatchContext",
+                    "run_id": run_id,
+                    "attempts": exc.attempts,
+                    "last_error": exc.last_error,
+                },
+            )
+            if reporter:
+                reporter.worktree_error(run_id, exc.attempts, exc.last_error)
         result = ResultIR(
             runtime_seconds=0.0,
             derived_metrics={},
@@ -1461,7 +8352,16 @@ def _run_experiment(
             base_action_id,
         )
 
-    verify = verifier.verify(job_snapshot, action, result, profile, gates, baseline_exp)
+    is_final_validation = exp_id.endswith("-validate")
+    verify = verifier.verify(
+        job_snapshot,
+        action,
+        result,
+        profile,
+        gates,
+        baseline_exp_for_verify or baseline_exp,
+        is_final_validation=is_final_validation,
+    )
     result.correctness_metrics.update(verify.correctness_metrics)
     _append_trace(
         trace_events,
@@ -1523,11 +8423,14 @@ def _run_experiment(
     return exp
 
 
-def _apply_run_config_action(job: JobIR, action: Optional[ActionIR]) -> Tuple[Dict[str, str], List[str]]:
-    env_overrides: Dict[str, str] = {}
+def _apply_run_config_action(
+    job: JobIR, action: Optional[ActionIR]
+) -> Tuple[Dict[str, str], List[str], Optional[Dict[str, object]]]:
+    env_overrides: Dict[str, str] = dict(job.env or {})
     run_args = list(job.run_args)
+    launcher_cfg: Optional[Dict[str, object]] = None
     if not action:
-        return env_overrides, run_args
+        return env_overrides, run_args, launcher_cfg
 
     env_overrides.update(action.parameters.get("env", {}))
     run_args_cfg = action.parameters.get("run_args", {})
@@ -1537,7 +8440,12 @@ def _apply_run_config_action(job: JobIR, action: Optional[ActionIR]) -> Tuple[Di
         arg_count = entry.get("arg_count", len(values))
         run_args = _remove_flag(run_args, flag, arg_count)
         run_args.extend([flag] + list(values))
-    return env_overrides, run_args
+
+    launcher = action.parameters.get("launcher")
+    if isinstance(launcher, dict) and launcher.get("type", "direct") != "direct":
+        launcher_cfg = launcher
+
+    return env_overrides, run_args, launcher_cfg
 
 
 def _extract_patch_params(action: Optional[ActionIR], repo_root: Path) -> Dict[str, Optional[Path]]:
@@ -1561,10 +8469,23 @@ def _requires_build(action: Optional[ActionIR]) -> bool:
     return any(target in action.applies_to for target in ["build_config", "source_patch"])
 
 
-def _apply_build_config(base_cfg: Dict[str, object], action: Optional[ActionIR]) -> Dict[str, object]:
+def _apply_build_config(
+    base_cfg: Dict[str, object],
+    action: Optional[ActionIR],
+    build_packs: Optional[Dict[str, object]],
+) -> Dict[str, object]:
     merged: Dict[str, object] = {**(base_cfg or {})}
     if not action:
         return merged
+    build_pack_id = None
+    if action.parameters:
+        build_pack_id = action.parameters.get("build_pack_id")
+    if build_pack_id and build_packs and isinstance(build_packs, dict):
+        pack = _find_build_pack(build_packs, str(build_pack_id))
+        if pack:
+            merged.setdefault("cmake_args", [])
+            merged["cmake_args"] = list(merged["cmake_args"]) + list(pack.get("cmake_args", []))
+            merged["build_pack_id"] = build_pack_id
     build_params = action.parameters.get("build")
     if not isinstance(build_params, dict):
         return merged
@@ -1586,6 +8507,143 @@ def _apply_build_config(base_cfg: Dict[str, object], action: Optional[ActionIR])
         merged_env.update(build_params["env"])
         merged["env"] = merged_env
     return merged
+
+
+def _format_build_commands(
+    build_cfg: Dict[str, object],
+    run_dir: Path,
+    actions_root: Path,
+) -> List[str]:
+    source_dir_raw = str(build_cfg.get("source_dir") or ".")
+    source_dir = Path(source_dir_raw)
+    if not source_dir.is_absolute():
+        source_dir = actions_root / source_dir
+    build_dir = run_dir / "build"
+    cmake_args = list(build_cfg.get("cmake_args") or [])
+    generator = str(build_cfg.get("generator") or "").strip()
+    cmake_cmd = ["cmake", "-S", str(source_dir), "-B", str(build_dir)]
+    if generator:
+        cmake_cmd.extend(["-G", generator])
+    cmake_cmd.extend([str(arg) for arg in cmake_args])
+    build_cmd = ["cmake", "--build", str(build_dir)]
+    target = str(build_cfg.get("target") or "").strip()
+    if target:
+        build_cmd.extend(["--target", target])
+    build_args = list(build_cfg.get("build_args") or [])
+    if build_args:
+        build_cmd.append("--")
+        build_cmd.extend([str(arg) for arg in build_args])
+    return [" ".join(cmake_cmd), " ".join(build_cmd)]
+
+
+def _format_run_command(
+    lammps_bin: Path,
+    run_args: List[str],
+    env_overrides: Dict[str, str],
+    launcher_cfg: Optional[Dict[str, object]] = None,
+    wrapper_command: Optional[List[str]] = None,
+) -> str:
+    from skills.run_local import build_launch_cmd
+
+    prefix = ""
+    if env_overrides:
+        prefix = " ".join(f"{k}={v}" for k, v in env_overrides.items())
+    cmd_parts = build_launch_cmd(
+        str(lammps_bin),
+        [str(a) for a in run_args],
+        launcher_cfg,
+        wrapper_command=wrapper_command,
+    )
+    cmd = " ".join(cmd_parts)
+    if prefix:
+        return f"{prefix} {cmd}"
+    return cmd
+
+
+def _resolve_wrappers(
+    wrappers_cfg: Optional[List[Dict[str, object]]],
+    run_kind: str,
+    run_dir: Path,
+    wrapper_id: Optional[str],
+) -> Tuple[Optional[List[str]], Dict[str, str]]:
+    if not wrappers_cfg:
+        return None, {}
+    selected: Optional[Dict[str, object]] = None
+    explicit = False
+    if wrapper_id:
+        for wrapper in wrappers_cfg:
+            if str(wrapper.get("id")) == str(wrapper_id):
+                selected = wrapper
+                break
+        explicit = selected is not None
+    if not selected:
+        for wrapper in wrappers_cfg:
+            if not wrapper.get("enabled", False):
+                continue
+            apply_to = set(wrapper.get("apply_to", []) or [])
+            if apply_to and run_kind not in apply_to:
+                continue
+            if not apply_to and wrapper.get("baseline_only", False) and run_kind != "baseline":
+                continue
+            selected = wrapper
+            break
+    if not selected or not selected.get("enabled", False):
+        return None, {}
+    if explicit:
+        # Explicit wrapper choice bypasses baseline_only/apply_to, but still respects limits.
+        pass
+
+    max_uses = selected.get("max_uses")
+    if max_uses is not None:
+        try:
+            max_uses_int = int(max_uses)
+        except (TypeError, ValueError):
+            max_uses_int = None
+        if max_uses_int is not None:
+            used = int(selected.get("_uses", 0) or 0)
+            if used >= max_uses_int:
+                return None, {}
+            selected["_uses"] = used + 1
+
+    exec_name = str(selected.get("exec") or "")
+    if not exec_name:
+        return None, {}
+    if not (shutil.which(exec_name) or Path(exec_name).exists()):
+        return None, {}
+    args = [str(a) for a in (selected.get("args") or [])]
+    wrapper = [exec_name] + args
+
+    env: Dict[str, str] = {}
+    for key, value in (selected.get("env") or {}).items():
+        expanded = os.path.expandvars(str(value))
+        env[str(key)] = expanded
+
+    profile_subdir = str(selected.get("profile_subdir") or selected.get("id") or "wrapper")
+    wrapper_dir = run_dir / profile_subdir
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    if selected.get("id") == "tau":
+        env.setdefault("TAU_PROFILE", "1")
+        env.setdefault("TAU_TRACE", "0")
+        env.setdefault("TAU_PROFILE_FORMAT", "profile")
+        env.setdefault("TAU_PROFILEDIR", str(wrapper_dir))
+    return wrapper, env
+
+
+def _replace_in_arg(run_args: List[str], input_path: str) -> List[str]:
+    updated = list(run_args)
+    for idx in range(len(updated) - 1):
+        if updated[idx] == "-in":
+            updated[idx + 1] = input_path
+            return updated
+    return updated
+
+
+def _find_build_pack(build_packs: Dict[str, object], pack_id: str) -> Optional[Dict[str, object]]:
+    packs = build_packs.get("packs", []) if isinstance(build_packs, dict) else []
+    for pack in packs:
+        if pack.get("id") == pack_id:
+            return pack
+    return None
 
 
 def _write_build_config_diff(
@@ -1631,19 +8689,24 @@ def _build_result_ir(
 ) -> ResultIR:
     timing = profile.timing_breakdown
     samples = (prior_samples or []) + (run_output.samples or [])
-    aggregate = _aggregate_runtime(samples, runtime_agg) if samples else run_output.runtime_seconds
-    total = timing.get("total", aggregate) or aggregate
+    aggregate_wall = _aggregate_runtime(samples, runtime_agg) if samples else run_output.runtime_seconds
+    loop_total = timing.get("total")
+    total = loop_total or aggregate_wall
     comm_ratio = (timing.get("comm", 0.0) / total) if total else 0.0
     derived = {"comm_ratio": comm_ratio}
-    if baseline_runtime and aggregate:
-        derived["speedup_vs_baseline"] = baseline_runtime / aggregate
+    if aggregate_wall:
+        derived["runtime_wall_seconds"] = aggregate_wall
+        if loop_total:
+            derived["runtime_overhead_seconds"] = max(0.0, aggregate_wall - loop_total)
+    if baseline_runtime and total:
+        derived["speedup_vs_baseline"] = baseline_runtime / total
     if len(samples) >= 2:
         mean = sum(samples) / len(samples)
         var = sum((x - mean) ** 2 for x in samples) / len(samples)
         derived["variance"] = var
         derived["variance_cv"] = (var ** 0.5) / mean if mean else 0.0
     return ResultIR(
-        runtime_seconds=aggregate,
+        runtime_seconds=total,
         derived_metrics=derived,
         correctness_metrics={},
         logs=[run_output.stdout_path, run_output.stderr_path, run_output.log_path],
@@ -1846,27 +8909,82 @@ def _read_file_preview(path: Optional[str], max_bytes: int) -> Optional[Dict[str
     return {"text": text, "size_bytes": size, "truncated": truncated}
 
 
-def _select_direction_families(actions: List[ActionIR], profile: ProfileReport) -> List[str]:
-    timing = profile.timing_breakdown
-    total = timing.get("total", 0.0) or 0.0
-    comm_ratio = (timing.get("comm", 0.0) / total) if total else 0.0
-    output_ratio = (timing.get("output", 0.0) / total) if total else 0.0
-    cpu = profile.system_metrics.get("cpu_percent_avg", 100.0)
-    effects: set[str] = set()
-    if comm_ratio > 0.2:
-        effects.add("comm_reduce")
-    if output_ratio > 0.2:
-        effects.add("io_reduce")
-    effects.add("compute_opt")
-    if cpu < 70.0:
-        effects.add("mem_locality")
-    families = []
-    for action in actions:
-        if any(effect in effects for effect in action.expected_effect):
-            families.append(action.family)
-    if not families:
-        families = [action.family for action in actions]
-    return sorted(set(families))
+def _select_directions_by_signal(
+    direction_map: Dict[str, Dict[str, object]],
+    profile_features: Dict[str, object],
+    candidate_policy: Optional[Dict[str, object]],
+    direction_top_k: int,
+) -> tuple[List[str], Dict[str, float]]:
+    tags = set(profile_features.get("bottleneck_tags") or [])
+    metrics = profile_features.get("metrics", {}) or {}
+    allow_skip = True
+    if candidate_policy and isinstance(candidate_policy, dict):
+        allow_skip = bool(candidate_policy.get("allow_skip_if_not_applicable", True))
+    scores: Dict[str, float] = {}
+    for direction_id, direction in direction_map.items():
+        applies_when = set(direction.get("applies_when", []) or [])
+        if allow_skip and applies_when and not (applies_when & tags):
+            continue
+        scores[direction_id] = _direction_score(direction_id, metrics, tags)
+    if not scores:
+        if "compute" in direction_map:
+            return ["compute"], {"compute": 1.0}
+        fallback = list(direction_map.keys())
+        return (fallback[:1] if fallback else []), {}
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    selected = [item[0] for item in ordered[: max(1, direction_top_k)]]
+    return selected, scores
+
+
+def _filter_actions_by_direction(
+    actions: List[ActionIR],
+    direction_map: Dict[str, Dict[str, object]],
+    selected_directions: List[str],
+    candidate_policy: Optional[Dict[str, object]],
+    profile_features: Dict[str, object],
+) -> List[ActionIR]:
+    if not direction_map or not selected_directions:
+        return actions
+    prefer_effects: List[str] = []
+    tags = set(profile_features.get("bottleneck_tags") or [])
+    if candidate_policy and isinstance(candidate_policy, dict):
+        adjustments = candidate_policy.get("domain_adjustments", {}) or {}
+        for tag in tags:
+            entry = adjustments.get(tag, {})
+            prefer_effects.extend(entry.get("prefer_effects", []) or [])
+    selected: List[ActionIR] = []
+    seen: set[str] = set()
+    for direction_id in selected_directions:
+        direction_cfg = direction_map.get(direction_id)
+        if not direction_cfg:
+            continue
+        candidates = select_actions_for_direction(
+            actions, direction_cfg, prefer_effects=prefer_effects or None
+        )
+        for action in candidates:
+            if action.action_id in seen:
+                continue
+            selected.append(action)
+            seen.add(action.action_id)
+    return selected or actions
+
+
+def _direction_score(direction_id: str, metrics: Dict[str, object], tags: set[str]) -> float:
+    io_ratio = float(metrics.get("io_ratio") or 0.0)
+    comm_ratio = float(metrics.get("comm_ratio") or 0.0)
+    compute_ratio = float(metrics.get("compute_ratio") or 0.0)
+    imbalance_ratio = float(metrics.get("imbalance_ratio") or 0.0)
+    if direction_id == "io":
+        return io_ratio
+    if direction_id == "communication":
+        return comm_ratio
+    if direction_id == "compute":
+        return compute_ratio
+    if direction_id == "imbalance":
+        return imbalance_ratio
+    if direction_id == "memory":
+        return 1.0 if "mem_bound" in tags else 0.0
+    return 0.0
 
 
 def _write_run_manifest(
@@ -2084,9 +9202,13 @@ def _write_iteration_summary(
         f"- Allowed families: {', '.join(analysis.allowed_families)}",
         f"- Profiling confidence: {analysis.confidence:.2f}",
         f"- Ranking mode: {'llm' if llm_enabled else 'heuristic'}",
-        "",
-        "## Candidates",
     ]
+    lines.extend(
+        [
+            "",
+            "## Candidates",
+        ]
+    )
     for action in candidates:
         lines.append(f"- {action.action_id} ({action.family})")
     lines.extend(["", "## Outcomes", ""])
@@ -2157,9 +9279,8 @@ def _build_iteration_summary_zh(
         f"- 允许动作族: {', '.join(analysis.allowed_families)}",
         f"- 画像置信度: {analysis.confidence:.2f}",
         f"- 排序模式: {'llm' if llm_enabled else 'heuristic'}",
-        "",
-        "## 候选动作",
     ]
+    lines.extend(["", "## 候选动作"])
     for action in candidates:
         lines.append(f"- {action.action_id} ({action.family})")
     lines.extend(["", "## 实验结果", ""])
@@ -2348,6 +9469,61 @@ def _write_repro_script(
 def _write_experiment(run_dir: Path, exp: ExperimentIR) -> None:
     path = run_dir / "experiment.json"
     path.write_text(json.dumps(exp.model_dump(), indent=2), encoding="utf-8")
+
+
+def _read_experiment(path: Path) -> Optional[ExperimentIR]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+    try:
+        return ExperimentIR.model_validate(data)
+    except Exception:
+        return None
+
+
+def _write_best_state(
+    artifacts_dir: Path,
+    baseline_exp: ExperimentIR,
+    best_exp: Optional[ExperimentIR],
+    best_chain_exp: Optional[ExperimentIR],
+    best_run_exp: Optional[ExperimentIR],
+    best_build_exp: Optional[ExperimentIR],
+    phase: str,
+    frozen_run_id: Optional[str],
+    frozen_build_id: Optional[str],
+) -> Optional[str]:
+    def exp_path(run_id: Optional[str]) -> Optional[str]:
+        if not run_id:
+            return None
+        path = artifacts_dir / "runs" / run_id / "experiment.json"
+        return str(path) if path.exists() else None
+
+    payload = {
+        "case_id": baseline_exp.job.case_id,
+        "baseline_run_id": baseline_exp.run_id,
+        "baseline_exp_path": exp_path(baseline_exp.run_id),
+        "best_chain_run_id": best_chain_exp.run_id if best_chain_exp else None,
+        "best_chain_exp_path": exp_path(best_chain_exp.run_id if best_chain_exp else None),
+        "best_run_id": best_run_exp.run_id if best_run_exp else None,
+        "best_run_exp_path": exp_path(best_run_exp.run_id if best_run_exp else None),
+        "best_build_id": best_build_exp.run_id if best_build_exp else None,
+        "best_build_exp_path": exp_path(best_build_exp.run_id if best_build_exp else None),
+        "best_action_id": best_exp.action.action_id if best_exp and best_exp.action else None,
+        "best_action": best_exp.action.model_dump() if best_exp and best_exp.action else None,
+        "best_run_action": best_run_exp.action.model_dump() if best_run_exp and best_run_exp.action else None,
+        "best_build_action": best_build_exp.action.model_dump()
+        if best_build_exp and best_build_exp.action
+        else None,
+        "phase": phase,
+        "frozen_run_id": frozen_run_id,
+        "frozen_build_id": frozen_build_id,
+    }
+    path = artifacts_dir / "best_state.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(path)
 
 
 def _safe_read(path: Path) -> str:

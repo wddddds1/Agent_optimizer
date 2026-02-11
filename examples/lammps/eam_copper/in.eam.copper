@@ -1,0 +1,29 @@
+# EAM Copper benchmark - larger scale
+# 瓶颈: pair_eam (many-body势, 比 LJ 复杂)
+# 特点: 需要计算嵌入能, 代码优化空间大
+
+units           metal
+atom_style      atomic
+
+# 40x40x40 box = 256,000 atoms (比 melt_xxlarge 的 131k 大)
+lattice         fcc 3.615
+region          box block 0 40 0 40 0 40
+create_box      1 box
+create_atoms    1 box
+
+pair_style      eam
+pair_coeff      1 1 ../../third_party/lammps/bench/Cu_u3.eam
+
+velocity        all create 1600.0 376847 loop geom
+
+neighbor        1.0 bin
+neigh_modify    every 1 delay 5 check yes
+
+fix             1 all nve
+
+timestep        0.005
+thermo          100
+thermo_style    custom step temp pe ke etotal press
+
+# 1000 步, 预计运行 30-60 秒
+run             1000

@@ -22,81 +22,10 @@ def load_action_space(path: Path) -> List[ActionIR]:
     return actions
 
 
-def load_direction_space(path: Path) -> List[ActionIR]:
+def load_direction_space(path: Path) -> List[Dict[str, object]]:
     data = load_yaml(path)
     directions = data.get("directions", [])
-    actions: List[ActionIR] = []
-    for direction in directions:
-        direction_id = direction.get("id")
-        if not direction_id:
-            continue
-        applies_to = direction.get("applies_to", ["run_config"])
-        expected_effect = direction.get("expected_effect", [])
-        risk_level = direction.get("risk_level", "low")
-        preconditions = direction.get("preconditions", [])
-        constraints = direction.get("constraints", [])
-        verification_plan = direction.get("verification_plan", {})
-        presets = direction.get("presets", [])
-        templates = direction.get("templates", [])
-        for preset in presets:
-            preset_id = preset.get("id")
-            if not preset_id:
-                continue
-            action_id = f"{direction_id}.{preset_id}"
-            description = preset.get("description") or direction.get("description") or direction_id
-            params = _build_params(preset, direction_id)
-            actions.append(
-                ActionIR(
-                    action_id=action_id,
-                    family=direction_id,
-                    description=description,
-                    applies_to=applies_to,
-                    parameters=params,
-                    preconditions=preconditions,
-                    constraints=constraints,
-                    expected_effect=expected_effect,
-                    risk_level=risk_level,
-                    verification_plan=verification_plan,
-                )
-            )
-        for template in templates:
-            template_id = template.get("id")
-            if not template_id:
-                continue
-            action_id = f"{direction_id}.template_{template_id}"
-            description = template.get("description") or direction.get("description") or direction_id
-            params = _build_params(template, direction_id)
-            params["template_id"] = template_id
-            params["dynamic_threads"] = True
-            actions.append(
-                ActionIR(
-                    action_id=action_id,
-                    family=direction_id,
-                    description=description,
-                    applies_to=applies_to,
-                    parameters=params,
-                    preconditions=preconditions,
-                    constraints=constraints,
-                    expected_effect=expected_effect,
-                    risk_level=risk_level,
-                    verification_plan=verification_plan,
-                )
-            )
-    return actions
-
-
-def _build_params(node: Dict[str, object], direction_id: str) -> Dict[str, object]:
-    params: Dict[str, object] = {}
-    if node.get("env"):
-        params["env"] = node.get("env")
-    if node.get("run_args"):
-        params["run_args"] = node.get("run_args")
-    if node.get("input_edit"):
-        params["input_edit"] = node.get("input_edit")
-    if node.get("backend_enable"):
-        params["backend_enable"] = node.get("backend_enable")
-    params["direction_id"] = direction_id
-    return params
+    return [direction for direction in directions if isinstance(direction, dict)]
 
 
 def load_policy(path: Path) -> Dict[str, object]:
@@ -157,6 +86,7 @@ def filter_actions(
     filtered: List[ActionIR] = []
     conditional_rules = policy.get("conditional_rules", [])
     global_rules = {rule.get("rule") for rule in policy.get("global_rules", [])}
+    forbid_env = policy.get("forbid_env", {})
 
     for action in actions:
         if "no_mixed_targets" in global_rules:
@@ -168,6 +98,20 @@ def filter_actions(
             continue
         if any(evaluate_rule(rule, ctx) for rule in action.constraints):
             continue
+        if forbid_env and isinstance(action.parameters, dict):
+            env = action.parameters.get("env") or {}
+            if isinstance(env, dict):
+                blocked = False
+                for key, values in forbid_env.items():
+                    if key not in env:
+                        continue
+                    val = str(env.get(key)).strip().lower()
+                    deny = {str(v).strip().lower() for v in (values or [])}
+                    if val in deny:
+                        blocked = True
+                        break
+                if blocked:
+                    continue
         if _violates_conditional_rules(action, ctx, conditional_rules):
             continue
         filtered.append(action)

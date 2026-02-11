@@ -1,15 +1,17 @@
-version: 1
-input_edit_allowlist:
-  - "neigh_modify"
-  - "thermo"
-  - "kspace_style"
-  - "kspace_modify"
+version: 2
+input_edit_allowlist: []
+forbid_env:
+  OMP_DYNAMIC:
+    - "true"
+    - "1"
+    - "on"
+
 global_rules:
   - id: single_action_only
     description: "Exactly one action per experiment for attribution."
     rule: "single_action_only"
   - id: no_mixed_targets
-    description: "Do not change env/run_args and input_script in the same experiment."
+    description: "Do not change runtime/env and input_script in the same experiment."
     rule: "no_mixed_targets"
   - id: require_correctness_for_input_edits
     description: "Input-script edits require correctness gate."
@@ -17,15 +19,12 @@ global_rules:
   - id: forbid_rng_or_integrator_changes
     description: "Do not modify RNG seeds or integrator time steps."
     rule: "forbid_rng_or_integrator_changes"
-conditional_rules:
-  - id: no_neigh_if_long_range
-    description: "Avoid neighbor list changes when long-range electrostatics is present."
-    when: "input_contains:kspace_style|pppm|ewald|coul/long"
-    forbid_action_families: ["neigh_modify"]
-  - id: thread_compare_parallel_only
-    description: "Thread comparison runs should only use parallel_omp."
-    when: "case_tag:thread_compare"
-    forbid_action_families: ["affinity_tune", "wait_policy", "sched_granularity", "runtime_lib"]
+  - id: no_multiple_medium_high_risk
+    description: "Do not combine medium/high risk actions in one experiment."
+    rule: "no_multiple_medium_high_risk"
+
+conditional_rules: []
+
 profiling_rules:
   low_confidence_allow:
     applies_to: ["run_config"]
@@ -33,3 +32,13 @@ profiling_rules:
   unknown_confidence_allow:
     applies_to: ["run_config"]
     risk_levels: ["low"]
+
+source_patch_scope:
+  start_level: "hotspot"
+  levels: ["hotspot", "module", "global"]
+  promote:
+    no_gain_iters: 2
+    no_candidates_iters: 1
+    patch_failures: 2
+  coverage:
+    require_all_families: true

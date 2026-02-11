@@ -1,0 +1,31 @@
+version: 1
+guidance:
+  loop_features:
+    - when:
+        adjacent_loop_signature: true
+      suggest_patch_families:
+        - loop_fusion
+      rationale: "Adjacent loops with identical bounds are strong candidates for fusion."
+    - when:
+        has_flag_condition: true
+      suggest_patch_families:
+        - loop_fission
+      rationale: "Split optional/flag-guarded diagnostics into a second pass; avoid moving core updates."
+    - when:
+        loop_count_min: 2
+      suggest_patch_families:
+        - loop_interchange_blocking
+      rationale: "Multiple loops may benefit from interchange/blocking to improve locality."
+    - when:
+        loop_count_min: 1
+      suggest_patch_families:
+        - loop_unroll
+        - vectorization_hints
+        - cache_local_pointers
+        - prefetch_hints
+        - branch_simplify
+      rationale: "Single hot loops may benefit from unroll/vectorization/pointer caching."
+  memory_hints_policy:
+    prefer_when_confidence_low: true
+  usage:
+    allow_soft_prior: true

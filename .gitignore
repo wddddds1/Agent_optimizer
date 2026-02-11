@@ -13,3 +13,19 @@ __pycache__/
 .venv/
 .env
 .idea/
+
+# Large data files (genomics benchmarks)
+*.fa
+*.fa.*
+*.fq
+*.fq.gz
+*.fastq
+*.fastq.gz
+*.sam
+*.bam
+*.bai
+
+# Third-party build products
+third_party/bwa/bwa
+third_party/bwa/*.o
+third_party/bwa/*.a

@@ -18,5 +18,7 @@ class RankerOutput(StrictBaseModel):
     scoring_notes: str = ""
     confidence: float = 0.0
     score_breakdown: Dict[str, Dict[str, float]] = Field(default_factory=dict)
+    llm_scores: Dict[str, float] = Field(default_factory=dict)
+    evidence_refs: Dict[str, List[str]] = Field(default_factory=dict)
     status: LLMStatus = "OK"
     missing_fields: List[str] = Field(default_factory=list)

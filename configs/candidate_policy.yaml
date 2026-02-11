@@ -1,19 +1,57 @@
-version: 1
-default:
-  families:
-    parallel_omp:
-      threads:
-        mode: "powers_of_two"
-        min: 1
-        max: "physical"
-        include_physical: true
-        include_logical: false
-        include_core_groups: true
-        include_socket_cores: true
-        include_numa_cores: true
-        max_pool: 6
-        expand_if_best_at_max: true
-        expansion_step: 4
+version: 2
+allow_skip_if_not_applicable: true
+max_candidates_per_round: 6
+patch_budgets:
+  max_patches_per_round: 1
+  max_files_touched: 6
+  max_lines_changed: 480
+
+domain_adjustments:
+  thread_floor:
+    min_when_best: 4
+    min_fraction_of_best: 0.5
+    note: "When a best thread count is known, skip very low thread counts."
+  mem_bound:
+    max_threads_cap: 8
+    note: "Cap threads when memory-bound unless scaling evidence exists."
+  comm_bound:
+    min_ratio: 0.2
+    prefer_effects: ["comm_reduce"]
+  io_bound:
+    min_ratio: 0.2
+    prefer_effects: ["io_reduce"]
+  imbalance_bound:
+    prefer_effects: ["imbalance_reduce"]
+
+families:
+  parallel_omp:
+    threads:
+      mode: "powers_of_two"
+      min: 1
+      max: "physical"
+      include_physical: true
+      include_logical: false
+      include_core_groups: true
+      include_socket_cores: true
+      include_numa_cores: true
+      max_pool: 6
+      expand_if_best_at_max: true
+      expansion_step: 4
+      stop_on_peak: true
+      peak_min_improvement_pct: 0.01
+      peak_min_samples: 3
+  parallel_mpi:
+    ranks:
+      mode: "powers_of_two"
+      min: 2
+      max: "physical"
+      max_pool: 4
+  mpi_omp_hybrid:
+    combinations:
+      mode: "balanced"
+      prefer_one_rank_per_socket: true
+      max_pool: 6
+
 cases:
   melt_xxlarge:
     families:
@@ -32,4 +70,8 @@ cases:
           keep_top_k: 2
           expand_if_best_at_max: true
           expansion_step: 4
-          template_ids: ["close_cores"]
+          stop_on_peak: true
+          peak_min_improvement_pct: 0.01
+          peak_min_samples: 3
+          template_ids:
+            ["close_cores", "spread_cores", "close_threads", "spread_threads", "close_sockets", "omp_pk", "blas_threads"]

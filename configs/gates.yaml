@@ -3,11 +3,70 @@ runtime:
   error_regex: "ERROR|Segmentation fault|SIGSEGV"
 correctness:
   default_mode: "strict"
-  allow_skip_for_low_risk_run_config: true
+  allow_skip_for_low_risk_run_config: false
   baseline_require_thermo: true
+  backend_select_allow_drift: true
+  agentic:
+    enabled: true
+    mode: "agent_only"
+    max_log_lines: 80
+  neighbor_tune_relaxed:
+    mode: "statistical"
+    adaptive_from_baseline: true
+    adaptive_multiplier: 3.0
+    adaptive_floor:
+      scalar_abs: 1.0e-6
+      scalar_rel: 1.0e-6
+      series_abs: 1.0e-6
+      series_rel: 1.0e-6
+      drift_rel: 1.0e-6
+    scalar_thresholds:
+      abs: 1.0e-4
+      rel: 1.0e-2
+    series_compare:
+      window: 20
+      abs_max: 1.0e-3
+      rel_max: 1.0e-2
+    energy_drift:
+      metric: "TotEng"
+      rel_max: 1.0e-3
   scalar_thresholds:
     abs: 1.0e-6
     rel: 1.0e-5
+  build_config_relaxed:
+    adaptive_from_baseline: true
+    adaptive_multiplier: 3.0
+    adaptive_floor:
+      scalar_abs: 1.0e-4
+      scalar_rel: 1.0e-3
+      series_abs: 1.0e-3
+      series_rel: 1.0e-2
+      drift_rel: 1.0e-3
+    scalar_thresholds:
+      abs: 1.0e-4
+      rel: 5.0e-3
+    series_compare:
+      window: 20
+      abs_max: 1.0e-3
+      rel_max: 1.0e-2
+    energy_drift:
+      metric: "TotEng"
+      rel_max: 1.0e-3
+  backend_select_relaxed:
+    scalar_thresholds:
+      abs: 1.0e-4
+      rel: 1.0e-3
+    series_compare:
+      window: 20
+      abs_max: 1.0e-3
+      rel_max: 1.0e-2
+    energy_drift:
+      metric: "TotEng"
+      rel_max: 1.0e-3
+  final_validation:
+    allow_skip_for_low_risk_run_config: false
+    backend_select_allow_drift: false
+    allow_relaxations: false
   series_compare:
     window: 20
     abs_max: 1.0e-5

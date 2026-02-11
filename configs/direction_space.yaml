@@ -1,111 +1,151 @@
+version: 2
 directions:
-  - id: parallel_omp
-    description: "OpenMP parallel strategy (threads + affinity + backend enable)."
-    applies_to: ["run_config"]
-    expected_effect: ["compute_opt", "mem_locality"]
-    risk_level: "low"
-    preconditions: []
-    constraints: []
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-    templates:
-      - id: close_cores
-        description: "OMP={threads}, bind close, places cores, enable OpenMP backend."
-        env:
-          OMP_NUM_THREADS: "{threads}"
-          OMP_PROC_BIND: "close"
-          OMP_PLACES: "cores"
-          OMP_DYNAMIC: "false"
-        backend_enable: "openmp"
-      - id: spread_cores
-        description: "OMP={threads}, bind spread, places cores, enable OpenMP backend."
-        env:
-          OMP_NUM_THREADS: "{threads}"
-          OMP_PROC_BIND: "spread"
-          OMP_PLACES: "cores"
-          OMP_DYNAMIC: "false"
-        backend_enable: "openmp"
+  - id: io
+    description: "Reduce I/O overhead and output pressure."
+    applies_when: ["io_bound"]
+    expected_effect: ["io_reduce"]
+    risk_default: "low"
+    knobs:
+      io_frequency:
+        type: "int"
+        domain: "positive"
+      io_async:
+        type: "bool"
+      io_format:
+        type: "enum"
+        values: ["binary", "text", "compressed"]
+      io_layout:
+        type: "enum"
+        values: ["auto", "striped", "blocked"]
+      io_aggregator:
+        type: "enum"
+        values: ["auto", "small", "large"]
+      checkpoint_compression:
+        type: "bool"
+    requires_caps: ["io_runtime_knobs"]
 
-  - id: affinity_tune
-    description: "Affinity tuning without changing thread count."
-    applies_to: ["run_config"]
-    expected_effect: ["mem_locality", "imbalance_reduce"]
-    risk_level: "low"
-    preconditions: []
-    constraints: []
-    verification_plan:
-      gates: ["runtime", "variance"]
-      thresholds:
-        variance_cv_max: 0.03
-    presets:
-      - id: bind_close
-        description: "Set OMP_PROC_BIND=close and OMP_PLACES=cores."
-        env:
-          OMP_PROC_BIND: "close"
-          OMP_PLACES: "cores"
-      - id: bind_spread
-        description: "Set OMP_PROC_BIND=spread and OMP_PLACES=cores."
-        env:
-          OMP_PROC_BIND: "spread"
-          OMP_PLACES: "cores"
+  - id: communication
+    description: "Reduce communication frequency or overlap communication."
+    applies_when: ["comm_bound"]
+    expected_effect: ["comm_reduce"]
+    risk_default: "medium"
+    knobs:
+      comm_frequency:
+        type: "int"
+        domain: "positive"
+      comm_overlap:
+        type: "bool"
+      message_aggregation:
+        type: "bool"
+      nonblocking_overlap:
+        type: "bool"
+      comm_algorithm:
+        type: "enum"
+        values: ["auto", "ring", "tree"]
+      topology_mapping:
+        type: "enum"
+        values: ["auto", "aware", "compact", "spread"]
+    requires_caps: ["mpi_runtime_knobs"]
 
-  - id: wait_policy
-    description: "OpenMP wait policy tuning."
-    applies_to: ["run_config"]
-    expected_effect: ["mem_locality", "imbalance_reduce"]
-    risk_level: "low"
-    preconditions: []
-    constraints: []
-    verification_plan:
-      gates: ["runtime", "variance"]
-      thresholds:
-        variance_cv_max: 0.03
-    presets:
-      - id: wait_active
-        description: "Set OMP_WAIT_POLICY=active."
-        env:
-          OMP_WAIT_POLICY: "active"
-      - id: wait_passive
-        description: "Set OMP_WAIT_POLICY=passive."
-        env:
-          OMP_WAIT_POLICY: "passive"
+  - id: memory
+    description: "Improve memory locality and cache behavior."
+    applies_when: ["mem_bound"]
+    expected_effect: ["mem_locality"]
+    risk_default: "medium"
+    knobs:
+      data_layout:
+        type: "enum"
+        values: ["aos", "soa", "hybrid"]
+      blocking_factor:
+        type: "int"
+        domain: "positive"
+      prefetch_hint:
+        type: "bool"
+    requires_caps: ["memory_tuning_knobs"]
 
-  - id: sched_granularity
-    description: "OpenMP schedule/granularity tuning."
-    applies_to: ["run_config"]
-    expected_effect: ["imbalance_reduce"]
-    risk_level: "low"
-    preconditions: []
-    constraints: []
-    verification_plan:
-      gates: ["runtime", "variance"]
-      thresholds:
-        variance_cv_max: 0.03
-    presets:
-      - id: schedule_static
-        description: "Set OMP_SCHEDULE=static."
-        env:
-          OMP_SCHEDULE: "static"
-      - id: schedule_dynamic
-        description: "Set OMP_SCHEDULE=dynamic"
-        env:
-          OMP_SCHEDULE: "dynamic"
-
-  - id: runtime_lib
-    description: "Runtime library/allocator tuning."
-    applies_to: ["run_config"]
+  - id: compute
+    description: "Increase compute throughput via parallelism and vectorization."
+    applies_when: ["compute_bound"]
     expected_effect: ["compute_opt"]
-    risk_level: "medium"
-    preconditions: ["case_tag:allow_runtime_lib"]
-    constraints: []
-    verification_plan:
-      gates: ["runtime", "correctness", "variance"]
-      thresholds:
-        variance_cv_max: 0.05
-    presets:
-      - id: disable_nanov2
-        description: "Disable macOS nano allocator for large allocations."
-        env:
-          MallocNanoZone: "0"
+    risk_default: "low"
+    subtags: ["parallelism", "affinity_locality", "vectorization"]
+    knobs:
+      threads:
+        type: "int"
+        domain: "positive"
+      affinity_policy:
+        type: "enum"
+        values: ["close", "spread", "none"]
+      places_policy:
+        type: "enum"
+        values: ["cores", "threads", "sockets"]
+      wait_policy:
+        type: "enum"
+        values: ["active", "passive", "auto"]
+      vectorization:
+        type: "enum"
+        values: ["auto", "forced", "off"]
+    requires_caps: ["runtime_parallel_knobs"]
+
+  - id: imbalance
+    description: "Reduce load imbalance and scheduling skew."
+    applies_when: ["imbalance_bound"]
+    expected_effect: ["imbalance_reduce"]
+    risk_default: "medium"
+    knobs:
+      partition_strategy:
+        type: "enum"
+        values: ["auto", "balanced", "weighted"]
+      schedule_policy:
+        type: "enum"
+        values: ["static", "dynamic", "guided"]
+    requires_caps: ["load_balance_knobs"]
+
+  - id: build_optimization
+    description: "Compiler/toolchain optimization packs."
+    applies_when: ["compute_bound", "mem_bound"]
+    expected_effect: ["compute_opt", "mem_locality"]
+    risk_default: "medium"
+    knobs:
+      compiler:
+        type: "enum"
+        values: ["system_default", "alt_vendor", "clang", "gcc"]
+      opt_level:
+        type: "enum"
+        values: ["O2", "O3", "Ofast"]
+      link_time_opt:
+        type: "bool"
+      fast_math:
+        type: "bool"
+    requires_caps: ["build_toolchain"]
+
+  - id: code_hotspot
+    description: "Localized source transforms in hotspots."
+    applies_when: ["compute_bound", "mem_bound", "comm_bound", "imbalance_bound"]
+    expected_effect: ["compute_opt", "mem_locality", "comm_reduce", "imbalance_reduce"]
+    risk_default: "high"
+    knobs:
+      patch_family:
+        type: "enum"
+        values:
+          - "loop_fusion"
+          - "loop_fission"
+          - "loop_interchange_blocking"
+          - "array_packing"
+          - "temporary_elision"
+          - "alignment_hints"
+          - "vectorization_enablers"
+          - "hoist_invariant"
+          - "conditional_elision"
+          - "math_equivalence"
+          - "precision_policy"
+          - "comm_frequency_merge"
+          - "comm_overlap"
+          - "message_aggregation"
+          - "nonblocking_overlap"
+          - "compute_comm_reorder"
+          - "vectorization_hints"
+      patch_scope:
+        type: "enum"
+        values: ["function", "loop", "file"]
+    requires_caps: ["source_patch"]

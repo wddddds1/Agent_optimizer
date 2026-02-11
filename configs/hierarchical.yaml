@@ -1,0 +1,22 @@
+version: 1
+phases:
+  default_order: ["RUN_TUNE", "BUILD_TUNE", "PATCH"]
+  mlda_direction_order: ["io", "communication", "memory", "compute", "imbalance"]
+  allow_skip_if_not_applicable: true
+freeze:
+  run_config:
+    min_relative_gain: 0.05
+    max_variance_cv: 0.02
+    patience_rounds: 2
+  build_config:
+    min_relative_gain: 0.03
+    max_variance_cv: 0.03
+    patience_rounds: 2
+retune:
+  post_patch_budget: 2
+triggers:
+  build_tune:
+    when_hotspot_shift: true
+    when_stagnation_rounds: 2
+  run_retune:
+    when_patch_family_tags: ["compiler_sensitive", "vectorization_helpful"]

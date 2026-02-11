@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List
 
 from pydantic import Field
 
@@ -13,6 +13,7 @@ class CandidateGroup(StrictBaseModel):
     assumptions: List[str] = Field(default_factory=list)
     confidence: float = 0.0
     family_rationale: str = ""
+    action_rationales: Dict[str, str] = Field(default_factory=dict)
 
 
 class OptimizerOutput(StrictBaseModel):

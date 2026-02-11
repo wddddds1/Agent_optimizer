@@ -65,15 +65,18 @@ class LLMClient:
             "sorted from best to worst. Only use action_id values provided.\n\n"
             f"Payload:\n{json.dumps(payload, ensure_ascii=False)}"
         )
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            messages=[
-                {"role": "system", "content": "Return only JSON. No markdown."},
-                {"role": "user", "content": prompt},
-            ],
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "Return only JSON. No markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+        except Exception:
+            return []
         content = response.choices[0].message.content.strip()
         try:
             data = json.loads(content)
@@ -90,15 +93,18 @@ class LLMClient:
             "Explain the action ranking rationale in 3-5 bullet points. "
             "Do not mention missing info."
         )
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            messages=[
-                {"role": "system", "content": "Return plain text only."},
-                {"role": "user", "content": prompt + "\n\nContext:\n" + json.dumps(context)},
-            ],
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "Return plain text only."},
+                    {"role": "user", "content": prompt + "\n\nContext:\n" + json.dumps(context)},
+                ],
+            )
+        except Exception:
+            return ""
         return response.choices[0].message.content.strip()
 
     def summarize_report_zh(self, payload: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -112,15 +118,18 @@ class LLMClient:
             "- selection_reason: \"中文简要说明为什么最终选择该优化\"\n"
             "要求：只输出 JSON，不要 markdown，不要额外文字。原因要简短、具体、可解释；不要编造未给出的数据。"
         )
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            messages=[
-                {"role": "system", "content": "Return only JSON."},
-                {"role": "user", "content": prompt + "\n\nPayload:\n" + json.dumps(payload)},
-            ],
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "Return only JSON."},
+                    {"role": "user", "content": prompt + "\n\nPayload:\n" + json.dumps(payload)},
+                ],
+            )
+        except Exception:
+            return None
         content = response.choices[0].message.content.strip()
         data = _safe_json_loads(content)
         if not isinstance(data, dict):
@@ -138,15 +147,18 @@ class LLMClient:
             "- selection_reason: \"中文简要说明本轮为什么选择该最优配置\"\n"
             "要求：只输出 JSON，不要 markdown，不要额外文字。原因要简短、具体、可解释；不要编造未给出的数据。"
         )
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            messages=[
-                {"role": "system", "content": "Return only JSON."},
-                {"role": "user", "content": prompt + "\n\nPayload:\n" + json.dumps(payload)},
-            ],
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "Return only JSON."},
+                    {"role": "user", "content": prompt + "\n\nPayload:\n" + json.dumps(payload)},
+                ],
+            )
+        except Exception:
+            return None
         content = response.choices[0].message.content.strip()
         data = _safe_json_loads(content)
         if not isinstance(data, dict):
@@ -157,15 +169,18 @@ class LLMClient:
         if not self.client:
             return None
         message = prompt.rstrip() + "\n\nPayload:\n" + json.dumps(payload, ensure_ascii=False)
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-            messages=[
-                {"role": "system", "content": "Return only JSON. No markdown or extra text."},
-                {"role": "user", "content": message},
-            ],
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                messages=[
+                    {"role": "system", "content": "Return only JSON. No markdown or extra text."},
+                    {"role": "user", "content": message},
+                ],
+            )
+        except Exception:
+            return None
         content = response.choices[0].message.content.strip()
         data = _safe_json_loads(content)
         if not isinstance(data, dict):

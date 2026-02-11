@@ -1,0 +1,110 @@
+diff --git a/src/OPENMP/pair_lj_cut_omp.cpp b/src/OPENMP/pair_lj_cut_omp.cpp
+index 654b91b7ba..b3eae0a1ce 100644
+--- a/src/OPENMP/pair_lj_cut_omp.cpp
++++ b/src/OPENMP/pair_lj_cut_omp.cpp
+@@ -110,39 +110,76 @@ void PairLJCutOMP::eval(int iifrom, int iito, ThrData * const thr)
+     jnum = numneigh[i];
+     fxtmp=fytmp=fztmp=0.0;
+ 
++    // Split loop: handle sbindex==0 (no special bonds) separately
++    // This is the common case and avoids factor_lj multiplication
+     for (jj = 0; jj < jnum; jj++) {
+       j = jlist[jj];
+-      factor_lj = special_lj[sbmask(j)];
+-      j &= NEIGHMASK;
+-
+-      delx = xtmp - x[j].x;
+-      dely = ytmp - x[j].y;
+-      delz = ztmp - x[j].z;
+-      rsq = delx*delx + dely*dely + delz*delz;
+-      jtype = type[j];
+-
+-      if (rsq < cutsqi[jtype]) {
+-        r2inv = 1.0/rsq;
+-        r6inv = r2inv*r2inv*r2inv;
+-        forcelj = r6inv * (lj1i[jtype]*r6inv - lj2i[jtype]);
+-        fpair = factor_lj*forcelj*r2inv;
+-
+-        fxtmp += delx*fpair;
+-        fytmp += dely*fpair;
+-        fztmp += delz*fpair;
+-        if (NEWTON_PAIR || j < nlocal) {
+-          f[j].x -= delx*fpair;
+-          f[j].y -= dely*fpair;
+-          f[j].z -= delz*fpair;
++      const int sbindex = sbmask(j);
++
++      if (sbindex == 0) {
++        // Fast path: no special bond, factor_lj = 1.0 implicitly
++        delx = xtmp - x[j].x;
++        dely = ytmp - x[j].y;
++        delz = ztmp - x[j].z;
++        rsq = delx*delx + dely*dely + delz*delz;
++        jtype = type[j];
++
++        if (rsq < cutsqi[jtype]) {
++          r2inv = 1.0/rsq;
++          r6inv = r2inv*r2inv*r2inv;
++          forcelj = r6inv * (lj1i[jtype]*r6inv - lj2i[jtype]);
++          fpair = forcelj*r2inv;  // No factor_lj multiplication
++
++          fxtmp += delx*fpair;
++          fytmp += dely*fpair;
++          fztmp += delz*fpair;
++          if (NEWTON_PAIR || j < nlocal) {
++            f[j].x -= delx*fpair;
++            f[j].y -= dely*fpair;
++            f[j].z -= delz*fpair;
++          }
++
++          if (EFLAG) {
++            evdwl = r6inv*(lj3i[jtype]*r6inv-lj4i[jtype]) - offseti[jtype];
++          }
++
++          if (EVFLAG) ev_tally_thr(this,i,j,nlocal,NEWTON_PAIR,
++                                   evdwl,0.0,fpair,delx,dely,delz,thr);
+         }
+-
+-        if (EFLAG) {
+-          evdwl = r6inv*(lj3i[jtype]*r6inv-lj4i[jtype]) - offseti[jtype];
+-          evdwl *= factor_lj;
++      } else {
++        // Slow path: special bond handling
++        factor_lj = special_lj[sbindex];
++        j &= NEIGHMASK;
++
++        delx = xtmp - x[j].x;
++        dely = ytmp - x[j].y;
++        delz = ztmp - x[j].z;
++        rsq = delx*delx + dely*dely + delz*delz;
++        jtype = type[j];
++
++        if (rsq < cutsqi[jtype]) {
++          r2inv = 1.0/rsq;
++          r6inv = r2inv*r2inv*r2inv;
++          forcelj = r6inv * (lj1i[jtype]*r6inv - lj2i[jtype]);
++          fpair = factor_lj*forcelj*r2inv;
++
++          fxtmp += delx*fpair;
++          fytmp += dely*fpair;
++          fztmp += delz*fpair;
++          if (NEWTON_PAIR || j < nlocal) {
++            f[j].x -= delx*fpair;
++            f[j].y -= dely*fpair;
++            f[j].z -= delz*fpair;
++          }
++
++          if (EFLAG) {
++            evdwl = r6inv*(lj3i[jtype]*r6inv-lj4i[jtype]) - offseti[jtype];
++            evdwl *= factor_lj;
++          }
++
++          if (EVFLAG) ev_tally_thr(this,i,j,nlocal,NEWTON_PAIR,
++                                   evdwl,0.0,fpair,delx,dely,delz,thr);
+         }
+-
+-        if (EVFLAG) ev_tally_thr(this,i,j,nlocal,NEWTON_PAIR,
+-                                 evdwl,0.0,fpair,delx,dely,delz,thr);
+       }
+     }
+     f[i].x += fxtmp;

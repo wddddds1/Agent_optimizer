@@ -22,8 +22,8 @@ cases:
       max_wall_seconds: 3600
     tags: ["short", "min"]
   melt_large:
-    workdir: "examples/melt_large"
-    input_script: "examples/melt_large/in.melt.large"
+    workdir: "examples/lammps/melt_large"
+    input_script: "examples/lammps/melt_large/in.melt.large"
     run_args: ["-in", "in.melt.large", "-log", "log.lammps"]
     env:
       OMP_NUM_THREADS: "1"
@@ -33,8 +33,8 @@ cases:
       max_wall_seconds: 3600
     tags: ["melt", "large"]
   melt_xlarge:
-    workdir: "examples/melt_xlarge"
-    input_script: "examples/melt_xlarge/in.melt.xlarge"
+    workdir: "examples/lammps/melt_xlarge"
+    input_script: "examples/lammps/melt_xlarge/in.melt.xlarge"
     run_args: ["-in", "in.melt.xlarge", "-log", "log.lammps"]
     env:
       OMP_NUM_THREADS: "1"
@@ -44,8 +44,8 @@ cases:
       max_wall_seconds: 7200
     tags: ["melt", "xlarge"]
   melt_xxlarge:
-    workdir: "examples/melt_xxlarge"
-    input_script: "examples/melt_xxlarge/in.melt.xxlarge"
+    workdir: "examples/lammps/melt_xxlarge"
+    input_script: "examples/lammps/melt_xxlarge/in.melt.xxlarge"
     run_args: ["-in", "in.melt.xxlarge", "-log", "log.lammps"]
     env:
       OMP_NUM_THREADS: "1"
@@ -54,3 +54,105 @@ cases:
       max_runs: 6
       max_wall_seconds: 7200
     tags: ["melt", "xxlarge", "thread_compare"]
+  melt_neigh_extreme:
+    workdir: "examples/lammps/melt_neigh_extreme"
+    input_script: "examples/lammps/melt_neigh_extreme/in.melt.neigh_extreme"
+    run_args: ["-in", "in.melt.neigh_extreme", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 5
+      max_runs: 20
+      max_wall_seconds: 7200
+    tags: ["melt", "neighbor_stress", "xxlarge"]
+  melt_xxxlarge:
+    workdir: "examples/lammps/melt_xxxlarge"
+    input_script: "examples/lammps/melt_xxxlarge/in.melt.xxxlarge"
+    run_args: ["-in", "in.melt.xxxlarge", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 1
+      max_runs: 6
+      max_wall_seconds: 7200
+    tags: ["melt", "xxxlarge", "thread_compare"]
+  tersoff_si:
+    workdir: "third_party/lammps/examples/tersoff"
+    input_script: "third_party/lammps/examples/tersoff/in.tersoff"
+    run_args: ["-in", "in.tersoff", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 20
+      max_runs: 200
+      max_wall_seconds: 14400
+    tags: ["tersoff", "three_body", "source_patch"]
+    lammps_bin: "build/lammps-macos-omp-manybody/lmp"
+  reaxff_rdx:
+    workdir: "third_party/lammps/examples/reaxff"
+    input_script: "third_party/lammps/examples/reaxff/in.reaxff.rdx"
+    run_args: ["-in", "in.reaxff.rdx", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 20
+      max_runs: 200
+      max_wall_seconds: 14400
+    tags: ["reaxff", "reactive", "source_patch"]
+    lammps_bin: "build/lammps-macos-omp-reaxff/lmp"
+  pppm_peptide:
+    workdir: "third_party/lammps/examples/peptide"
+    input_script: "third_party/lammps/examples/peptide/in.peptide.opt"
+    run_args: ["-in", "in.peptide.opt", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 20
+      max_runs: 200
+      max_wall_seconds: 14400
+    tags: ["pppm", "kspace", "source_patch"]
+    lammps_bin: "build/lammps-macos-omp-peptide/lmp"
+
+  # ─── 新增算例: 更大规模 + 更多样化的瓶颈 ───
+
+  eam_copper:
+    workdir: "examples/lammps/eam_copper"
+    input_script: "examples/lammps/eam_copper/in.eam.copper"
+    run_args: ["-in", "in.eam.copper", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 5
+      max_runs: 20
+      max_wall_seconds: 7200
+    tags: ["eam", "metal", "many_body", "source_patch"]
+    lammps_bin: "build/lammps-macos-omp-manybody/lmp"
+    description: "EAM copper 256k atoms - many-body势, pair_eam代码比LJ复杂"
+
+  rhodopsin:
+    workdir: "examples/lammps/rhodopsin"
+    input_script: "examples/lammps/rhodopsin/in.rhodo.large"
+    run_args: ["-in", "in.rhodo.large", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 5
+      max_runs: 20
+      max_wall_seconds: 7200
+    tags: ["biomolecule", "kspace", "pppm", "bond_angle", "source_patch"]
+    lammps_bin: "build/lammps-macos-omp-peptide/lmp"
+    description: "Rhodopsin蛋白 32k atoms - kspace+pair+bond混合瓶颈"
+
+  polymer_chain:
+    workdir: "examples/lammps/polymer_chain"
+    input_script: "examples/lammps/polymer_chain/in.chain.large"
+    run_args: ["-in", "in.chain.large", "-log", "log.lammps"]
+    env:
+      OMP_NUM_THREADS: "1"
+    budgets:
+      max_iters: 5
+      max_runs: 20
+      max_wall_seconds: 7200
+    tags: ["polymer", "bond", "neighbor_heavy", "source_patch"]
+    lammps_bin: "build/lammps-macos-omp-peptide/lmp"
+    description: "FENE聚合物链 256k atoms - 键相互作用+频繁邻居更新(Neigh 60%)"

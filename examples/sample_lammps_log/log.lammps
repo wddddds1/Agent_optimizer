@@ -1,16 +1,6 @@
-LAMMPS (29 Oct 2020)
-Step Temp E_pair E_mol TotEng Press
-0 1.0 -5.0 0.0 -4.0 1.0
-1000 1.2 -5.1 0.0 -4.1 1.1
-
-Loop time of 1.2345 on 1 procs for 1000 steps with 1000 atoms
-
-MPI task timing breakdown:
-Section |  min time |  avg time |  max time |%varavg|%varmax
-Pair    | 0.40 | 0.41 | 0.42 | 0.1 | 0.2
-Neigh   | 0.10 | 0.11 | 0.12 | 0.1 | 0.2
-Comm    | 0.20 | 0.21 | 0.22 | 0.1 | 0.2
-Output  | 0.05 | 0.06 | 0.07 | 0.1 | 0.2
-Modify  | 0.15 | 0.16 | 0.17 | 0.1 | 0.2
-Other   | 0.08 | 0.09 | 0.10 | 0.1 | 0.2
-Total   | 0.98 | 1.00 | 1.02 | 0.1 | 0.2
+LAMMPS (test log)
+Per MPI rank memory allocation (min/avg/max) = 1 | 1 | 1 Mbytes
+   Step          Temp          E_pair         E_mol          TotEng         Press     
+         0   1.0000000     -2.0000000      0.0000000     -1.5000000      0.5000000
+       100   1.1000000     -2.1000000      0.0000000     -1.5500000      0.5500000
+Loop time of 1.0 on 1 procs for 100 steps with 1000 atoms

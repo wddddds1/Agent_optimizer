@@ -1,8 +1,104 @@
 app: lammps
-backend_enable:
-  openmp:
-    run_args:
-      set_flags:
-        - flag: "-sf"
-          values: ["omp"]
-          arg_count: 1
+# Application-specific mappings are implemented in skills/applications/lammps_app.py
+patch_root: "third_party/lammps"
+patch_rules:
+  allowed_globs:
+    - "third_party/lammps/src/*.h"
+    - "third_party/lammps/src/*.cpp"
+    - "third_party/lammps/src/**/*.h"
+    - "third_party/lammps/src/**/*.cpp"
+  hotspot_globs:
+    pair:
+      - "third_party/lammps/src/pair_*.cpp"
+      - "third_party/lammps/src/pair_*.h"
+      - "third_party/lammps/src/pair_*_omp.cpp"
+      - "third_party/lammps/src/pair_*_omp.h"
+      - "third_party/lammps/src/OPENMP/pair_*_omp.cpp"
+      - "third_party/lammps/src/OPENMP/pair_*_omp.h"
+      - "third_party/lammps/src/OPT/pair_*_opt.cpp"
+      - "third_party/lammps/src/OPT/pair_*_opt.h"
+    neigh:
+      - "third_party/lammps/src/neighbor*.cpp"
+      - "third_party/lammps/src/neighbor*.h"
+    comm:
+      - "third_party/lammps/src/comm*.cpp"
+      - "third_party/lammps/src/comm*.h"
+    kspace:
+      - "third_party/lammps/src/kspace*.cpp"
+      - "third_party/lammps/src/kspace*.h"
+    compute:
+      - "third_party/lammps/src/compute*.cpp"
+      - "third_party/lammps/src/compute*.h"
+  scope_levels:
+    hotspot:
+      hotspot_only: true
+      allowed_globs:
+        - "third_party/lammps/src/pair_*.cpp"
+        - "third_party/lammps/src/pair_*.h"
+        - "third_party/lammps/src/OPENMP/pair_*_omp.cpp"
+        - "third_party/lammps/src/OPENMP/pair_*_omp.h"
+        - "third_party/lammps/src/OPT/pair_*_opt.cpp"
+        - "third_party/lammps/src/OPT/pair_*_opt.h"
+        - "third_party/lammps/src/neighbor*.cpp"
+        - "third_party/lammps/src/neighbor*.h"
+        - "third_party/lammps/src/comm*.cpp"
+        - "third_party/lammps/src/comm*.h"
+        - "third_party/lammps/src/compute*.cpp"
+        - "third_party/lammps/src/compute*.h"
+        - "third_party/lammps/src/kspace*.cpp"
+        - "third_party/lammps/src/kspace*.h"
+    module:
+      allowed_globs:
+        - "third_party/lammps/src/pair*.cpp"
+        - "third_party/lammps/src/pair*.h"
+        - "third_party/lammps/src/neighbor*.cpp"
+        - "third_party/lammps/src/neighbor*.h"
+        - "third_party/lammps/src/npair*.cpp"
+        - "third_party/lammps/src/npair*.h"
+        - "third_party/lammps/src/comm*.cpp"
+        - "third_party/lammps/src/comm*.h"
+        - "third_party/lammps/src/compute*.cpp"
+        - "third_party/lammps/src/compute*.h"
+        - "third_party/lammps/src/kspace*.cpp"
+        - "third_party/lammps/src/kspace*.h"
+        - "third_party/lammps/src/OPENMP/*.cpp"
+        - "third_party/lammps/src/OPENMP/*.h"
+        - "third_party/lammps/src/OPT/*.cpp"
+        - "third_party/lammps/src/OPT/*.h"
+    global:
+      allowed_globs:
+        - "third_party/lammps/src/*.h"
+        - "third_party/lammps/src/*.cpp"
+        - "third_party/lammps/src/**/*.h"
+        - "third_party/lammps/src/**/*.cpp"
+  forbidden_patterns:
+    - "\\bMPI_Abort\\b"
+    - "\\bMPI_Finalize\\b"
+    - "\\bexit\\s*\\("
+  max_lines_changed: 480
+  max_files_changed: 6
+  max_context_chars: 120000
+  max_snippets: 12
+  debug_max_attempts: 2
+
+variants_prefer_mode: exclusive
+variants:
+  - id: "openmp_backend"
+    when:
+      run_args_contains:
+        - "-sf omp"
+        - "-suffix omp"
+        - "-pk omp"
+    prefer_globs:
+      - "third_party/lammps/src/OPENMP/pair_*_omp.cpp"
+      - "third_party/lammps/src/OPENMP/pair_*_omp.h"
+      - "third_party/lammps/src/pair_*_omp.cpp"
+      - "third_party/lammps/src/pair_*_omp.h"
+  - id: "opt_backend"
+    when:
+      run_args_contains:
+        - "-sf opt"
+        - "-suffix opt"
+    prefer_globs:
+      - "third_party/lammps/src/OPT/pair_*_opt.cpp"
+      - "third_party/lammps/src/OPT/pair_*_opt.h"

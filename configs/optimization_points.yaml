@@ -1,0 +1,426 @@
+version: 1
+points:
+  - id: run.omp_threads
+    category: run_config
+    direction: parallelism
+    description: "Thread count sweep for OpenMP runtime."
+    applies_to: ["run_config"]
+    risk: low
+    tags: ["omp", "threads"]
+  - id: run.omp_proc_bind
+    category: run_config
+    direction: affinity
+    description: "Thread binding policy (close/spread/true/false)."
+    applies_to: ["run_config"]
+    risk: low
+    tags: ["omp", "affinity"]
+  - id: run.omp_places
+    category: run_config
+    direction: affinity
+    description: "Thread placement policy (cores/threads/sockets)."
+    applies_to: ["run_config"]
+    risk: low
+    tags: ["omp", "placement"]
+  - id: run.omp_schedule
+    category: run_config
+    direction: imbalance
+    description: "OpenMP schedule policy (static/dynamic/guided)."
+    applies_to: ["run_config"]
+    risk: low
+    tags: ["omp", "schedule"]
+  - id: run.omp_wait_policy
+    category: run_config
+    direction: compute
+    description: "OpenMP wait policy (active/passive)."
+    applies_to: ["run_config"]
+    risk: low
+    tags: ["omp", "wait"]
+  - id: run.omp_dynamic
+    category: run_config
+    direction: parallelism
+    description: "Enable/disable OpenMP dynamic adjustment."
+    applies_to: ["run_config"]
+    risk: low
+    tags: ["omp", "dynamic"]
+  - id: run.omp_nested
+    category: run_config
+    direction: parallelism
+    description: "Enable/disable nested OpenMP."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["omp", "nested"]
+  - id: run.omp_max_active_levels
+    category: run_config
+    direction: parallelism
+    description: "Control max active OpenMP levels."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["omp", "nested"]
+  - id: run.omp_stacksize
+    category: run_config
+    direction: memory
+    description: "Adjust OpenMP stack size."
+    applies_to: ["run_config"]
+    risk: low
+    tags: ["omp", "memory"]
+  - id: run.numa_interleave
+    category: run_config
+    direction: memory
+    description: "NUMA memory interleave/bind."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["numa", "memory"]
+  - id: run.huge_pages
+    category: run_config
+    direction: memory
+    description: "Enable huge pages / THP."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["memory", "tlb"]
+  - id: run.mpi_rank_thread_ratio
+    category: run_config
+    direction: parallelism
+    description: "MPI ranks vs threads ratio sweep."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["mpi", "hybrid"]
+  - id: run.mpi_pinning
+    category: run_config
+    direction: affinity
+    description: "MPI rank pinning policy."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["mpi", "affinity"]
+  - id: run.mpi_collective_algo
+    category: run_config
+    direction: communication
+    description: "Collective algorithm selection (ring/tree)."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["mpi", "collectives"]
+  - id: run.mpi_buffer
+    category: run_config
+    direction: communication
+    description: "MPI buffer and eager/rendezvous thresholds."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["mpi", "buffer"]
+  - id: run.ucx_transport
+    category: run_config
+    direction: communication
+    description: "UCX transport selection (tcp/rc/ud)."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["ucx", "mpi"]
+  - id: run.shm_enable
+    category: run_config
+    direction: communication
+    description: "Shared-memory transport enable/disable."
+    applies_to: ["run_config"]
+    risk: low
+    tags: ["mpi", "shm"]
+  - id: run.power_governor
+    category: run_config
+    direction: compute
+    description: "CPU governor / turbo settings."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["power", "cpu"]
+  - id: run.malloc_allocator
+    category: run_config
+    direction: memory
+    description: "Allocator choice (jemalloc/tcmalloc/system)."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["memory", "allocator"]
+  - id: run.lib_threading
+    category: run_config
+    direction: compute
+    description: "Library thread policy (BLAS/FFT)."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["blas", "fft"]
+
+  - id: io.output_frequency
+    category: input_script
+    direction: io
+    description: "Reduce output frequency."
+    applies_to: ["input_script"]
+    risk: low
+    tags: ["io", "output"]
+  - id: io.checkpoint_frequency
+    category: input_script
+    direction: io
+    description: "Increase checkpoint interval."
+    applies_to: ["input_script"]
+    risk: medium
+    tags: ["io", "checkpoint"]
+  - id: io.async_enable
+    category: run_config
+    direction: io
+    description: "Enable async I/O path."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["io", "async"]
+  - id: io.aggregator_count
+    category: run_config
+    direction: io
+    description: "Tune I/O aggregator count."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["io", "aggregator"]
+  - id: io.stripe_count
+    category: run_config
+    direction: io
+    description: "File system stripe count."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["io", "filesystem"]
+  - id: io.stripe_size
+    category: run_config
+    direction: io
+    description: "File system stripe size."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["io", "filesystem"]
+  - id: io.collective_buffer
+    category: run_config
+    direction: io
+    description: "Collective I/O buffer sizes."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["io", "buffer"]
+  - id: io.compression
+    category: input_script
+    direction: io
+    description: "Enable output compression."
+    applies_to: ["input_script"]
+    risk: medium
+    tags: ["io", "compression"]
+  - id: io.binary_format
+    category: input_script
+    direction: io
+    description: "Prefer binary output formats."
+    applies_to: ["input_script"]
+    risk: low
+    tags: ["io", "format"]
+  - id: io.in_situ
+    category: run_config
+    direction: io
+    description: "In-situ analysis to reduce I/O."
+    applies_to: ["run_config"]
+    risk: medium
+    tags: ["io", "insitu"]
+
+  - id: build.opt_level
+    category: build_config
+    direction: compute
+    description: "Optimization level selection (O2/O3)."
+    applies_to: ["build_config"]
+    risk: low
+    tags: ["build", "opt"]
+  - id: build.lto
+    category: build_config
+    direction: compute
+    description: "Link-time optimization."
+    applies_to: ["build_config"]
+    risk: medium
+    tags: ["build", "lto"]
+  - id: build.pgo
+    category: build_config
+    direction: compute
+    description: "Profile-guided optimization."
+    applies_to: ["build_config"]
+    risk: medium
+    tags: ["build", "pgo"]
+  - id: build.march_native
+    category: build_config
+    direction: compute
+    description: "Target native CPU ISA."
+    applies_to: ["build_config"]
+    risk: medium
+    tags: ["build", "march"]
+  - id: build.mtune
+    category: build_config
+    direction: compute
+    description: "Tune for specific micro-architecture."
+    applies_to: ["build_config"]
+    risk: medium
+    tags: ["build", "mtune"]
+  - id: build.fast_math
+    category: build_config
+    direction: compute
+    description: "Enable fast-math (strict correctness gates)."
+    applies_to: ["build_config"]
+    risk: high
+    tags: ["build", "fastmath"]
+  - id: build.vector_flags
+    category: build_config
+    direction: compute
+    description: "Vectorization flags (simd, fma contract)."
+    applies_to: ["build_config"]
+    risk: medium
+    tags: ["build", "vector"]
+  - id: build.fp_contract
+    category: build_config
+    direction: compute
+    description: "Floating point contraction policy."
+    applies_to: ["build_config"]
+    risk: high
+    tags: ["build", "fp"]
+  - id: build.pkg_openmp
+    category: build_config
+    direction: compute
+    description: "Enable OpenMP package."
+    applies_to: ["build_config"]
+    risk: low
+    tags: ["build", "openmp"]
+  - id: build.pkg_opt
+    category: build_config
+    direction: compute
+    description: "Enable optimized kernel package."
+    applies_to: ["build_config"]
+    risk: low
+    tags: ["build", "opt"]
+
+  - id: patch.loop_blocking
+    category: source_patch
+    direction: memory
+    description: "Loop blocking/tiling for cache locality."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "memory"]
+  - id: patch.loop_fission
+    category: source_patch
+    direction: memory
+    description: "Split optional/flag-guarded diagnostics into a second pass."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "memory"]
+  - id: patch.loop_fusion
+    category: source_patch
+    direction: memory
+    description: "Loop fusion to reduce passes over data."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "memory"]
+  - id: patch.hoist_invariant
+    category: source_patch
+    direction: compute
+    description: "Hoist loop-invariant computations."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "compute"]
+  - id: patch.reduce_temp_arrays
+    category: source_patch
+    direction: memory
+    description: "Eliminate temporary arrays and stores."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "memory"]
+  - id: patch.data_layout_soa
+    category: source_patch
+    direction: memory
+    description: "AoS to SoA data layout transform."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "memory"]
+  - id: patch.restrict_qualifiers
+    category: source_patch
+    direction: compute
+    description: "Add restrict qualifiers for alias analysis."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "vector"]
+  - id: patch.prefetch_hints
+    category: source_patch
+    direction: memory
+    description: "Add prefetch hints in hot loops."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "memory"]
+  - id: patch.alignment_hints
+    category: source_patch
+    direction: compute
+    description: "Add alignment/contiguous hints."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "vector"]
+  - id: patch.vectorization_hints
+    category: source_patch
+    direction: compute
+    description: "Add vectorization pragmas/annotations."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "vector"]
+
+  - id: patch.comm_overlap
+    category: source_patch
+    direction: communication
+    description: "Overlap communication with computation."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "comm"]
+  - id: patch.message_aggregation
+    category: source_patch
+    direction: communication
+    description: "Aggregate small messages."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "comm"]
+  - id: patch.comm_frequency_merge
+    category: source_patch
+    direction: communication
+    description: "Reduce/merge communication frequency."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "comm"]
+  - id: patch.mpi_hoist_out_inner
+    category: source_patch
+    direction: communication
+    description: "Hoist MPI out of inner loops."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "comm"]
+  - id: patch.partition_rebalance
+    category: source_patch
+    direction: imbalance
+    description: "Rebalance partition/work distribution."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "imbalance"]
+  - id: patch.work_stealing
+    category: source_patch
+    direction: imbalance
+    description: "Introduce work stealing or dynamic scheduling."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "imbalance"]
+  - id: patch.chunk_size_tune
+    category: source_patch
+    direction: imbalance
+    description: "Tune chunk sizes for parallel loops."
+    applies_to: ["source_patch"]
+    risk: medium
+    tags: ["patch", "imbalance"]
+  - id: patch.spatial_decomp
+    category: source_patch
+    direction: imbalance
+    description: "Spatial decomposition adjustments."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "imbalance"]
+  - id: patch.ghost_layer_tune
+    category: source_patch
+    direction: communication
+    description: "Ghost layer exchange tuning."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "comm"]
+  - id: patch.algorithm_switch
+    category: source_patch
+    direction: compute
+    description: "Algorithmic alternative selection."
+    applies_to: ["source_patch"]
+    risk: high
+    tags: ["patch", "algo"]

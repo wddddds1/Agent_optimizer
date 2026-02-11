@@ -28,14 +28,20 @@ class OptimizerAgent:
         policy: Dict[str, object],
         profile: ProfileReport,
         exclude_action_ids: List[str],
+        memory_keep_action_ids: Optional[List[str]] = None,
         system_caps: Optional[Dict[str, object]] = None,
     ) -> List[CandidateList]:
         candidate_lists: List[CandidateList] = []
+        keep_set = set(memory_keep_action_ids or [])
         family_actions: Dict[str, List[ActionIR]] = {}
         for family in plan.chosen_families:
             family_pool = [a for a in actions if a.family == family]
             filtered = filter_actions(family_pool, ctx, [family], policy)
-            filtered = [a for a in filtered if a.action_id not in exclude_action_ids]
+            filtered = [
+                a
+                for a in filtered
+                if a.action_id in keep_set or a.action_id not in exclude_action_ids
+            ]
             if filtered:
                 family_actions[family] = filtered
 
@@ -50,7 +56,12 @@ class OptimizerAgent:
                 ctx,
             )
             if llm_lists:
-                return _dedupe_candidate_lists(llm_lists, plan)
+                return _ensure_memory_keep(
+                    _dedupe_candidate_lists(llm_lists, plan),
+                    family_actions,
+                    keep_set,
+                    plan.max_candidates,
+                )
 
         for family, filtered in family_actions.items():
             candidates = filtered[: plan.max_candidates]
@@ -62,7 +73,12 @@ class OptimizerAgent:
                     confidence=0.6,
                 )
             )
-        return _dedupe_candidate_lists(candidate_lists, plan)
+        return _ensure_memory_keep(
+            _dedupe_candidate_lists(candidate_lists, plan),
+            family_actions,
+            keep_set,
+            plan.max_candidates,
+        )
 
     def _try_llm(
         self,
@@ -140,6 +156,7 @@ def _build_llm_candidates(
         action_ids = group.action_ids
         assumptions = group.assumptions
         confidence_val = float(group.confidence)
+        rationales = group.action_rationales or {}
         candidates: List[ActionIR] = []
         for action_id in action_ids:
             action = actions_by_id.get(str(action_id))
@@ -151,6 +168,10 @@ def _build_llm_candidates(
                 continue
             if action in candidates:
                 continue
+            if action.notes is None:
+                note = rationales.get(action.action_id, "") or group.family_rationale
+                if note:
+                    action.notes = note
             candidates.append(action)
             if len(candidates) >= plan.max_candidates:
                 break
@@ -163,6 +184,40 @@ def _build_llm_candidates(
                     confidence=confidence_val,
                 )
             )
+    return candidate_lists
+
+
+def _ensure_memory_keep(
+    candidate_lists: List[CandidateList],
+    family_actions: Dict[str, List[ActionIR]],
+    keep_set: set[str],
+    max_candidates: int,
+) -> List[CandidateList]:
+    if not keep_set:
+        return candidate_lists
+    by_family: Dict[str, CandidateList] = {c.family: c for c in candidate_lists}
+    for family, actions in family_actions.items():
+        keep_actions = [a for a in actions if a.action_id in keep_set]
+        if not keep_actions:
+            continue
+        candidate_list = by_family.get(family)
+        if candidate_list is None:
+            candidate_list = CandidateList(
+                family=family,
+                candidates=[],
+                assumptions=[],
+                confidence=0.6,
+            )
+            candidate_lists.append(candidate_list)
+            by_family[family] = candidate_list
+        existing = {a.action_id for a in candidate_list.candidates}
+        for action in keep_actions:
+            if action.action_id in existing:
+                continue
+            candidate_list.candidates.insert(0, action)
+            existing.add(action.action_id)
+        if len(candidate_list.candidates) > max_candidates:
+            candidate_list.candidates = candidate_list.candidates[:max_candidates]
     return candidate_lists
 
 

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from schemas.plan_ir import EvaluationPlan, FusePlan, PlanIR, StopPlan
 from schemas.analysis_ir import AnalysisResult
 from schemas.job_ir import Budgets
+from schemas.profile_report import ProfileReport
 from orchestrator.llm_client import LLMClient
 
 
@@ -24,8 +25,15 @@ class PlannerAgent:
         history: Dict[str, object],
         availability: Optional[Dict[str, int]] = None,
         cost_model: Optional[Dict[str, float]] = None,
+        context: Optional[Dict[str, object]] = None,
     ) -> PlanIR:
-        llm_plan = self._try_llm(iteration_id, analysis, budgets, history, availability, cost_model)
+        if (not analysis.allowed_families) and availability:
+            analysis.allowed_families = [
+                fam for fam, count in availability.items() if count > 0
+            ]
+        llm_plan = self._try_llm(
+            iteration_id, analysis, budgets, history, availability, cost_model, context
+        )
         if llm_plan is not None:
             normalized = _normalize_plan(
                 llm_plan, analysis, self.defaults, budgets, availability, cost_model
@@ -53,6 +61,17 @@ class PlannerAgent:
         )
         return _apply_cost_guard(plan, cost_model, self.defaults)
 
+    def analyze(
+        self,
+        profile: ProfileReport,
+        history: Dict[str, object],
+        policy: Dict[str, object],
+        case_tags: List[str],
+        profile_features: Optional[Dict[str, object]] = None,
+    ) -> AnalysisResult:
+        del history, policy, case_tags, profile_features
+        return _heuristic_analysis(profile)
+
     def _try_llm(
         self,
         iteration_id: int,
@@ -61,6 +80,7 @@ class PlannerAgent:
         history: Dict[str, object],
         availability: Optional[Dict[str, int]],
         cost_model: Optional[Dict[str, float]],
+        context: Optional[Dict[str, object]],
     ) -> Optional[PlanIR]:
         if not self.llm_client or not self.llm_client.config.enabled:
             return None
@@ -68,6 +88,7 @@ class PlannerAgent:
         payload = {
             "iteration_id": iteration_id,
             "analysis": analysis.model_dump(),
+            "context": context or {},
             "budgets": budgets.model_dump(),
             "history": history,
             "defaults": self.defaults,
@@ -181,6 +202,75 @@ def _apply_cost_guard(
 def _load_prompt(name: str) -> str:
     path = Path(__file__).resolve().parents[2] / "prompts" / "agents" / f"{name}.md"
     return path.read_text(encoding="utf-8")
+
+
+def _analysis_confidence(profile: ProfileReport) -> float:
+    timing = profile.timing_breakdown or {}
+    total = timing.get("total", 0.0) or 0.0
+    if total <= 0.0:
+        return 0.2
+    keys = ["pair", "kspace", "neigh", "comm", "modify", "output"]
+    present = [key for key in keys if timing.get(key) is not None]
+    positive = [key for key in keys if (timing.get(key) or 0.0) > 0.0]
+    if len(positive) >= 2:
+        return 0.9
+    if len(present) >= 2:
+        return 0.6
+    return 0.3
+
+
+def _build_rationale(
+    bottleneck: str,
+    comm_ratio: float,
+    output_ratio: float,
+    confidence: float,
+) -> str:
+    if confidence < 0.5:
+        return "profiling signal weak; allow low-risk run_config only"
+    if bottleneck == "comm":
+        return f"comm ratio {comm_ratio:.2f} suggests communication tuning"
+    if bottleneck == "io":
+        return f"output ratio {output_ratio:.2f} suggests IO tuning"
+    return "compute-dominant; prioritize parallel strategy and affinity"
+
+
+def _heuristic_analysis(profile: ProfileReport) -> AnalysisResult:
+    timing = profile.timing_breakdown or {}
+    total = timing.get("total", 0.0) or 0.0
+    comm_ratio = (timing.get("comm", 0.0) / total) if total else 0.0
+    output_ratio = (timing.get("output", 0.0) / total) if total else 0.0
+    bottleneck = "compute"
+    if comm_ratio > 0.2:
+        bottleneck = "comm"
+    if output_ratio > 0.2:
+        bottleneck = "io"
+    confidence = _analysis_confidence(profile)
+    allowed = {
+        "parallel_omp",
+        "affinity_tune",
+        "runtime_backend_select",
+        "runtime_lib",
+        "sched_granularity",
+        "wait_policy",
+        "neighbor_tune",
+        "output_tune",
+    }
+    if bottleneck == "comm":
+        allowed.update({"comm_tune", "load_balance"})
+    if bottleneck == "io":
+        allowed.update({"io_tune", "output_tune"})
+    if confidence >= 0.7:
+        allowed.update({"build_config", "source_patch", "lib_threading", "omp_pkg", "accuracy_tune"})
+    rationale = _build_rationale(bottleneck, comm_ratio, output_ratio, confidence)
+    return AnalysisResult(
+        bottleneck=bottleneck,
+        allowed_families=sorted(allowed),
+        allowed_transforms=[],
+        forbidden_transforms=[],
+        risk_overrides={},
+        confidence=confidence,
+        rationale=rationale,
+    )
 
 
 def _build_evaluation(raw: Dict[str, object]) -> EvaluationPlan:
