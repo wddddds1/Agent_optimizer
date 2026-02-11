@@ -23,6 +23,11 @@ class BuildOutput:
     provenance: Dict[str, object]
     build_seconds: Optional[float] = None
 
+    @property
+    def app_bin_path(self) -> Optional[str]:
+        """Alias for lammps_bin_path (generic name)."""
+        return self.lammps_bin_path
+
 
 def build_job(
     build_cfg: Dict[str, object],

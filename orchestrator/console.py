@@ -60,7 +60,7 @@ class ConsoleUI:
         self._section("运行开始")
         self._kv("算例", job.case_id)
         self._kv("工作目录", job.workdir)
-        self._kv("可执行文件", job.lammps_bin)
+        self._kv("可执行文件", job.app_bin)
         self._kv(
             "预算",
             f"迭代={job.budgets.max_iters} 运行={job.budgets.max_runs} 限时={job.budgets.max_wall_seconds}s",

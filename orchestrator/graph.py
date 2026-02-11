@@ -3829,7 +3829,7 @@ def _filter_mpi_actions(
     from skills.hardware_probe import check_binary_mpi_support
 
     # Only check once; cache result
-    has_mpi = check_binary_mpi_support(job.lammps_bin)
+    has_mpi = check_binary_mpi_support(job.app_bin)
     if has_mpi:
         return actions
 
@@ -7964,7 +7964,7 @@ def _run_experiment(
         lammps_bin = Path(build_cfg_final.get("lammps_bin") or "lmp")
         run_bin = run_dir / "build" / lammps_bin
     else:
-        run_bin = Path(base_job_snapshot.lammps_bin)
+        run_bin = Path(base_job_snapshot.app_bin)
     run_cmd = _format_run_command(
         run_bin,
         run_args,
@@ -8153,7 +8153,8 @@ def _run_experiment(
                 build_config_diff_path = _write_build_config_diff(run_dir, build_cfg, final_build_cfg)
                 build_output = build_job(final_build_cfg, source_root, run_dir)
                 if not build_output.lammps_bin_path:
-                    raise RuntimeError("build did not produce lammps binary")
+                    raise RuntimeError("build did not produce application binary")
+                job_snapshot.app_bin = build_output.lammps_bin_path
                 job_snapshot.lammps_bin = build_output.lammps_bin_path
                 _append_trace(
                     trace_events,
@@ -8168,7 +8169,7 @@ def _run_experiment(
                     },
                 )
 
-            binary_provenance = collect_binary_provenance(job_snapshot.lammps_bin, run_dir)
+            binary_provenance = collect_binary_provenance(job_snapshot.app_bin, run_dir)
             repro_script_path = _write_repro_script(
                 run_dir=run_dir,
                 workdir=workdir,
@@ -9065,8 +9066,8 @@ def _build_run_manifest(
     repro_script_path: Optional[str],
 ) -> Dict[str, object]:
     git_status = get_git_status(repo_root)
-    lammps_hash = _sha256_file(job.lammps_bin)
-    input_hash = _sha256_file(job.input_script)
+    lammps_hash = _sha256_file(job.app_bin)
+    input_hash = _sha256_file(job.input_script) if job.input_script else None
     artifacts = {
         "stdout": result.logs[0] if result.logs else None,
         "stderr": result.logs[1] if len(result.logs) > 1 else None,
@@ -9117,7 +9118,7 @@ def _build_run_manifest(
             "dirty": git_status.get("dirty"),
         },
         "binary_version": {
-            "path": job.lammps_bin,
+            "path": job.app_bin,
             "sha256": lammps_hash,
         },
         "input": {
@@ -9458,7 +9459,7 @@ def _write_repro_script(
         "set -e",
         f"cd {shlex.quote(str(workdir))}",
         *env_lines,
-        f"{shlex.quote(str(job.lammps_bin))} {args}",
+        f"{shlex.quote(str(job.app_bin))} {args}",
         "",
     ]
     repro_path.write_text("\n".join(lines), encoding="utf-8")

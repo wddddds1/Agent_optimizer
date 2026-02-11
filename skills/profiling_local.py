@@ -45,7 +45,7 @@ def profile_job(
         except FileNotFoundError:
             pass
 
-    timing_breakdown = parse_lammps_timing(log_text)
+    timing_breakdown = parse_lammps_timing(log_text) if job.app == "lammps" else {}
     system_metrics = parse_time_output(time_text)
     system_metrics.update(run_output.system_metrics)
 

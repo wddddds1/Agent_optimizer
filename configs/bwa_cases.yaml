@@ -1,0 +1,13 @@
+cases:
+  bwa_chr1:
+    app: bwa
+    workdir: "examples/bwa/bwa_human_chr1"
+    app_bin: "third_party/bwa/bwa"
+    input_script: ""
+    run_args: ["mem", "-t", "1", "chr1.fa", "reads.fq"]
+    env: {}
+    budgets:
+      max_iters: 5
+      max_runs: 30
+      max_wall_seconds: 3600
+    tags: ["bwa", "alignment", "chr1", "thread_compare"]

@@ -91,7 +91,7 @@ def verify_run(
             except FileNotFoundError:
                 baseline_text = ""
         if not metrics and not series:
-            if not use_agent:
+            if not use_agent and job.app == "lammps":
                 reasons.append("no thermo metrics available for correctness check")
             correctness_metrics["no_thermo_metrics"] = True
         else:

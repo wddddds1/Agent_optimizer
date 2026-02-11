@@ -59,6 +59,13 @@ families:
     description: "Source code patches (requires rebuild)."
     expected_effect: ["compute_opt", "mem_locality", "comm_reduce", "imbalance_reduce"]
 
+  - id: parallel_pthread
+    description: "Pthread thread count exploration (for apps using -t N)."
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    applies_to: ["run_config"]
+    gates: ["runtime", "variance"]
+
 actions:
   - action_id: parallel_omp.template_close_cores
     family: parallel_omp
@@ -2851,5 +2858,26 @@ actions:
     risk_level: "low"
     verification_plan:
       gates: ["runtime", "correctness", "variance"]
+      thresholds:
+        variance_cv_max: 0.05
+
+  # ---------- pthread thread exploration (BWA, etc.) ----------
+  - action_id: parallel_pthread.template_threads
+    family: parallel_pthread
+    description: "Threads={threads} via -t flag."
+    applies_to: ["run_config"]
+    parameters:
+      run_args:
+        set_flags:
+          - flag: "-t"
+            values: ["{threads}"]
+            arg_count: 1
+      dynamic_threads: true
+    preconditions: []
+    constraints: []
+    expected_effect: ["compute_opt"]
+    risk_level: "low"
+    verification_plan:
+      gates: ["runtime", "variance"]
       thresholds:
         variance_cv_max: 0.05

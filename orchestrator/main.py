@@ -95,7 +95,7 @@ def _init_artifacts_session(artifacts_root: Path) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="HPC agent platform MVP")
-    parser.add_argument("--case", required=True, help="Case ID from configs/lammps_cases.yaml")
+    parser.add_argument("--case", required=True, help="Case ID from configs/*_cases.yaml")
     parser.add_argument("--config-dir", default="configs", help="Config directory")
     parser.add_argument(
         "--ui",
@@ -186,38 +186,54 @@ def main() -> None:
 
     config_dir = Path(args.config_dir)
     env_cfg = yaml.safe_load((config_dir / "env.local.yaml").read_text(encoding="utf-8"))
-    cases_cfg = yaml.safe_load((config_dir / "lammps_cases.yaml").read_text(encoding="utf-8"))
-    case = cases_cfg["cases"].get(args.case)
+
+    # Search all *_cases.yaml files for the requested case ID
+    case = None
+    for cases_file in sorted(config_dir.glob("*_cases.yaml")):
+        cases_cfg = yaml.safe_load(cases_file.read_text(encoding="utf-8")) or {}
+        case = (cases_cfg.get("cases") or {}).get(args.case)
+        if case is not None:
+            break
     if not case:
         raise SystemExit(f"Unknown case_id: {args.case}")
 
+    app = case.get("app", "lammps")
     default_env = env_cfg.get("default_env", {})
     env = {**default_env, **case.get("env", {})}
     if args.fixed_threads is not None:
-        env["OMP_NUM_THREADS"] = str(int(args.fixed_threads))
+        if app == "lammps":
+            env["OMP_NUM_THREADS"] = str(int(args.fixed_threads))
+        # BWA thread count is in run_args (-t N), not env var
     budgets = Budgets(**case["budgets"])
     if args.max_iters is not None:
         budgets.max_iters = int(args.max_iters)
     if args.max_runs is not None:
         budgets.max_runs = int(args.max_runs)
 
-    lammps_bin = case.get("lammps_bin") or env_cfg["lammps_bin"]
-    lammps_bin_path = Path(lammps_bin)
-    if not lammps_bin_path.is_absolute():
-        lammps_bin_path = (config_dir.parent / lammps_bin_path).resolve()
+    app_bin = case.get("app_bin") or case.get("lammps_bin") or env_cfg.get("app_bin") or env_cfg.get("lammps_bin", "")
+    app_bin_path = Path(app_bin)
+    if not app_bin_path.is_absolute():
+        app_bin_path = (config_dir.parent / app_bin_path).resolve()
 
     workdir = Path(case["workdir"])
     if not workdir.is_absolute():
         workdir = (config_dir.parent / workdir).resolve()
-    input_script = Path(case["input_script"])
-    if not input_script.is_absolute():
-        input_script = (config_dir.parent / input_script).resolve()
+
+    input_script_raw = case.get("input_script", "")
+    if input_script_raw:
+        input_script = Path(input_script_raw)
+        if not input_script.is_absolute():
+            input_script = (config_dir.parent / input_script).resolve()
+        input_script_str = str(input_script)
+    else:
+        input_script_str = ""
 
     job = JobIR(
+        app=app,
         case_id=args.case,
         workdir=str(workdir),
-        lammps_bin=str(lammps_bin_path),
-        input_script=str(input_script),
+        app_bin=str(app_bin_path),
+        input_script=input_script_str,
         env=env,
         run_args=case.get("run_args", []),
         budgets=budgets,

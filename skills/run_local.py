@@ -62,11 +62,14 @@ class RunOutput:
     samples: List[float]
 
 
-def _extract_log_path(run_args: List[str], workdir: Path) -> Path:
+def _extract_log_path(run_args: List[str], workdir: Path, artifacts_dir: Optional[Path] = None) -> Path:
     if "-log" in run_args:
         idx = run_args.index("-log")
         if idx + 1 < len(run_args):
             return (workdir / run_args[idx + 1]).resolve()
+    # For non-LAMMPS apps (no -log flag), fall back to stdout capture
+    if artifacts_dir is not None:
+        return (artifacts_dir / "stdout.log").resolve()
     return (workdir / "log.lammps").resolve()
 
 
@@ -161,7 +164,7 @@ def run_job(
         time_file = time_output_path if repeats == 1 else artifacts_dir / f"time_{idx}.log"
 
         cmd = build_launch_cmd(
-            job.lammps_bin,
+            job.app_bin,
             run_args,
             launcher_cfg,
             time_command,
@@ -180,7 +183,7 @@ def run_job(
             monitor_proc = _select_monitor_process(
                 ps_proc,
                 prefer_child=bool(time_command) or _has_launcher,
-                target_bin=job.lammps_bin,
+                target_bin=job.app_bin,
             )
             stop_event = threading.Event()
             monitor_thread = threading.Thread(
@@ -202,7 +205,9 @@ def run_job(
                 except FileNotFoundError:
                     pass
 
-    log_path = _extract_log_path(run_args, workdir)
+    # For non-LAMMPS apps without a -log flag, use the stdout capture file
+    _log_artifacts = artifacts_dir if job.app != "lammps" else None
+    log_path = _extract_log_path(run_args, workdir, artifacts_dir=_log_artifacts)
 
     mean_runtime = sum(runtime_samples) / len(runtime_samples) if runtime_samples else 0.0
     return RunOutput(

@@ -1,0 +1,11 @@
+app: bwa
+patch_root: "third_party/bwa"
+patch_rules:
+  allowed_globs:
+    - "third_party/bwa/*.c"
+    - "third_party/bwa/*.h"
+  forbidden_patterns:
+    - "\\bexit\\s*\\("
+    - "\\babort\\s*\\("
+  max_lines_changed: 200
+  max_files_changed: 4

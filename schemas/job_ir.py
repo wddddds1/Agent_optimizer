@@ -17,11 +17,12 @@ class Budgets(BaseModel):
 
 
 class JobIR(BaseModel):
-    app: Literal["lammps"] = "lammps"
+    app: Literal["lammps", "bwa"] = "lammps"
     case_id: str
     workdir: str
-    lammps_bin: str
-    input_script: str
+    app_bin: str = ""
+    lammps_bin: str = ""  # backward compat alias for app_bin
+    input_script: str = ""
     env: Dict[str, str] = Field(default_factory=dict)
     run_args: List[str] = Field(default_factory=list)
     objective: Objective = Field(default_factory=Objective)
@@ -31,10 +32,16 @@ class JobIR(BaseModel):
 
     @model_validator(mode="after")
     def _validate_paths(self) -> "JobIR":
+        # Sync app_bin ↔ lammps_bin for backward compatibility
+        if self.app_bin and not self.lammps_bin:
+            self.lammps_bin = self.app_bin
+        elif self.lammps_bin and not self.app_bin:
+            self.app_bin = self.lammps_bin
+        if not self.app_bin:
+            raise ValueError("app_bin (or lammps_bin) must be set")
         if not self.workdir:
             raise ValueError("workdir must be set")
-        if not self.lammps_bin:
-            raise ValueError("lammps_bin must be set")
-        if not self.input_script:
-            raise ValueError("input_script must be set")
+        # input_script only required for LAMMPS
+        if self.app == "lammps" and not self.input_script:
+            raise ValueError("input_script must be set for LAMMPS")
         return self
