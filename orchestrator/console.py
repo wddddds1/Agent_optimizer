@@ -53,7 +53,6 @@ class ConsoleUI:
         baseline_repeats: int,
         baseline_stat: str,
         validate_top1_repeats: int,
-        min_improvement_pct: float,
     ) -> None:
         if not self.enabled:
             return
@@ -74,7 +73,7 @@ class ConsoleUI:
         self._kv("产物目录", artifacts_dir)
         self._kv(
             "基线",
-            f"重复={baseline_repeats} 统计={baseline_stat} 复跑Top1={validate_top1_repeats} 最小提升={min_improvement_pct:.2%}",
+            f"重复={baseline_repeats} 统计={baseline_stat} 复跑Top1={validate_top1_repeats}",
         )
         self._print("")
 

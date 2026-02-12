@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import time
 import os
 import shlex
@@ -106,17 +107,21 @@ def collect_binary_provenance(lammps_bin: str, run_dir: Path) -> Dict[str, objec
         [str(binary_path), "-h"], lmp_help_path, env=os.environ.copy(), check=False
     )
 
-    otool_path = run_dir / "lmp_otool.txt"
-    otool_exit = _run_cmd(
-        ["otool", "-L", str(binary_path)], otool_path, env=os.environ.copy(), check=False
+    deps_path = run_dir / "lmp_deps.txt"
+    if platform.system() == "Darwin":
+        deps_cmd = ["otool", "-L", str(binary_path)]
+    else:
+        deps_cmd = ["ldd", str(binary_path)]
+    deps_exit = _run_cmd(
+        deps_cmd, deps_path, env=os.environ.copy(), check=False
     )
 
     return {
         "lammps_bin": str(binary_path),
         "lmp_help_path": str(lmp_help_path),
         "lmp_help_exit_code": lmp_help_exit,
-        "otool_path": str(otool_path),
-        "otool_exit_code": otool_exit,
+        "otool_path": str(deps_path),
+        "otool_exit_code": deps_exit,
     }
 
 

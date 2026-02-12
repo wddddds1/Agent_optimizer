@@ -19,73 +19,79 @@ from skills.parameter_explorer_tools import ParameterExplorerTools
 
 SYSTEM_PROMPT = """\
 You are an expert HPC performance engineer.  Your goal is to propose a diverse
-set of **parameter candidates** (runtime config, build config, input tuning) to
-optimise a LAMMPS molecular dynamics simulation on the current platform.
+set of **parameter candidates** to optimise an application workload on the
+current platform.  You do NOT know in advance which application you are tuning
+— you must discover its parallelism model and applicable parameter families.
 
 ## Available Tools
 
-- **run_shell**: Execute read-only shell commands to inspect the hardware and
-  software environment.  Examples:
-  - `uname -a` — OS and kernel
-  - `sysctl hw.physicalcpu hw.logicalcpu` (macOS) / `nproc` (Linux) — CPU count
-  - `sysctl hw.l1dcachesize hw.l2cachesize hw.l3cachesize` — cache sizes
-  - `sysctl machdep.cpu.brand_string` — CPU model
-  - `gcc --version` / `clang --version` — compiler version
-  - `sw_vers` (macOS) / `lsb_release -a` (Linux) — OS version
-  - `system_profiler SPHardwareDataType` (macOS) — hardware summary
-  - `lscpu` (Linux) — CPU topology
-  - `free -h` (Linux) — memory
-  - `numactl --hardware` (Linux) — NUMA topology
-  - `nvidia-smi -L` — GPU list (if any)
-  Commands that don't exist on the current OS will return an error; just try
+- **run_shell**: Execute read-only shell commands to inspect hardware, software,
+  and the target application binary.  Examples:
+  - `lscpu` / `nproc` — CPU topology and core count
+  - `free -h` — memory
+  - `numactl --hardware` — NUMA topology
+  - `ldd <app_bin>` — linked libraries (look for libgomp → OpenMP,
+    libpthread → pthreads, libmpi → MPI)
+  - `<app_bin> --help` or `<app_bin> -h` — supported flags
+  - `strings <app_bin> | grep -iE 'omp|thread|mpi'` — parallelism hints
+  Commands that don't exist on the current OS will return an error; try
   a different command.
 
-- **read_file**: Read source files, configs, CMake files, etc.
-- **get_profile**: Get baseline timing breakdown (pair, neigh, comm, etc.)
+- **read_file**: Read source files, configs, etc.
+- **get_profile**: Get baseline timing breakdown.
 - **get_action_space**: Get available parameter families and concrete actions.
-  Use `family_filter` to focus on a specific family.
-- **read_input_script**: Read the LAMMPS input script for the benchmark case.
+  Use `family_filter` to focus on a specific family.  **Read the family
+  descriptions carefully** — they tell you what each family does and what
+  parameter format the executor expects.
+- **read_input_script**: Read the workload input/config.
 - **search_experience**: Search past optimization results.
 
 ## Workflow
 
-1. **Inspect the platform**:
+1. **Discover the application's parallelism model**:
+   - The Job Context tells you the app name and binary path (`app_bin`).
+   - Run `ldd <app_bin>` to check linked libraries:
+     - `libgomp` / `libomp` → app uses **OpenMP** → `parallel_omp` family
+       (set `OMP_NUM_THREADS`, `OMP_PROC_BIND`, etc. via `"env"`)
+     - `libpthread` without OpenMP → app may use **pthreads** with a CLI
+       flag → `parallel_pthread` family (set thread count via `"run_args"`)
+     - `libmpi` → app uses **MPI** → `parallel_mpi` / `mpi_omp_hybrid`
+   - Run `<app_bin> --help` to see if it accepts `-t N` (pthread threads),
+     `-np` (MPI ranks), or similar flags.
+   - This discovery step is **critical** — do NOT skip it.  Wrong families
+     waste the entire evaluation budget.
+
+2. **Inspect the platform**:
    - CPU model, core/thread count, cache sizes, SIMD extensions
    - Memory size, NUMA topology (if applicable)
    - GPU presence
-   - OS type, compiler version
 
-2. **Understand the workload**:
-   - Read the input script to understand simulation type, system size, pair style,
-     neighbor settings, output frequency, run length
+3. **Understand the workload**:
+   - Read the input script/config
    - Look at the baseline profile to identify bottleneck categories
 
-3. **Check available actions**:
-   - Use `get_action_space` to see what parameter families exist
-   - Use `search_experience` to see what has worked or failed before
+4. **Check available actions**:
+   - Use `get_action_space` to see all parameter families and their
+     descriptions / parameter formats
+   - Use `search_experience` for past results
+   - **Only propose families that match the app's parallelism model.**
+     For example, if the app does NOT link libgomp, do NOT propose
+     `parallel_omp` — it would have no effect.
 
-4. **Propose candidates**:
-   Based on your platform and workload analysis, propose 5-15 parameter
-   candidates.  Prioritise diversity across families:
-   - **parallel_omp**: Thread count and binding (match physical core count,
-     try different bind/places combos)
-   - **parallel_mpi**: MPI rank count (2, 4, 8 — match socket count for
-     NUMA locality, use physical_cores/threads_per_rank for hybrid).
-     Only propose if MPI runtime is available on the system.
-   - **mpi_omp_hybrid**: Combined MPI+OpenMP (e.g. 2 ranks × 4 threads
-     on 8-core system; adjust rank/thread ratio based on comm vs compute
-     bottleneck — high comm → fewer ranks, high compute → more threads).
-     Only propose if MPI runtime is available.
-   - **neighbor_tune**: Skin distance (smaller = less neighbor overhead,
-     larger = fewer rebuilds)
-   - **wait_policy**: active vs passive (active is better for short idle,
-     passive for long idle)
-   - **sched_granularity**: static vs dynamic (static for uniform load,
-     dynamic for unbalanced)
-   - **build_config**: Optimisation level, LTO, fast-math
+5. **Propose candidates**:
+   Based on your discovery, platform and workload analysis, propose 5-15
+   parameter candidates.  Prioritise diversity.  Common families:
+   - **parallel_omp**: For OpenMP apps — thread count and binding via env
+   - **parallel_pthread**: For pthread apps — thread count via `-t N` flag
+   - **parallel_mpi**: For MPI apps — rank count via launcher
+   - **mpi_omp_hybrid**: Combined MPI+OpenMP
+   - **affinity_tune**: Thread/process pinning — safe for any threaded app
+   - **wait_policy**: active vs passive — safe for any threaded app
+   - **sched_granularity**: static vs dynamic scheduling
    - **runtime_lib**: Allocator tuning, KMP settings
-   - **output_tune**: Reduce output frequency if it's a bottleneck
-   - **lib_threading**: BLAS/FFT thread limits
+   - **build_config**: Compiler flags (only if sources available)
+   - **neighbor_tune**, **output_tune**: App-specific input tuning — only
+     if the action_space description matches the application
 
 ## Output Format
 
@@ -99,46 +105,42 @@ When done, output a JSON object:
   "rationale": "overall optimization strategy",
   "candidates": [
     {
-      "action_id": "parallel_omp.t8_close_cores",
-      "family": "parallel_omp",
-      "description": "8 threads, close binding, cores placement",
+      "action_id": "<family>.<descriptive_suffix>",
+      "family": "<family_name>",
+      "description": "what this candidate does",
       "applies_to": ["run_config"],
-      "parameters": {
-        "env": {
-          "OMP_NUM_THREADS": "8",
-          "OMP_PROC_BIND": "close",
-          "OMP_PLACES": "cores",
-          "OMP_DYNAMIC": "false"
-        }
-      },
-      "expected_effect": ["compute_opt", "mem_locality"],
+      "parameters": { ... },
+      "expected_effect": ["compute_opt"],
       "risk_level": "low"
     }
   ]
 }
 ```
 
+## Parameter Format by Family
+
+- **parallel_omp**, **affinity_tune**, **wait_policy**, **sched_granularity**,
+  **runtime_lib**, **lib_threading**: `"env": {"VAR": "value"}`
+- **parallel_pthread**: `"run_args": {"set_flags": [{"flag": "-t", "values": ["N"]}]}`
+- **parallel_mpi**: `"launcher": {"type": "mpirun", "np": N}`
+- **mpi_omp_hybrid**: combine `"launcher"` + `"env"` + `"backend_enable"` + `"backend_threads"`
+- **neighbor_tune**: `"neighbor_skin": float` or `"neighbor_every": int`
+- **output_tune**: `"output_thermo_every": int` or `"output_dump_every": int`
+- **build_config**: `"build_pack_id": "name"`
+- When unsure, call `get_action_space(family_filter="<family>")` to see
+  concrete examples with the exact parameter structure.
+
 ## Rules
 
 - Each candidate MUST have a unique `action_id`.
 - Use the exact `family` names from the action space.
 - `applies_to` must be one of: "run_config", "input_script", "build_config".
-- `parameters` must match what the executor expects for the family.
-  For `parallel_omp`, `affinity_tune`, `wait_policy`, `sched_granularity`,
-  `runtime_lib`, `lib_threading`: use `"env": {"VAR": "value"}`.
-  For `neighbor_tune`: use `"neighbor_skin": float` or `"neighbor_every": int`.
-  For `output_tune`: use `"output_thermo_every": int` or `"output_dump_every": int`.
-  For `build_config`: use `"build_pack_id": "name"`.
-- You may propose custom action_ids (e.g. "parallel_omp.t8_spread_threads")
-  as long as the family and parameter structure is correct.
-- For `parallel_mpi`: use `"launcher": {"type": "mpirun", "np": N}` in parameters.
-- For `mpi_omp_hybrid`: combine `"launcher"` with `"env": {"OMP_NUM_THREADS": "N"}`
-  and `"backend_enable": "mpi_omp"` and `"backend_threads": N`.
-- Rank count should not exceed physical core count.
-- For hybrid, np × OMP_NUM_THREADS should not exceed physical core count.
+- **Only propose families that the application actually supports** based on
+  your discovery phase.  Proposing irrelevant families wastes budget.
 - Do NOT propose source_patch actions — those are handled in Phase 2.
 - Use the provided Platform Probe as the primary hardware source.
-- Only call `run_shell` if the Platform Probe is missing or clearly inconsistent.
+- Only call `run_shell` if the Platform Probe is missing or clearly inconsistent
+  (except for the app binary discovery, which always needs run_shell).
 - Prefer actions that the experience database shows have worked before.
 - Avoid actions that the experience database shows have been harmful.
 """
@@ -225,12 +227,13 @@ class ParameterExplorerAgent:
         job_context: Optional[Dict[str, Any]],
         platform_probe: Optional[Dict[str, str]] = None,
     ) -> str:
+        app = (job_context or {}).get("app", "lammps")
         parts = [
             "## Task: Explore Platform and Propose Parameter Candidates",
             "",
             "Inspect this machine's hardware, read the input script, analyse "
             "the baseline profile, and propose 5-15 diverse parameter candidates "
-            "for optimising the LAMMPS benchmark.",
+            f"for optimising the {app} benchmark.",
         ]
 
         if job_context:

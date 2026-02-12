@@ -133,10 +133,10 @@ def _select_families(
 
 def _priority_families(bottleneck: str) -> List[str]:
     if bottleneck == "comm":
-        return ["comm_tune", "parallel_omp", "omp_pkg", "affinity_tune", "wait_policy"]
+        return ["comm_tune", "parallel_omp", "parallel_pthread", "omp_pkg", "affinity_tune", "wait_policy"]
     if bottleneck == "io":
-        return ["io_tune", "parallel_omp", "affinity_tune", "wait_policy"]
-    return ["parallel_omp", "omp_pkg", "affinity_tune", "wait_policy", "sched_granularity"]
+        return ["io_tune", "parallel_omp", "parallel_pthread", "affinity_tune", "wait_policy"]
+    return ["parallel_omp", "parallel_pthread", "omp_pkg", "affinity_tune", "wait_policy", "sched_granularity"]
 
 
 def _normalize_plan(
@@ -245,8 +245,12 @@ def _heuristic_analysis(profile: ProfileReport) -> AnalysisResult:
     if output_ratio > 0.2:
         bottleneck = "io"
     confidence = _analysis_confidence(profile)
+    # Generic base set: parallelism families for all threading models,
+    # plus safe env-only tuning families.  The downstream availability
+    # filter removes families that have no actions in the action_space.
     allowed = {
         "parallel_omp",
+        "parallel_pthread",
         "affinity_tune",
         "runtime_backend_select",
         "runtime_lib",

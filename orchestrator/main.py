@@ -185,7 +185,15 @@ def main() -> None:
     args = parser.parse_args()
 
     config_dir = Path(args.config_dir)
-    env_cfg = yaml.safe_load((config_dir / "env.local.yaml").read_text(encoding="utf-8"))
+    # Load base config (tracked), then merge machine-local overrides (untracked).
+    env_base_path = config_dir / "env.yaml"
+    env_local_path = config_dir / "env.local.yaml"
+    env_cfg = {}
+    if env_base_path.exists():
+        env_cfg = yaml.safe_load(env_base_path.read_text(encoding="utf-8")) or {}
+    if env_local_path.exists():
+        local_cfg = yaml.safe_load(env_local_path.read_text(encoding="utf-8")) or {}
+        env_cfg = _deep_merge_dicts(env_cfg, local_cfg)
 
     # Search all *_cases.yaml files for the requested case ID
     case = None
@@ -199,7 +207,8 @@ def main() -> None:
 
     app = case.get("app", "lammps")
     default_env = env_cfg.get("default_env", {})
-    env = {**default_env, **case.get("env", {})}
+    app_env = env_cfg.get("app_env", {}).get(app, {})
+    env = {**default_env, **app_env, **case.get("env", {})}
     if args.fixed_threads is not None:
         if app == "lammps":
             env["OMP_NUM_THREADS"] = str(int(args.fixed_threads))

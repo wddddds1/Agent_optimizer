@@ -205,9 +205,12 @@ def run_job(
                 except FileNotFoundError:
                     pass
 
-    # For non-LAMMPS apps without a -log flag, use the stdout capture file
-    _log_artifacts = artifacts_dir if job.app != "lammps" else None
-    log_path = _extract_log_path(run_args, workdir, artifacts_dir=_log_artifacts)
+    # For non-LAMMPS apps without a -log flag, use the actual stdout capture file
+    # (stdout_path already accounts for repeats: stdout.log or stdout_0.log)
+    if job.app != "lammps":
+        log_path = stdout_path.resolve()
+    else:
+        log_path = _extract_log_path(run_args, workdir)
 
     mean_runtime = sum(runtime_samples) / len(runtime_samples) if runtime_samples else 0.0
     return RunOutput(

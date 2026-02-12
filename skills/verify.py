@@ -71,7 +71,8 @@ def verify_run(
     )
     agentic_cfg = agentic_cfg or {}
     agentic_mode = str(agentic_cfg.get("mode", "")).lower()
-    use_agent = agentic_decider is not None and agentic_mode == "agent_only" and not is_baseline
+    use_agent = (agentic_decider is not None and agentic_mode == "agent_only"
+                 and not is_baseline and job.app == "lammps")
 
     if require_correctness:
         log_text = ""

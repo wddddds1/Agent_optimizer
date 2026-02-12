@@ -12,6 +12,7 @@ __pycache__/
 *.pyc
 .venv/
 .env
+configs/env.local.yaml
 .idea/
 
 # Large data files (genomics benchmarks)

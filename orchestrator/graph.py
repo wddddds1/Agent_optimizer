@@ -734,7 +734,7 @@ def _run_parameter_exploration_phase(
 
     agent = ParameterExplorerAgent(
         config=agent_config,
-        repo_root=repo_root / "third_party" / "lammps",
+        repo_root=repo_root / "third_party" / job.app,
         input_script_path=input_script_path,
         experience_db=experience_memory,
     )
@@ -812,18 +812,19 @@ def _run_parameter_exploration_phase(
     # Auto-inject backend_enable for parallel_omp actions so the LAMMPS
     # adapter adds ``-sf omp`` to run_args.  Without this, setting
     # OMP_NUM_THREADS alone has no effect because LAMMPS pair styles
-    # default to serial kernels.
-    _PARALLEL_FAMILIES = {"parallel_omp", "affinity_tune"}
-    for cand in result.candidates:
-        needs_backend = (
-            _is_parallel_threads_action(cand)
-            or (cand.family and cand.family in _PARALLEL_FAMILIES)
-        )
-        if needs_backend:
-            params = dict(cand.parameters or {})
-            if not params.get("backend_enable"):
-                params["backend_enable"] = "openmp"
-                cand.parameters = params
+    # default to serial kernels.  BWA does not use this mechanism.
+    if job.app == "lammps":
+        _PARALLEL_FAMILIES = {"parallel_omp", "affinity_tune"}
+        for cand in result.candidates:
+            needs_backend = (
+                _is_parallel_threads_action(cand)
+                or (cand.family and cand.family in _PARALLEL_FAMILIES)
+            )
+            if needs_backend:
+                params = dict(cand.parameters or {})
+                if not params.get("backend_enable"):
+                    params["backend_enable"] = "openmp"
+                    cand.parameters = params
 
     _sanitize_param_explorer_env(result.candidates)
 
@@ -4113,7 +4114,6 @@ def run_optimization(
             baseline_repeats=baseline_repeats,
             baseline_stat=baseline_stat,
             validate_top1_repeats=validate_top1_repeats,
-            min_improvement_pct=min_improvement_pct,
         )
     last_review_decision: Optional[Dict[str, object]] = None
     baseline_from_seed = False
@@ -7945,7 +7945,7 @@ def _run_experiment(
     # Normalize workdir/input_script if they point inside a stale worktree
     base_job_snapshot = _normalize_worktree_paths(base_job_snapshot, actions_root)
     env_overrides, run_args, launcher_cfg = _apply_run_config_action(base_job_snapshot, action)
-    run_args = _ensure_log_path(run_args, run_dir)
+    run_args = _ensure_log_path(run_args, run_dir, app=base_job_snapshot.app)
     run_kind = "baseline" if action is None else "experiment"
     wrapper_id = None
     if action and action.parameters:
@@ -8193,7 +8193,7 @@ def _run_experiment(
                 baseline_check_dir.mkdir(parents=True, exist_ok=True)
                 baseline_job = base_job_snapshot.model_copy(deep=True)
                 baseline_job.env.update(run_env_overrides)
-                baseline_run_args = _ensure_log_path(run_args, baseline_check_dir)
+                baseline_run_args = _ensure_log_path(run_args, baseline_check_dir, app=base_job_snapshot.app)
                 baseline_workdir = Path(base_job_snapshot.workdir)
                 baseline_wrapper, baseline_wrapper_env = _resolve_wrappers(
                     wrappers_cfg, "baseline_check", baseline_check_dir, wrapper_id
@@ -8668,7 +8668,9 @@ def _remove_flag(run_args: List[str], flag: str, arg_count: int) -> List[str]:
     return cleaned
 
 
-def _ensure_log_path(run_args: List[str], run_dir: Path) -> List[str]:
+def _ensure_log_path(run_args: List[str], run_dir: Path, app: str = "lammps") -> List[str]:
+    if app != "lammps":
+        return list(run_args)
     args = list(run_args)
     log_path = run_dir / "log.lammps"
     if "-log" in args:
