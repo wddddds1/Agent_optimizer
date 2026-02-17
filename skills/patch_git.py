@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import subprocess
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 class WorktreeAddError(RuntimeError):
@@ -13,6 +14,18 @@ class WorktreeAddError(RuntimeError):
         super().__init__(message)
         self.attempts = attempts
         self.last_error = last_error
+
+
+def _compact_git_token(raw: str, max_len: int = 72) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw or "").strip())
+    slug = re.sub(r"_+", "_", slug).strip("._-") or "exp"
+    digest = hashlib.sha1(str(raw or "").encode("utf-8")).hexdigest()[:10]
+    keep = max_len - len(digest) - 1
+    if keep < 8:
+        keep = 8
+    if len(slug) > keep:
+        slug = slug[:keep].rstrip("._-")
+    return f"{slug}-{digest}"
 
 
 class GitPatchContext(AbstractContextManager):
@@ -25,6 +38,7 @@ class GitPatchContext(AbstractContextManager):
         input_edit: Optional[Dict[str, object]],
         allowlist: list[str],
         patch_path: Optional[Path] = None,
+        patch_paths: Optional[List[Path]] = None,
         patch_root: Optional[Path] = None,
         worktree_retries: int = 2,
     ) -> None:
@@ -34,10 +48,16 @@ class GitPatchContext(AbstractContextManager):
         self.input_script = input_script
         self.input_edit = input_edit
         self.allowlist = allowlist
-        self.patch_source_path = patch_path
+        self.patch_source_paths: List[Path] = []
+        for candidate in patch_paths or []:
+            if isinstance(candidate, Path):
+                self.patch_source_paths.append(candidate)
+        if patch_path and patch_path not in self.patch_source_paths:
+            self.patch_source_paths.append(patch_path)
         self.patch_root = patch_root
-        self.worktree_dir = artifacts_dir / "worktrees" / exp_id
-        self.branch_name = f"exp/{exp_id}"
+        self.worktree_token = _compact_git_token(exp_id)
+        self.worktree_dir = artifacts_dir / "worktrees" / self.worktree_token
+        self.branch_name = f"exp/{self.worktree_token}"
         self.patch_path = artifacts_dir / "patch.diff"
         self.git_commit_before: Optional[str] = None
         self.git_commit_after: Optional[str] = None
@@ -52,18 +72,18 @@ class GitPatchContext(AbstractContextManager):
         self._init_submodule_worktrees()
         self._sync_input_script()
 
-        if self.input_edit and self.patch_source_path:
-            raise RuntimeError("input_edit and patch_path cannot be combined in one action")
+        if self.input_edit and self.patch_source_paths:
+            raise RuntimeError("input_edit and patch_path(s) cannot be combined in one action")
 
         patch_repo = self.repo_root
         if self.input_edit:
             self._apply_input_edit()
             patch_repo = self._repo_root_for_path(self.map_to_worktree(self.input_script))
-        elif self.patch_source_path:
+        elif self.patch_source_paths:
             patch_repo = self._resolve_patch_root()
-            self._apply_patch_file(patch_repo, self.patch_source_path)
+            self._apply_patch_files(patch_repo, self.patch_source_paths)
 
-        if self.input_edit or self.patch_source_path:
+        if self.input_edit or self.patch_source_paths:
             self.git_commit_before = self._git(["-C", str(patch_repo), "rev-parse", "HEAD"]).strip()
             diff = self._git(["-C", str(patch_repo), "diff", "--binary"])
             self.patch_path.write_text(diff, encoding="utf-8")
@@ -93,7 +113,7 @@ class GitPatchContext(AbstractContextManager):
         if self.worktree_dir.exists():
             shutil.rmtree(self.worktree_dir, ignore_errors=True)
         self._git(["branch", "-D", self.branch_name], check=False)
-        worktree_gitdir = self.repo_root / ".git" / "worktrees" / self.exp_id
+        worktree_gitdir = self.repo_root / ".git" / "worktrees" / self.worktree_token
         if worktree_gitdir.exists():
             shutil.rmtree(worktree_gitdir, ignore_errors=True)
 
@@ -140,7 +160,7 @@ class GitPatchContext(AbstractContextManager):
                 self.repo_root
                 / ".git"
                 / "worktrees"
-                / self.exp_id
+                / self.worktree_token
                 / "modules"
                 / sub_path
             )
@@ -313,6 +333,10 @@ class GitPatchContext(AbstractContextManager):
         )
         if result.returncode != 0:
             raise RuntimeError(f"Failed to apply patch: {patch_to_apply}")
+
+    def _apply_patch_files(self, patch_repo: Path, patch_paths: List[Path]) -> None:
+        for patch_path in patch_paths:
+            self._apply_patch_file(patch_repo, patch_path)
 
     def _resolve_patch_root(self) -> Path:
         if not self.patch_root:

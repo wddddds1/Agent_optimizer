@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ class ConsoleUI:
     verbose: bool = False
     show_output_preview: bool = True
     preview_bytes: int = 2048
+    show_agent_trace: bool = False
 
     def header(
         self,
@@ -181,6 +183,43 @@ class ConsoleUI:
             ],
         )
 
+    def agent_trace(self, name: str, trace: Optional[Dict[str, object]]) -> None:
+        if not self.enabled or not self.show_agent_trace:
+            return
+        self._section(f"{name} 输出")
+        if not trace:
+            self._print("  (empty)")
+            return
+        for key in ("payload", "response", "explanation", "error", "notes"):
+            if key not in trace:
+                continue
+            self._print(f"  {key}:")
+            self._print_block(trace.get(key))
+
+    def agent_conversation(self, name: str, log: List[Dict[str, object]]) -> None:
+        if not self.enabled or not self.show_agent_trace:
+            return
+        self._section(f"{name} 对话")
+        if not log:
+            self._print("  (empty)")
+            return
+        for idx, entry in enumerate(log, start=1):
+            role = entry.get("role", "unknown")
+            self._print(f"[{name}] {idx:03d} role={role}")
+            content = entry.get("content")
+            if content:
+                for line in str(content).splitlines():
+                    self._print(f"  {line}")
+            tool_calls = entry.get("tool_calls") or []
+            for call in tool_calls:
+                tname = call.get("name", "tool")
+                args = call.get("arguments", {})
+                self._print(f"  tool_call: {tname}")
+                self._print_block(args, indent="    ")
+            tool_call_id = entry.get("tool_call_id")
+            if tool_call_id:
+                self._print(f"  tool_call_id: {tool_call_id}")
+
     def run_start(
         self,
         exp_id: str,
@@ -241,6 +280,11 @@ class ConsoleUI:
         timing = _format_timing(profile)
         if timing:
             lines.append(f"耗时分解: {timing}")
+        hotspot_count = len(profile.tau_hotspots or [])
+        if hotspot_count > 0:
+            lines.append(f"函数热点: {hotspot_count} 条")
+        if profile.notes:
+            lines.append(f"采样备注: {'; '.join(profile.notes[:2])}")
         self._agent("ProfilerAgent", lines)
         if self.show_output_preview:
             self.output_preview(run_output)
@@ -470,6 +514,17 @@ class ConsoleUI:
             return
         self.stream.write(line + "\n")
         self.stream.flush()
+
+    def _print_block(self, obj: object, indent: str = "    ") -> None:
+        if obj is None:
+            return
+        if isinstance(obj, str):
+            for line in obj.splitlines():
+                self._print(f"{indent}{line}")
+            return
+        text = json.dumps(obj, ensure_ascii=False, indent=2)
+        for line in text.splitlines():
+            self._print(f"{indent}{line}")
 
 
 def _fmt_env(env: Dict[str, str]) -> str:

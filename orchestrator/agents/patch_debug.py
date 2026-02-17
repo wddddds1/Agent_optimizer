@@ -11,6 +11,7 @@ from schemas.patch_edit_ir import PatchEditProposal
 from schemas.patch_proposal_ir import PatchProposal
 from schemas.profile_report import ProfileReport
 from skills.patch_edit import StructuredEditError, apply_structured_edits
+from skills.profile_payload import build_profile_payload
 
 
 class PatchDebugAgent:
@@ -41,11 +42,7 @@ class PatchDebugAgent:
                 "expected_effect": action.expected_effect,
                 "risk_level": action.risk_level,
             },
-            "profile": {
-                "timing_breakdown": profile.timing_breakdown,
-                "system_metrics": profile.system_metrics,
-                "notes": profile.notes,
-            },
+            "profile": build_profile_payload(profile),
             "patch_rules": patch_rules,
             "allowed_files": allowed_files,
             "code_snippets": code_snippets,
@@ -55,12 +52,41 @@ class PatchDebugAgent:
         }
         data = self.llm_client.request_json(prompt, payload)
         self.last_trace = {"payload": payload, "response": data}
+        if data is None:
+            return PatchProposal(
+                status="NEED_MORE_CONTEXT",
+                patch_diff="",
+                touched_files=[],
+                rationale="PatchDebugAgent returned no JSON object.",
+                assumptions=[],
+                confidence=0.0,
+                missing_fields=["debug_agent_no_json"],
+            )
         if not data:
-            return None
+            return PatchProposal(
+                status="NEED_MORE_CONTEXT",
+                patch_diff="",
+                touched_files=[],
+                rationale="PatchDebugAgent returned an empty JSON object.",
+                assumptions=[],
+                confidence=0.0,
+                missing_fields=["debug_agent_empty_json"],
+            )
         try:
             edit_proposal = PatchEditProposal(**data)
-        except ValidationError:
-            return None
+        except ValidationError as exc:
+            first_error = exc.errors()[0] if exc.errors() else {}
+            loc = ".".join(str(part) for part in first_error.get("loc", [])) or "unknown"
+            msg = str(first_error.get("msg") or "validation_error")
+            return PatchProposal(
+                status="NEED_MORE_CONTEXT",
+                patch_diff="",
+                touched_files=[],
+                rationale="PatchDebugAgent response failed schema validation.",
+                assumptions=[],
+                confidence=0.0,
+                missing_fields=[f"debug_agent_schema_error:{loc}:{msg}"],
+            )
         patch_proposal = PatchProposal(
             status=edit_proposal.status,
             patch_diff="",

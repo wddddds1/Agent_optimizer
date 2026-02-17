@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from schemas.action_ir import ActionIR
 from schemas.experiment_ir import ExperimentIR
 from schemas.job_ir import JobIR
 from schemas.profile_report import ProfileReport
 from schemas.result_ir import ResultIR
+from skills.applications import (
+    requires_structured_correctness as app_requires_structured_correctness,
+    supports_agentic_correctness as app_supports_agentic_correctness,
+)
 from skills.metrics_parse import extract_error_lines, parse_thermo_series, parse_thermo_table
 
 
@@ -30,6 +35,8 @@ def verify_run(
     is_final_validation: bool = False,
     agentic_decider=None,
     agentic_cfg: Optional[Dict[str, object]] = None,
+    contract_getter: Optional[Callable[[JobIR], Optional[Dict[str, object]]]] = None,
+    contract_putter: Optional[Callable[[JobIR, Dict[str, object]], None]] = None,
 ) -> VerifyResult:
     reasons: List[str] = []
     correctness_metrics: Dict[str, object] = {}
@@ -71,8 +78,9 @@ def verify_run(
     )
     agentic_cfg = agentic_cfg or {}
     agentic_mode = str(agentic_cfg.get("mode", "")).lower()
+    strict_structured_correctness = app_requires_structured_correctness(job.app)
     use_agent = (agentic_decider is not None and agentic_mode == "agent_only"
-                 and not is_baseline and job.app == "lammps")
+                 and not is_baseline and app_supports_agentic_correctness(job.app))
 
     if require_correctness:
         log_text = ""
@@ -92,9 +100,26 @@ def verify_run(
             except FileNotFoundError:
                 baseline_text = ""
         if not metrics and not series:
-            if not use_agent and job.app == "lammps":
-                reasons.append("no thermo metrics available for correctness check")
             correctness_metrics["no_thermo_metrics"] = True
+            generic_eval = _evaluate_generic_contract(
+                job=job,
+                run_text=log_text,
+                baseline_text=baseline_text if not is_baseline else "",
+                is_baseline=is_baseline,
+                contract_getter=contract_getter,
+                contract_putter=contract_putter,
+            )
+            correctness_metrics["generic_contract"] = generic_eval
+            status = str(generic_eval.get("status", "UNSURE")).upper()
+            if status == "FAIL":
+                reasons.append(f"generic correctness mismatch: {generic_eval.get('reason', 'mismatch')}")
+            elif status == "UNSURE":
+                if not use_agent and strict_structured_correctness:
+                    reasons.append("no thermo metrics available for correctness check")
+                elif not use_agent:
+                    reasons.append(
+                        f"correctness uncertain: {generic_eval.get('reason', 'generic contract unavailable')}"
+                    )
         else:
             correctness_metrics["key_scalar_diffs"] = {}
             correctness_metrics["series_diffs"] = {}
@@ -211,13 +236,18 @@ def verify_run(
                 elif abs(drift_value) > drift_limit:
                     reasons.append("energy drift threshold exceeded")
 
-        if use_agent:
+        should_call_agent = use_agent and (
+            "generic_contract" not in correctness_metrics
+            or str(correctness_metrics["generic_contract"].get("status", "")).upper() == "UNSURE"
+        )
+        if should_call_agent:
             hard_failures = [
                 r
                 for r in reasons
                 if not r.startswith("correctness drift")
                 and not r.startswith("series drift")
                 and "energy drift" not in r
+                and not r.startswith("correctness uncertain:")
             ]
             payload = _build_agent_payload(
                 job=job,
@@ -302,6 +332,221 @@ def verify_run(
 
     verdict = "PASS" if not reasons else "FAIL"
     return VerifyResult(verdict=verdict, reasons=reasons, correctness_metrics=correctness_metrics)
+
+
+def _evaluate_generic_contract(
+    job: JobIR,
+    run_text: str,
+    baseline_text: str,
+    is_baseline: bool,
+    contract_getter: Optional[Callable[[JobIR], Optional[Dict[str, object]]]] = None,
+    contract_putter: Optional[Callable[[JobIR, Dict[str, object]], None]] = None,
+) -> Dict[str, object]:
+    run_sig = _generic_signature(run_text)
+    if run_sig is None:
+        if _signature_intentionally_suppressed(job):
+            return {
+                "status": "PASS",
+                "reason": "signature intentionally suppressed by run args",
+                "signature": None,
+                "suppressed_signature": True,
+            }
+        return {"status": "UNSURE", "reason": "run signature unavailable"}
+
+    if is_baseline:
+        contract = {
+            "version": 1,
+            "kind": "generic_signature_v1",
+            "app": job.app,
+            "case_id": job.case_id,
+            "signature": run_sig,
+        }
+        if contract_putter:
+            try:
+                contract_putter(job, contract)
+            except Exception:
+                pass
+        return {
+            "status": "PASS",
+            "reason": "baseline contract recorded",
+            "signature": run_sig,
+        }
+
+    baseline_sig = _generic_signature(baseline_text) if baseline_text else None
+    if baseline_sig is None and contract_getter:
+        try:
+            cached = contract_getter(job)
+        except Exception:
+            cached = None
+        if isinstance(cached, dict):
+            cand = cached.get("signature")
+            if isinstance(cand, dict):
+                baseline_sig = cand
+    if baseline_sig is None:
+        return {"status": "UNSURE", "reason": "baseline signature unavailable", "signature": run_sig}
+
+    verdict, mismatch = _compare_generic_signatures(baseline_sig, run_sig)
+    if verdict == "PASS":
+        return {
+            "status": "PASS",
+            "reason": "generic signature matched",
+            "signature": run_sig,
+            "baseline_signature": baseline_sig,
+        }
+    return {
+        "status": "FAIL",
+        "reason": mismatch or "signature mismatch",
+        "signature": run_sig,
+        "baseline_signature": baseline_sig,
+    }
+
+
+def _signature_intentionally_suppressed(job: JobIR) -> bool:
+    app = str(getattr(job, "app", "") or "").strip().lower()
+    run_args = [str(arg) for arg in (getattr(job, "run_args", []) or [])]
+    for idx, token in enumerate(run_args):
+        if token == "-o" and idx + 1 < len(run_args) and run_args[idx + 1] == "/dev/null":
+            return app == "bwa"
+    return False
+
+
+def _generic_signature(text: str) -> Optional[Dict[str, object]]:
+    if not text:
+        return None
+    lines = [line.rstrip("\n") for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    normalized = [_normalize_line(line) for line in lines if not _is_volatile_line(line)]
+    payload = "\n".join(normalized).encode("utf-8", errors="replace")
+    sig: Dict[str, object] = {
+        "line_count": len(normalized),
+        "byte_count": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    sam = _sam_summary(lines)
+    if sam:
+        sig["sam"] = sam
+    return sig
+
+
+def _is_volatile_line(line: str) -> bool:
+    lowered = line.lower()
+    volatile_tokens = (
+        "real time:",
+        "cpu:",
+        " user ",
+        " sys",
+        "maximum resident set size",
+        "context switches",
+        "instructions retired",
+        "cycles elapsed",
+        "peak memory footprint",
+        "page faults",
+        "messages sent",
+        "messages received",
+    )
+    return any(token in lowered for token in volatile_tokens)
+
+
+def _normalize_line(line: str) -> str:
+    return " ".join(line.strip().split())
+
+
+def _sam_summary(lines: List[str]) -> Optional[Dict[str, object]]:
+    total = 0
+    mapped = 0
+    unmapped = 0
+    primary = 0
+    secondary = 0
+    supplementary = 0
+    nm_sum = 0
+    mapq_sum = 0
+    hash_xor = 0
+    hash_sum = 0
+    mask64 = (1 << 64) - 1
+
+    for line in lines:
+        if line.startswith("@"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 11:
+            continue
+        try:
+            flag = int(parts[1])
+            pos = int(parts[3])
+            mapq = int(parts[4])
+        except (TypeError, ValueError):
+            continue
+        total += 1
+        mapq_sum += mapq
+        if flag & 0x4:
+            unmapped += 1
+        else:
+            mapped += 1
+        if flag & 0x100:
+            secondary += 1
+        if flag & 0x800:
+            supplementary += 1
+        if not (flag & 0x100) and not (flag & 0x800):
+            primary += 1
+        for field in parts[11:]:
+            if field.startswith("NM:i:"):
+                try:
+                    nm_sum += int(field[5:])
+                except ValueError:
+                    pass
+                break
+        key = f"{parts[0]}\t{flag}\t{parts[2]}\t{pos}\t{parts[5]}\t{parts[9]}"
+        digest = hashlib.sha1(key.encode("utf-8", errors="replace")).digest()
+        value = int.from_bytes(digest[:8], "big", signed=False)
+        hash_xor ^= value
+        hash_sum = (hash_sum + value) & mask64
+
+    if total < 10:
+        return None
+    return {
+        "total": total,
+        "mapped": mapped,
+        "unmapped": unmapped,
+        "primary": primary,
+        "secondary": secondary,
+        "supplementary": supplementary,
+        "mapq_sum": mapq_sum,
+        "nm_sum": nm_sum,
+        "hash_xor": hash_xor,
+        "hash_sum": hash_sum,
+    }
+
+
+def _compare_generic_signatures(
+    baseline: Dict[str, object],
+    run: Dict[str, object],
+) -> tuple[str, str]:
+    base_sam = baseline.get("sam")
+    run_sam = run.get("sam")
+    if isinstance(base_sam, dict) and isinstance(run_sam, dict):
+        keys = [
+            "total",
+            "mapped",
+            "unmapped",
+            "primary",
+            "secondary",
+            "supplementary",
+            "nm_sum",
+            "hash_xor",
+            "hash_sum",
+        ]
+        for key in keys:
+            if int(run_sam.get(key, -1)) != int(base_sam.get(key, -1)):
+                return "FAIL", f"sam_{key}_mismatch"
+        return "PASS", ""
+
+    if (
+        str(run.get("sha256", "")) == str(baseline.get("sha256", ""))
+        and int(run.get("line_count", -1)) == int(baseline.get("line_count", -1))
+    ):
+        return "PASS", ""
+    return "FAIL", "text_signature_mismatch"
 
 
 def _energy_drift(series: Dict[str, List[float]], key: str) -> Optional[float]:

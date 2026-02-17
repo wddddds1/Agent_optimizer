@@ -34,8 +34,8 @@ profiling_rules:
     risk_levels: ["low"]
 
 source_patch_scope:
-  start_level: "hotspot"
-  levels: ["hotspot", "module", "global"]
+  start_level: "global"
+  levels: ["global", "module", "hotspot"]
   promote:
     no_gain_iters: 2
     no_candidates_iters: 1

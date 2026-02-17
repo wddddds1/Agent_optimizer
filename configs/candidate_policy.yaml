@@ -2,7 +2,7 @@ version: 2
 allow_skip_if_not_applicable: true
 max_candidates_per_round: 6
 patch_budgets:
-  max_patches_per_round: 1
+  max_patches_per_round: 3
   max_files_touched: 6
   max_lines_changed: 480
 

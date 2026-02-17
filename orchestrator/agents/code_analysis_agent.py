@@ -8,7 +8,10 @@ reference implementations, check compiler reports, and examine assembly.
 from __future__ import annotations
 
 import json
+import math
 import re
+from datetime import datetime, timezone
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -20,6 +23,21 @@ from orchestrator.agent_llm import (
     MAX_TURNS_SENTINEL,
 )
 from schemas.code_analysis_ir import DeepCodeAnalysisResult
+from schemas.opportunity_graph import (
+    MACRO_MECHANISMS,
+    Composability,
+    ExpectedGain,
+    HotspotEvidence,
+    OpportunityGraph,
+    OpportunityGraphResult,
+    OpportunityMechanism,
+    OpportunityNode,
+    OpportunityStatus,
+    SelectedOpportunities,
+    SelectedOpportunity,
+    ValidationPlan,
+    validate_graph,
+)
 from skills.agent_tools import CodeOptimizationTools
 
 
@@ -46,6 +64,11 @@ def _build_system_prompt(
                 lines.append(f"  - {fid}: {desc} (ref: {ref})")
             else:
                 lines.append(f"  - {fid}: {desc}")
+            hints = item.get("detection_hints")
+            if hints and not covered:
+                patterns = hints.get("patterns", [])
+                if patterns:
+                    lines.append(f"    Look for: {'; '.join(patterns[:2])}")
         if lines:
             families_section = (
                 "\n\n## Known Optimization Patterns (reference only)\n"
@@ -56,168 +79,35 @@ def _build_system_prompt(
             )
 
     return f"""\
-You are a deep code analysis agent specialising in HPC performance optimisation.
-Your task is to THOROUGHLY explore a codebase to discover ALL viable source-level
-optimisation opportunities.  You are analysing LAMMPS, a molecular dynamics code.
+You are an HPC deep-analysis agent.
+Goal: discover high-impact source-level optimization opportunities on real hotspots.
 
-## Your Mission
-
-Produce a comprehensive, RANKED list of optimisation opportunities for the hotspot
-code.  You have tools to:
-- Read complete source files and trace call chains
-- Examine type definitions, data layouts, and memory access patterns
-- Study compiler optimisation reports to see what IS and IS NOT optimised
-- Read disassembly to observe actual SIMD usage and branch patterns
-- Find reference implementations (OPT/INTEL variants) for comparison
-- Query past optimisation experience
-
-You are NOT limited to predefined optimisation families.  Discover opportunities
-organically through systematic exploration.
-
-## Mandatory Analysis Workflow
-
-Follow this workflow IN ORDER.  Use tools extensively — you have budget for 30+
-tool calls.
-
-### Phase 1: Understand the Architecture (3-4 tool calls)
-1. **get_profile** — Where is time spent?  Note pair/neigh/comm ratios.
-2. **read_file** the main hotspot file(s) identified in the profile.
-3. **get_file_outline** for each hotspot file — overall structure.
-4. **get_callers** for the main compute/eval function — call chain from
-   the simulation loop to the hot inner loop.
-
-### Phase 2: Map Data Structures (3-5 tool calls)
-5. **get_type_definition** and **get_type_layout** for ALL types in the hot path:
-   - Coordinate types (dbl3_t, vec3_t, double**)
-   - Coefficient types (cutsq, lj1, lj2 — how are they stored?)
-   - Neighbour list types (NeighList, firstneigh, numneigh)
-   - Force accumulation types (f[i] patterns, fxtmp/fytmp/fztmp)
-6. Document the access pattern for each: AoS vs SoA?  How many cache lines
-   per access?  Indirection (pointer-to-pointer)?
-
-### Phase 3: Study Reference Implementations (2-3 tool calls)
-7. **get_reference_implementation** — find OPT / INTEL versions of the hotspot.
-8. **read_file** the reference implementation fully.  Identify EVERY optimisation
-   technique it uses and whether each could apply to the current code.
-9. **grep** for specific patterns from the reference (struct definitions,
-   specialised loop structures, etc.)
-
-### Phase 4: Compiler Baseline — CRITICAL (2-4 tool calls)
-10. **get_compiler_opt_report** on the hotspot file — see what the compiler DOES.
-    For each optimisation you are considering, check: does the compiler already
-    do it?
-11. **get_assembly** for the hotspot function.  Look for:
-    - SIMD instructions (vmulpd, vfmadd = vectorised; mulsd = scalar)
-    - Scatter/gather (vgatherdpd = indirect access problem)
-    - Branches inside tight loops (jne, je)
-    - Redundant loads (same address loaded multiple times)
-12. **get_compile_flags** — optimisation level, target arch, enabled packages.
-
-### Phase 5: Deep Pattern Mining (3-6 tool calls)
-13. **Compare** current code against the reference OPT/INTEL version line-by-line.
-    What techniques does the reference use that the current code does not?
-14. For each potential optimisation, VERIFY with the compiler report and assembly
-    that it is NOT already being done.
-15. **search_experience** — has this been tried before?  What was the result?
-16. For novel patterns beyond the reference, examine:
-    - Unnecessary memory indirections that could be flattened
-    - Branches in the inner loop that could be eliminated
-    - Data dependencies preventing vectorisation
-    - Memory access patterns that could be improved
-    - Redundant computations visible only with semantic understanding
-
-### Phase 6: Rank and Output (final turn)
-17. Produce your final JSON with ALL discovered opportunities, ranked by
-    estimated impact, confidence, risk, and implementation complexity.
-
-## Evidence Requirements
-
-For EACH opportunity you MUST have:
-- **compiler_gap**: A specific explanation of why the compiler cannot do this.
-  If you cannot articulate the gap, the optimisation is likely already handled.
-- **code_context**: Actual source code from the hotspot (copy from read_file).
-- At least ONE of: assembly_evidence, compiler_report_evidence, or reference_code.
-
-## What Makes a GOOD Opportunity
-1. The compiler cannot do it: data layout changes, algorithm changes, semantic
-   optimisations requiring domain knowledge.
-2. Evidence-based: you saw it in the assembly, compiler report, or reference impl.
-3. Targeted: you know the exact file, function, and lines to modify.
-4. Measurable: you can estimate impact from the profile data.
-
-## What Makes a BAD Opportunity
-1. Compiler already does it: loop unrolling, constant hoisting, simple branch hints
-   — these are done by -O3 -march=native.
-2. No evidence: "this might help" without checking assembly or compiler report.
-3. Vague target: "optimise the inner loop" without specifying the mechanism.
-4. Previously failed: search_experience shows it was tried and failed.
+Rules:
+1. Focus macro-first: data_layout, memory_path, vectorization, algorithmic.
+2. Only keep opportunities with concrete evidence and clear compiler gap.
+3. Avoid generic micro-opts unless no macro path is actionable.
+4. If context/profile is insufficient, return explicit status and missing items.
+5. If status=OK, output 8-12 opportunities when feasible; at least 6.
+6. At least 4 opportunities must be macro mechanisms (data_layout/memory_path/vectorization/algorithmic).
+7. Favor structural transforms (data layout, memory traffic shaping, vector path redesign, algorithm path changes), not only loop micro-tweaks.
 {families_section}
 
-## Output Format
+Tool workflow (compact):
+- get_profile -> read_file/get_file_outline/get_callers on top hotspots
+- get_type_definition/get_type_layout on hot-path data
+- get_reference_implementation + grep for comparable optimized patterns
+- get_compiler_opt_report + get_assembly + get_compile_flags to verify compiler gap
+- search_experience to avoid repeating known failures
 
-When analysis is complete, output a single JSON object:
-```json
-{{
-  "status": "OK",
-  "architecture_summary": "...",
-  "call_chain": [
-    {{"function_name": "eval", "file_path": "src/OPENMP/pair_lj_cut_omp.cpp",
-      "line_number": 75, "time_share_pct": 84.0, "description": "Hot inner loop"}}
-  ],
-  "data_structures": [
-    {{"type_name": "dbl3_t", "defined_in": "src/OPENMP/omp_compat.h",
-      "access_pattern": "AoS", "hotspot_usage": "x[j].x/y/z coordinate access",
-      "cache_behavior": "24 bytes, fits in one cache line",
-      "optimization_relevance": "Determines vectorisation pattern"}}
-  ],
-  "compiler_insights": [
-    {{"file_path": "...", "vectorized_loops": ["..."], "missed_optimizations": ["..."],
-      "simd_width_used": "...", "aliasing_issues": ["..."], "inlining_decisions": ["..."]}}
-  ],
-  "compiler_baseline_summary": "...",
-  "bottleneck_diagnosis": "...",
-  "hotspot_files": ["..."],
-  "opportunities": [
-    {{
-      "opportunity_id": "param_table_pack_1",
-      "title": "Pack coefficient arrays into cache-aligned struct",
-      "category": "data_layout",
-      "family_hint": "param_table_pack",
-      "target_files": ["src/OPENMP/pair_lj_cut_omp.cpp"],
-      "target_functions": ["eval"],
-      "diagnosis": "Six separate 2D arrays each require separate cache line loads...",
-      "mechanism": "Pack into single 64-byte aligned struct like OPT reference...",
-      "compiler_gap": "Compiler cannot merge accesses across independently allocated arrays.",
-      "evidence": ["Assembly shows 6 separate load sequences per iteration"],
-      "code_context": "const double * _noalias const cutsqi = cutsq[itype];...",
-      "reference_code": "typedef struct {{ double cutsq,lj1,lj2,lj3,lj4,offset; double _pad[2]; }} fast_alpha_t;",
-      "assembly_evidence": "Multiple movsd from different base addresses per neighbour",
-      "compiler_report_evidence": "",
-      "estimated_impact": "high",
-      "confidence": 0.8,
-      "risk_level": "medium",
-      "expected_effect": ["mem_locality", "compute_opt"],
-      "depends_on": [],
-      "conflicts_with": [],
-      "composable_with": ["special_pair_split_1"],
-      "implementation_complexity": "medium",
-      "lines_of_change_estimate": 40,
-      "priority_rank": 1
-    }}
-  ],
-  "recommended_sequence": ["param_table_pack_1", "special_pair_split_1"],
-  "strategy_rationale": "Start with param_table_pack for highest impact...",
-  "total_files_explored": 5,
-  "total_functions_analyzed": 3,
-  "exploration_notes": []
-}}
-```
-
-IMPORTANT: Do NOT stop after finding one opportunity.  Continue through ALL phases.
-A thorough analysis typically finds 3-8 opportunities.
-
-IMPORTANT: If running low on turns, IMMEDIATELY output your current findings as
-JSON.  Partial results are better than no results.
+Output:
+- Return ONE valid JSON object only (no markdown), with keys:
+  status, hotspot_files, opportunities, recommended_sequence, strategy_rationale
+- status must be one of: OK, NEED_MORE_CONTEXT, NEED_MORE_PROFILE, NO_ACTIONABLE
+- Each opportunity must include:
+  opportunity_id, title, category, target_files, target_functions,
+  diagnosis, mechanism, compiler_gap, evidence, code_context,
+  estimated_impact, confidence, risk_level.
+- For each opportunity include one falsifiable performance hypothesis in `diagnosis`.
 """
 
 
@@ -234,6 +124,7 @@ class DeepAnalysisResult:
     conversation_log: List[Dict[str, Any]] = field(default_factory=list)
     total_turns: int = 0
     total_tokens: int = 0
+    error_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -262,12 +153,9 @@ _ANALYSIS_TOOL_NAMES = {
     "get_assembly",
     # Compiler Analysis
     "get_compiler_opt_report",
-    "compile_single",
     # Knowledge
     "get_reference_implementation",
     "search_experience",
-    # Platform
-    "run_shell",
 }
 
 
@@ -294,6 +182,7 @@ class DeepCodeAnalysisAgent:
         self.build_dir = build_dir or repo_root / "build"
         self.llm_client = AgentLLMClient(config)
         self.tools = CodeOptimizationTools(repo_root, build_dir, experience_db)
+        self.last_discovery_run: Optional[DeepAnalysisResult] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -308,21 +197,265 @@ class DeepCodeAnalysisAgent:
         experience_hints: Optional[List[Dict[str, Any]]] = None,
         backend_variant: Optional[str] = None,
         input_script_path: Optional[str] = None,
+        supplemental_context: Optional[Dict[str, str]] = None,
     ) -> DeepAnalysisResult:
-        """Run the deep code analysis.
+        """Legacy compatibility wrapper.
 
-        Args:
-            profile: Baseline performance profile dict (timing_breakdown, etc.).
-            hotspot_files: Paths (relative to repo_root) of performance-critical files.
-            system_caps: Hardware topology and capabilities.
-            patch_families: Optional known patch family definitions (reference only).
-            experience_hints: Historical optimisation results.
-            backend_variant: e.g., "omp".
-            input_script_path: Path to the LAMMPS input script.
-
-        Returns:
-            DeepAnalysisResult with ranked optimisation opportunities.
+        The new contract is:
+        1) discover_opportunity_graph(...)
+        2) select_topk_from_graph(...)
         """
+        return self._run_analysis_session(
+            profile=profile,
+            hotspot_files=hotspot_files,
+            system_caps=system_caps,
+            patch_families=patch_families,
+            experience_hints=experience_hints,
+            backend_variant=backend_variant,
+            input_script_path=input_script_path,
+            supplemental_context=supplemental_context,
+        )
+
+    def discover_opportunity_graph(
+        self,
+        profile: Dict[str, Any],
+        hotspot_files: List[str],
+        system_caps: Dict[str, Any],
+        patch_families: Optional[Dict[str, Any]] = None,
+        experience_hints: Optional[List[Dict[str, Any]]] = None,
+        backend_variant: Optional[str] = None,
+        input_script_path: Optional[str] = None,
+        supplemental_context: Optional[Dict[str, str]] = None,
+    ) -> OpportunityGraphResult:
+        run = self._run_analysis_session(
+            profile=profile,
+            hotspot_files=hotspot_files,
+            system_caps=system_caps,
+            patch_families=patch_families,
+            experience_hints=experience_hints,
+            backend_variant=backend_variant,
+            input_script_path=input_script_path,
+            supplemental_context=supplemental_context,
+        )
+        self.last_discovery_run = run
+        analysis = run.analysis
+        if analysis and analysis.opportunities:
+            graph = self._analysis_to_opportunity_graph(
+                analysis=analysis,
+                profile=profile,
+                fallback_hotspot_files=hotspot_files,
+            )
+            graph = validate_graph(graph)
+            valid_nodes = [n for n in graph.opportunities if not n.invalid]
+            if valid_nodes:
+                return OpportunityGraphResult(
+                    status=OpportunityStatus.OK,
+                    graph=graph,
+                    rationale="discovery complete",
+                    suggestions=[],
+                )
+
+        missing = self._infer_missing_context(run.conversation_log, run.error_reason)
+        needs_profile = self._infer_missing_profile(run.conversation_log, run.error_reason, profile)
+        if missing:
+            return OpportunityGraphResult(
+                status=OpportunityStatus.NEED_MORE_CONTEXT,
+                graph=None,
+                missing=missing,
+                needs_profile=[],
+                rationale=run.error_reason or "missing code context",
+                suggestions=[
+                    "collect missing files/functions and rerun discovery once",
+                ],
+            )
+        if needs_profile:
+            return OpportunityGraphResult(
+                status=OpportunityStatus.NEED_MORE_PROFILE,
+                graph=None,
+                missing=[],
+                needs_profile=needs_profile,
+                rationale=run.error_reason or "insufficient profiling evidence",
+                suggestions=[
+                    "collect requested profile data and rerun discovery",
+                ],
+            )
+        return OpportunityGraphResult(
+            status=OpportunityStatus.NO_ACTIONABLE,
+            graph=None,
+            missing=[],
+            needs_profile=[],
+            rationale=run.error_reason or "no actionable opportunities",
+            suggestions=[
+                "re-run deep analysis with broader hotspot scope",
+                "collect compiler optimization report and branch/memory counters",
+            ],
+        )
+
+    def select_topk_from_graph(
+        self,
+        graph: OpportunityGraph,
+        k: int,
+        budget: Optional[Dict[str, Any]] = None,
+        experience_hints: Optional[List[Dict[str, Any]]] = None,
+        selection_policy: Optional[Dict[str, Any]] = None,
+    ) -> SelectedOpportunities:
+        validated = validate_graph(graph)
+        hints = experience_hints or []
+        policy = selection_policy or {}
+        tested_ids: set[str] = set()
+        blocked_ids: set[str] = set()
+        for hint in hints:
+            if not isinstance(hint, dict):
+                continue
+            candidate_id = str(hint.get("opportunity_id") or hint.get("action_id") or "").strip()
+            if not candidate_id:
+                continue
+            outcome = str(hint.get("outcome") or hint.get("status") or "").upper()
+            if outcome in {"PASS", "FAIL", "SKIP"}:
+                tested_ids.add(candidate_id)
+            if outcome in {"FAIL", "INFEASIBLE"}:
+                blocked_ids.add(candidate_id)
+
+        budget_penalty = 1.0
+        if isinstance(budget, dict):
+            # Prefer lower implementation cost when run/iteration budget is tight.
+            max_iters = float(budget.get("max_iters") or 0.0)
+            max_runs = float(budget.get("max_runs") or 0.0)
+            if max_iters > 0 and max_iters <= 3:
+                budget_penalty *= 1.1
+            if max_runs > 0 and max_runs <= 20:
+                budget_penalty *= 1.2
+
+        # Default policy favors deeper opportunities by reducing pure cost penalty
+        # and reserving quota for macro/algorithmic mechanisms.
+        cost_penalty_power = max(0.3, min(1.0, float(policy.get("cost_penalty_power", 0.65) or 0.65)))
+        cost_penalty_weight = max(0.1, min(1.0, float(policy.get("cost_penalty_weight", 0.7) or 0.7)))
+        macro_quota_ratio = max(0.0, min(1.0, float(policy.get("macro_quota_ratio", 0.6) or 0.6)))
+        macro_quota_min = max(0, int(policy.get("macro_quota_min", 2) or 0))
+        algorithmic_quota_min = max(0, int(policy.get("algorithmic_quota_min", 1) or 0))
+
+        scored: List[SelectedOpportunity] = []
+        dropped: List[Dict[str, object]] = []
+        for node in validated.opportunities:
+            if node.invalid:
+                dropped.append(
+                    {
+                        "opportunity_id": node.opportunity_id,
+                        "reason": "invalid",
+                        "details": list(node.invalid_reasons),
+                    }
+                )
+                continue
+            if node.opportunity_id in blocked_ids:
+                dropped.append(
+                    {
+                        "opportunity_id": node.opportunity_id,
+                        "reason": "historically_infeasible",
+                    }
+                )
+                continue
+            expected_speedup = self._normalize_speedup(node.expected_gain.p50)
+            composability_score = float(node.composability.score)
+            raw_cost = max(float(node.implementation_cost), 1.0)
+            # Use sublinear cost growth so medium/complex opportunities are not
+            # over-penalized versus micro tweaks.
+            effective_cost = 1.0 + cost_penalty_weight * ((raw_cost ** cost_penalty_power) - 1.0)
+            implementation_cost = effective_cost * budget_penalty
+            objective = (
+                expected_speedup
+                * float(node.success_prob)
+                * composability_score
+                / max(implementation_cost, 1.0e-6)
+            )
+            value_density = expected_speedup / max(effective_cost, 1.0e-6)
+            node.score = objective
+            node.value_density = value_density
+            scored.append(
+                SelectedOpportunity(
+                    opportunity=node,
+                    expected_speedup=expected_speedup,
+                    success_prob=float(node.success_prob),
+                    composability=composability_score,
+                    implementation_cost=effective_cost,
+                    objective_score=objective,
+                    value_density=value_density,
+                )
+            )
+
+        scored.sort(
+            key=lambda item: (
+                -item.objective_score,
+                -item.value_density,
+                item.opportunity.opportunity_id,
+            )
+        )
+        target_k = max(0, int(k or 0))
+        selected: List[SelectedOpportunity] = []
+        selected_ids: set[str] = set()
+
+        def _append_from(pool: List[SelectedOpportunity], limit: int) -> None:
+            if limit <= 0:
+                return
+            added = 0
+            for item in pool:
+                op_id = item.opportunity.opportunity_id
+                if op_id in selected_ids:
+                    continue
+                selected.append(item)
+                selected_ids.add(op_id)
+                added += 1
+                if added >= limit:
+                    break
+
+        macro_pool = [item for item in scored if item.opportunity.mechanism in MACRO_MECHANISMS]
+        algorithmic_pool = [
+            item for item in scored if item.opportunity.mechanism == OpportunityMechanism.ALGORITHMIC
+        ]
+        macro_preferred = [i for i in macro_pool if i.opportunity.opportunity_id not in tested_ids] + [
+            i for i in macro_pool if i.opportunity.opportunity_id in tested_ids
+        ]
+        algorithmic_preferred = [
+            i for i in algorithmic_pool if i.opportunity.opportunity_id not in tested_ids
+        ] + [i for i in algorithmic_pool if i.opportunity.opportunity_id in tested_ids]
+
+        macro_quota_target = min(
+            len(macro_pool),
+            target_k,
+            max(macro_quota_min, int(math.ceil(target_k * macro_quota_ratio))) if target_k > 0 else 0,
+        )
+        algorithmic_quota_target = min(algorithmic_quota_min, target_k, len(algorithmic_pool))
+
+        _append_from(algorithmic_preferred, algorithmic_quota_target)
+        selected_macro_count = sum(
+            1 for item in selected if item.opportunity.mechanism in MACRO_MECHANISMS
+        )
+        _append_from(macro_preferred, max(0, macro_quota_target - selected_macro_count))
+        _append_from(scored, max(0, target_k - len(selected)))
+        selected = selected[:target_k]
+
+        macro_rule_applied = bool(macro_quota_target > 0 or algorithmic_quota_target > 0)
+
+        return SelectedOpportunities(
+            selected=selected,
+            dropped=dropped,
+            macro_rule_applied=macro_rule_applied,
+            ranking_rationale=(
+                "score = expected_speedup * success_prob * composability / effective_cost, "
+                "with macro+algorithmic quotas"
+            ),
+        )
+
+    def _run_analysis_session(
+        self,
+        profile: Dict[str, Any],
+        hotspot_files: List[str],
+        system_caps: Dict[str, Any],
+        patch_families: Optional[Dict[str, Any]] = None,
+        experience_hints: Optional[List[Dict[str, Any]]] = None,
+        backend_variant: Optional[str] = None,
+        input_script_path: Optional[str] = None,
+        supplemental_context: Optional[Dict[str, str]] = None,
+    ) -> DeepAnalysisResult:
         self.tools.set_profile_data(profile)
         if input_script_path:
             self.tools.set_benchmark_input(input_script_path)
@@ -339,20 +472,24 @@ class DeepCodeAnalysisAgent:
             system_caps=system_caps,
             experience_hints=experience_hints or [],
             backend_variant=backend_variant,
+            supplemental_context=supplemental_context or {},
         )
 
         try:
             response = self.llm_client.chat(
                 session, user_message, auto_execute_tools=True
             )
-            return self._parse_result(response, session)
+            return self._parse_result(response, session, hotspot_files)
         except Exception as exc:
+            if self.config.strict_availability:
+                raise
             return DeepAnalysisResult(
                 status="ERROR",
                 analysis=None,
                 conversation_log=self._extract_conversation_log(session),
                 total_turns=session.turn_count,
                 total_tokens=session.total_tokens,
+                error_reason=str(exc),
             )
 
     # ------------------------------------------------------------------
@@ -382,29 +519,48 @@ class DeepCodeAnalysisAgent:
         system_caps: Dict[str, Any],
         experience_hints: List[Dict[str, Any]],
         backend_variant: Optional[str],
+        supplemental_context: Dict[str, str],
     ) -> str:
+        profile_payload = self._compact_profile_payload(profile)
+        caps_payload = self._compact_system_caps(system_caps)
+        hotspot_preview = hotspot_files[:12]
         parts = [
             "## Task: Deep Code Analysis for Optimisation Discovery",
             "",
-            "Explore the hotspot code thoroughly and produce a ranked list of "
-            "optimisation opportunities.  Follow the mandatory analysis workflow "
-            "in order.  Use tools extensively — you have budget for 30+ tool calls.",
+            "Explore hotspot code and produce a ranked list of actionable source-level opportunities.",
+            "Work efficiently: keep tool calls focused on hottest functions and strongest evidence.",
+            "When actionable, provide at least 6 opportunities (target 8-12), with macro-first coverage.",
             "",
             "## Baseline Profile",
             "```json",
-            json.dumps(profile, indent=2),
+            json.dumps(profile_payload, indent=2),
             "```",
             "",
             "## Hotspot Files to Analyse",
         ]
-        for f in hotspot_files:
+        for f in hotspot_preview:
             parts.append(f"- `{f}`")
+        if len(hotspot_files) > len(hotspot_preview):
+            parts.append(f"- ... ({len(hotspot_files) - len(hotspot_preview)} more)")
+
+        # TAU hotspot data (when available)
+        tau_hotspots = profile.get("tau_hotspots", [])
+        if tau_hotspots:
+            parts.extend([
+                "",
+                "## TAU Function-Level Hotspots",
+                "The following functions were identified by TAU sampling profiling.",
+                "Focus on functions with the highest `exclusive_us`.",
+                "```json",
+                json.dumps(tau_hotspots[:12], indent=2),
+                "```",
+            ])
 
         parts.extend([
             "",
             "## Platform",
             "```json",
-            json.dumps(system_caps, indent=2),
+            json.dumps(caps_payload, indent=2),
             "```",
         ])
 
@@ -412,8 +568,8 @@ class DeepCodeAnalysisAgent:
             parts.extend([
                 "",
                 f"## Backend: `{backend_variant}`",
-                "The code uses OpenMP parallelisation.  Coordinates are accessed "
-                "via `dbl3_t` struct (x[j].x, x[j].y, x[j].z).",
+                "The application uses this backend for parallelisation.  "
+                "Examine the source code to understand data structures and access patterns.",
             ])
 
         if experience_hints:
@@ -421,104 +577,818 @@ class DeepCodeAnalysisAgent:
                 "",
                 "## Historical Optimisation Experience",
                 "```json",
-                json.dumps(experience_hints[:10], indent=2),
+                json.dumps(experience_hints[:6], indent=2),
                 "```",
                 "Use `search_experience` tool for more details on specific families.",
             ])
 
+        if supplemental_context:
+            parts.extend(["", "## Additional Context (补上下文重试数据)"])
+            for path, snippet in list(supplemental_context.items())[:8]:
+                snippet_text = str(snippet or "").strip()
+                if not snippet_text:
+                    continue
+                parts.extend(
+                    [
+                        f"### {path}",
+                        "```text",
+                        snippet_text[:4000],
+                        "```",
+                    ]
+                )
+
         parts.extend([
             "",
             "## Begin Analysis",
-            "Start with Phase 1: call `get_profile` and `read_file` for the first "
-            "hotspot file.  Work through all 6 phases systematically.",
+            "Start with `get_profile`, then inspect top hotspot function(s) first.",
+            "",
+            "## Final Output Constraints",
+            "Final answer must be ONE compact JSON object only (no markdown fences).",
+            "Keep `reference_code` and evidence snippets concise; avoid dumping long code blocks.",
         ])
         return "\n".join(parts)
+
+    def _compact_profile_payload(self, profile: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if not isinstance(profile, dict):
+            return payload
+        timing = profile.get("timing_breakdown")
+        if isinstance(timing, dict):
+            top_timing = sorted(
+                ((str(k), float(v)) for k, v in timing.items() if isinstance(v, (int, float))),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:12]
+            payload["timing_breakdown_top"] = [
+                {"metric": key, "value": value} for key, value in top_timing
+            ]
+        metrics = profile.get("system_metrics")
+        if isinstance(metrics, dict):
+            payload["system_metrics"] = {
+                str(k): v for k, v in metrics.items() if isinstance(v, (int, float, str))
+            }
+        notes = profile.get("notes")
+        if isinstance(notes, list):
+            payload["notes"] = [str(item)[:240] for item in notes[:8]]
+        tau = profile.get("tau_hotspots")
+        if isinstance(tau, list):
+            payload["tau_hotspots"] = tau[:12]
+        return payload
+
+    def _compact_system_caps(self, system_caps: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(system_caps, dict):
+            return {}
+        keep_keys = {
+            "platform",
+            "os",
+            "cpu_model",
+            "cpu_model_name",
+            "cpu_cores_logical",
+            "cpu_cores_physical",
+            "memory_gb",
+            "compiler",
+            "mpi_launcher",
+        }
+        compact: Dict[str, Any] = {}
+        for key in keep_keys:
+            if key in system_caps:
+                compact[key] = system_caps[key]
+        return compact
+
+    # ------------------------------------------------------------------
+    # OpportunityGraph conversion + selection helpers
+    # ------------------------------------------------------------------
+
+    def _analysis_to_opportunity_graph(
+        self,
+        analysis: DeepCodeAnalysisResult,
+        profile: Dict[str, Any],
+        fallback_hotspot_files: List[str],
+    ) -> OpportunityGraph:
+        graph_id = f"opp-graph-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        evidence_catalog: Dict[str, Dict[str, object]] = {}
+        nodes: List[OpportunityNode] = []
+        tau_hotspots = profile.get("tau_hotspots", []) if isinstance(profile, dict) else []
+
+        for idx, opp in enumerate(analysis.opportunities, start=1):
+            hotspot = self._resolve_hotspot_evidence(
+                opportunity=opp,
+                tau_hotspots=tau_hotspots,
+                fallback_hotspot_files=analysis.hotspot_files or fallback_hotspot_files,
+            )
+            evidence_ids: List[str] = []
+            raw_evidence = list(opp.evidence or [])
+            if opp.assembly_evidence:
+                raw_evidence.append(opp.assembly_evidence)
+            if opp.compiler_report_evidence:
+                raw_evidence.append(opp.compiler_report_evidence)
+            if opp.code_context:
+                raw_evidence.append(opp.code_context[:240])
+            for eidx, item in enumerate(raw_evidence, start=1):
+                snippet = str(item or "").strip()
+                if not snippet:
+                    continue
+                eid = self._evidence_id(opp.opportunity_id, eidx, snippet)
+                evidence_catalog[eid] = {
+                    "type": "analysis_evidence",
+                    "opportunity_id": opp.opportunity_id,
+                    "snippet": snippet[:800],
+                }
+                evidence_ids.append(eid)
+
+            gain = self._impact_to_gain(opp.estimated_impact, opp.confidence)
+            mechanism = self._to_mechanism(opp.category, opp.mechanism, opp.family_hint)
+            success_prob = max(0.05, min(0.95, float(opp.confidence)))
+            implementation_cost = float(self._complexity_to_cost(opp.implementation_complexity))
+            composability_score = self._composability_score(opp)
+            node = OpportunityNode(
+                opportunity_id=opp.opportunity_id or f"opportunity_{idx}",
+                title=opp.title or f"Opportunity {idx}",
+                hotspot=hotspot,
+                mechanism=mechanism,
+                evidence_ids=evidence_ids,
+                hypothesis=self._build_hypothesis(opp),
+                expected_gain=ExpectedGain(p50=gain["p50"], p90=gain["p90"]),
+                success_prob=success_prob,
+                implementation_cost=implementation_cost,
+                composability=Composability(
+                    score=composability_score,
+                    depends_on=list(opp.depends_on or []),
+                    conflicts_with=list(opp.conflicts_with or []),
+                ),
+                validation_plan=ValidationPlan(
+                    benchmark="re-run baseline command + patched command on same case",
+                    metrics=["runtime_seconds", "speedup_vs_baseline", "correctness_gate"],
+                    acceptance=(
+                        "PASS correctness + runtime improves over best_chain by >= 1%"
+                    ),
+                ),
+                target_files=list(opp.target_files or []),
+                target_functions=list(opp.target_functions or []),
+                family_hint=str(opp.family_hint or ""),
+                notes=str(opp.mechanism or ""),
+                meta={
+                    "diagnosis": opp.diagnosis,
+                    "compiler_gap": opp.compiler_gap,
+                    "category": opp.category,
+                },
+            )
+            nodes.append(node)
+        return OpportunityGraph(
+            graph_id=graph_id,
+            opportunities=nodes,
+            evidence_catalog=evidence_catalog,
+            invalid_nodes=[],
+            ranking_notes=[],
+        )
+
+    def _resolve_hotspot_evidence(
+        self,
+        opportunity: Any,
+        tau_hotspots: List[Dict[str, Any]],
+        fallback_hotspot_files: List[str],
+    ) -> HotspotEvidence:
+        target_file = ""
+        if getattr(opportunity, "target_files", None):
+            target_file = str(opportunity.target_files[0] or "")
+        elif fallback_hotspot_files:
+            target_file = str(fallback_hotspot_files[0] or "")
+        target_fn = ""
+        if getattr(opportunity, "target_functions", None):
+            target_fn = str(opportunity.target_functions[0] or "")
+
+        share = 0.01
+        line = "0-0"
+        if tau_hotspots:
+            matched = None
+            for item in tau_hotspots:
+                if not isinstance(item, dict):
+                    continue
+                fn = str(item.get("name") or "")
+                file_path = str(item.get("file") or "")
+                if target_fn and fn == target_fn:
+                    matched = item
+                    break
+                if target_file and file_path and file_path.endswith(target_file):
+                    matched = item
+                    break
+            if matched is None:
+                matched = tau_hotspots[0] if isinstance(tau_hotspots[0], dict) else None
+            if matched:
+                target_file = str(matched.get("file") or target_file)
+                if not target_fn:
+                    target_fn = str(matched.get("name") or "")
+                line_no = int(matched.get("line", 0) or 0)
+                line = f"{line_no}-{line_no}" if line_no > 0 else "0-0"
+                share = float(matched.get("exclusive_share", 0.0) or 0.0)
+                if share <= 0:
+                    excl = float(matched.get("exclusive_us", 0.0) or 0.0)
+                    total_excl = sum(
+                        float(item.get("exclusive_us", 0.0) or 0.0)
+                        for item in tau_hotspots
+                        if isinstance(item, dict)
+                    )
+                    if total_excl > 0 and excl > 0:
+                        share = excl / total_excl
+        if not target_file:
+            target_file = "unknown"
+        if not target_fn:
+            target_fn = "unknown"
+        return HotspotEvidence(
+            file=target_file,
+            function=target_fn,
+            line_range=line,
+            share=max(share, 0.01),
+        )
+
+    def _to_mechanism(
+        self,
+        category: str,
+        mechanism: str,
+        family_hint: Optional[str],
+    ) -> OpportunityMechanism:
+        text = " ".join(
+            [
+                str(category or "").lower(),
+                str(mechanism or "").lower(),
+                str(family_hint or "").lower(),
+            ]
+        )
+        if any(key in text for key in ("layout", "pack", "soa", "aos")):
+            return OpportunityMechanism.DATA_LAYOUT
+        if any(key in text for key in ("memory", "cache", "prefetch", "indirect")):
+            return OpportunityMechanism.MEMORY_PATH
+        if any(key in text for key in ("vector", "simd", "restrict")):
+            return OpportunityMechanism.VECTORIZATION
+        if any(key in text for key in ("algorithm", "lookup", "branch split", "search")):
+            return OpportunityMechanism.ALGORITHMIC
+        if any(key in text for key in ("lock", "sync", "barrier")):
+            return OpportunityMechanism.SYNC
+        if any(key in text for key in ("io", "output", "log")):
+            return OpportunityMechanism.IO
+        if any(key in text for key in ("alloc", "arena", "malloc")):
+            return OpportunityMechanism.ALLOCATION
+        return OpportunityMechanism.MICRO_OPT
+
+    def _impact_to_gain(self, impact: str, confidence: float) -> Dict[str, float]:
+        table = {
+            "high": (0.18, 0.35),
+            "medium": (0.08, 0.18),
+            "low": (0.03, 0.08),
+        }
+        p50, p90 = table.get(str(impact or "").lower(), (0.06, 0.14))
+        scale = max(0.6, min(1.2, 0.6 + float(confidence)))
+        return {
+            "p50": round(p50 * scale, 4),
+            "p90": round(p90 * scale, 4),
+        }
+
+    def _complexity_to_cost(self, complexity: str) -> float:
+        mapping = {
+            "trivial": 1.0,
+            "simple": 2.0,
+            "medium": 3.0,
+            "complex": 4.0,
+            "very_complex": 5.0,
+            "high": 4.0,
+            "low": 2.0,
+        }
+        return mapping.get(str(complexity or "").lower(), 3.0)
+
+    def _composability_score(self, opportunity: Any) -> float:
+        deps = len(list(getattr(opportunity, "depends_on", []) or []))
+        conflicts = len(list(getattr(opportunity, "conflicts_with", []) or []))
+        base = 0.75 - 0.08 * deps - 0.10 * conflicts
+        return max(0.15, min(0.95, base))
+
+    def _build_hypothesis(self, opportunity: Any) -> str:
+        mechanism = str(getattr(opportunity, "mechanism", "") or "").strip()
+        diagnosis = str(getattr(opportunity, "diagnosis", "") or "").strip()
+        if mechanism and diagnosis:
+            return f"{mechanism}; expected bottleneck reduction: {diagnosis[:180]}"
+        if mechanism:
+            return mechanism
+        return "Reduce bottleneck in hotspot function with source-level restructuring."
+
+    def _normalize_speedup(self, gain: float) -> float:
+        if gain > 1.0:
+            return max(gain / 100.0, 0.0)
+        return max(float(gain), 0.0)
+
+    def _evidence_id(self, opportunity_id: str, index: int, snippet: str) -> str:
+        key = f"{opportunity_id}|{index}|{snippet[:200]}"
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+        return f"ev_{opportunity_id}_{index}_{digest}"
+
+    def _infer_missing_context(
+        self,
+        conversation_log: List[Dict[str, Any]],
+        error_reason: str,
+    ) -> List[str]:
+        text = " ".join(
+            [str(error_reason or "")]
+            + [str(item.get("content") or "") for item in conversation_log]
+        )
+        patterns = [
+            r"File not found:\s*([^\s\n]+)",
+            r"missing include[:\s]+([^\s\n]+)",
+            r"undefined reference to ([^\s\n]+)",
+        ]
+        missing: List[str] = []
+        for pattern in patterns:
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                token = str(match).strip().strip("`\"',.;:()[]{}")
+                # compile_commands is useful but non-blocking for analysis tools
+                # because fallback compile/report paths are available.
+                if "compile_commands.json" in token.lower():
+                    continue
+                if token and token not in missing:
+                    missing.append(token)
+        return missing
+
+    def _infer_missing_profile(
+        self,
+        conversation_log: List[Dict[str, Any]],
+        error_reason: str,
+        profile: Dict[str, Any],
+    ) -> List[str]:
+        text = " ".join(
+            [str(error_reason or "")]
+            + [str(item.get("content") or "") for item in conversation_log]
+        ).lower()
+        needs: List[str] = []
+        if not profile.get("tau_hotspots"):
+            needs.append("tau_hotspots_or_xctrace_hotspots")
+        if "compiler report" in text or "vectorization report" in text:
+            needs.append("compiler_optimization_report")
+        if "branch" in text and "miss" in text:
+            needs.append("branch_miss_profile")
+        if "l1" in text or "cache miss" in text:
+            needs.append("cache_miss_profile")
+        deduped: List[str] = []
+        for item in needs:
+            if item not in deduped:
+                deduped.append(item)
+        return deduped
 
     # ------------------------------------------------------------------
     # Result parsing
     # ------------------------------------------------------------------
 
     def _parse_result(
-        self, response: str, session: AgentSession
+        self,
+        response: str,
+        session: AgentSession,
+        hotspot_files: Optional[List[str]] = None,
     ) -> DeepAnalysisResult:
         conversation_log = self._extract_conversation_log(session)
+        fallback_hotspots = hotspot_files or []
 
         # Handle max turns sentinel
         if response == MAX_TURNS_SENTINEL:
             partial = self._extract_partial_from_conversation(session)
+            if not partial:
+                partial = self._repair_result_from_conversation(
+                    conversation_log=conversation_log,
+                    final_response="",
+                    hotspot_files=fallback_hotspots,
+                )
             return DeepAnalysisResult(
                 status="PARTIAL" if partial else "ERROR",
                 analysis=partial,
                 conversation_log=conversation_log,
                 total_turns=session.turn_count,
                 total_tokens=session.total_tokens,
+                error_reason=(
+                    "max_turns_exhausted"
+                    if partial is None
+                    else "max_turns_exhausted_salvaged"
+                ),
             )
 
         # Try parsing the final response
         json_result = self._extract_json(response)
         if json_result:
-            try:
-                analysis = DeepCodeAnalysisResult(**json_result)
+            analysis = self._coerce_analysis_result(json_result, fallback_hotspots)
+            if analysis:
                 return DeepAnalysisResult(
-                    status="OK",
+                    status="OK" if analysis.opportunities else "PARTIAL",
                     analysis=analysis,
                     conversation_log=conversation_log,
                     total_turns=session.turn_count,
                     total_tokens=session.total_tokens,
+                    error_reason="parsed_final_response",
                 )
-            except Exception:
-                pass
+
+        retry_payload = self._request_compact_final_json(session, fallback_hotspots)
+        if retry_payload:
+            retry_analysis = self._coerce_analysis_result(retry_payload, fallback_hotspots)
+            if retry_analysis:
+                return DeepAnalysisResult(
+                    status="OK" if retry_analysis.opportunities else "PARTIAL",
+                    analysis=retry_analysis,
+                    conversation_log=self._extract_conversation_log(session),
+                    total_turns=session.turn_count,
+                    total_tokens=session.total_tokens,
+                    error_reason="parsed_retry_response",
+                )
+
+        repaired = self._repair_result_from_conversation(
+            conversation_log=conversation_log,
+            final_response=response or "",
+            hotspot_files=fallback_hotspots,
+        )
+        if repaired:
+            return DeepAnalysisResult(
+                status="PARTIAL",
+                analysis=repaired,
+                conversation_log=conversation_log,
+                total_turns=session.turn_count,
+                total_tokens=session.total_tokens,
+                error_reason="repaired_from_conversation",
+            )
 
         # Fallback: try from unstructured response
         partial = self._extract_partial_from_conversation(session)
+        partial_reason = "recovered_from_partial_assistant_message" if partial else ""
         return DeepAnalysisResult(
             status="PARTIAL" if partial else "ERROR",
             analysis=partial,
             conversation_log=conversation_log,
             total_turns=session.turn_count,
             total_tokens=session.total_tokens,
+            error_reason=(
+                "no_parseable_result"
+                if partial is None
+                else partial_reason
+            ),
         )
 
     def _extract_partial_from_conversation(
         self, session: AgentSession
     ) -> Optional[DeepCodeAnalysisResult]:
         """Scan conversation history backward for any JSON with opportunities."""
+        best: Optional[DeepCodeAnalysisResult] = None
+        best_score = -1.0
         for msg in reversed(session.messages):
             if msg.role == "assistant" and msg.content:
                 json_result = self._extract_json(msg.content)
-                if json_result and "opportunities" in json_result:
-                    try:
-                        return DeepCodeAnalysisResult(**json_result)
-                    except Exception:
-                        continue
-        return None
+                if json_result:
+                    analysis = self._coerce_analysis_result(json_result, [])
+                    if analysis:
+                        score = self._analysis_payload_score(json_result)
+                        if score > best_score:
+                            best = analysis
+                            best_score = score
+        return best
 
     # ------------------------------------------------------------------
     # JSON extraction (reused from ParameterExplorerAgent pattern)
     # ------------------------------------------------------------------
 
     def _extract_json(self, text: str) -> Optional[Dict[str, Any]]:
-        """Extract JSON from text, handling markdown code blocks."""
-        patterns = [
+        """Extract an analysis-like JSON object from free-form text."""
+        if not text:
+            return None
+        payloads: List[Dict[str, Any]] = []
+        candidates: List[str] = []
+        for pattern in (
             r"```json\s*([\s\S]*?)\s*```",
             r"```\s*([\s\S]*?)\s*```",
-            r"\{[\s\S]*\}",
-        ]
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
+        ):
+            candidates.extend(re.findall(pattern, text))
+        candidates.append(text)
+        for candidate in candidates:
+            for parsed in self._iter_json_objects(candidate):
+                if self._is_analysis_like_payload(parsed):
+                    payloads.append(parsed)
+        if not payloads:
+            return None
+        payloads.sort(key=self._analysis_payload_score, reverse=True)
+        return payloads[0]
+
+    def _iter_json_objects(self, text: str):
+        decoder = json.JSONDecoder()
+        idx = 0
+        length = len(text)
+        while idx < length:
+            start = text.find("{", idx)
+            if start < 0:
+                break
+            try:
+                obj, end = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                idx = start + 1
+                continue
+            if isinstance(obj, dict):
+                yield obj
+            idx = start + max(1, end)
+
+    def _is_analysis_like_payload(self, parsed: Dict[str, Any]) -> bool:
+        keys = set(parsed.keys())
+        return bool(
+            {"opportunities", "hotspot_files", "architecture_summary", "status"} & keys
+        )
+
+    def _analysis_payload_score(self, payload: Dict[str, Any]) -> float:
+        if not isinstance(payload, dict):
+            return -1.0
+        score = 0.0
+        opps = payload.get("opportunities")
+        if isinstance(opps, list):
+            score += 10.0 * len(opps)
+        elif isinstance(opps, dict):
+            score += 8.0 * len(opps)
+        hotspot_files = payload.get("hotspot_files")
+        if isinstance(hotspot_files, list):
+            score += float(min(len(hotspot_files), 10))
+        if isinstance(payload.get("recommended_sequence"), list):
+            score += 5.0
+        for key in ("architecture_summary", "bottleneck_diagnosis", "strategy_rationale"):
+            if str(payload.get(key, "")).strip():
+                score += 2.0
+        return score
+
+    def _request_compact_final_json(
+        self,
+        session: AgentSession,
+        fallback_hotspots: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        if session.turn_count >= self.config.max_turns:
+            return None
+        try:
+            retry = self.llm_client.chat(
+                session,
+                (
+                    "Return exactly ONE compact JSON object now. "
+                    "No markdown, no tools. Required keys: status, hotspot_files, opportunities. "
+                    f"Use these hotspot files when relevant: {json.dumps(fallback_hotspots[:10])}"
+                ),
+                auto_execute_tools=False,
+            )
+        except Exception:
+            return None
+        parsed = self._extract_json(retry or "")
+        if isinstance(parsed, dict):
+            return parsed
+        try:
+            loaded = json.loads((retry or "").strip())
+        except Exception:
+            return None
+        return loaded if isinstance(loaded, dict) else None
+
+    def _coerce_analysis_result(
+        self,
+        payload: Dict[str, Any],
+        fallback_hotspots: List[str],
+    ) -> Optional[DeepCodeAnalysisResult]:
+        if not isinstance(payload, dict):
+            return None
+        status_raw = str(payload.get("status", "NEED_MORE_CONTEXT")).strip().upper()
+        allowed_status = {"OK", "NEED_MORE_EVIDENCE", "NEED_MORE_CONTEXT", "NEED_MORE_PROFILE", "NO_ACTIONABLE"}
+        status = status_raw if status_raw in allowed_status else "NEED_MORE_CONTEXT"
+        status_model = status if status in {"OK", "NEED_MORE_EVIDENCE", "NEED_MORE_CONTEXT"} else "NEED_MORE_CONTEXT"
+        hotspot_files = self._to_str_list(payload.get("hotspot_files"))
+        if not hotspot_files:
+            hotspot_files = self._to_str_list(fallback_hotspots)
+
+        opportunities = self._coerce_opportunities(
+            payload.get("opportunities"),
+            hotspot_files=hotspot_files,
+        )
+
+        normalized: Dict[str, Any] = {
+            "status": status_model,
+            "architecture_summary": str(payload.get("architecture_summary", "") or ""),
+            "bottleneck_diagnosis": str(payload.get("bottleneck_diagnosis", "") or ""),
+            "hotspot_files": hotspot_files,
+            "opportunities": opportunities,
+            "recommended_sequence": self._to_str_list(payload.get("recommended_sequence")),
+            "strategy_rationale": str(payload.get("strategy_rationale", "") or ""),
+            "exploration_notes": self._to_str_list(payload.get("exploration_notes")),
+        }
+        try:
+            return DeepCodeAnalysisResult(**normalized)
+        except Exception:
+            return None
+
+    def _coerce_opportunities(
+        self,
+        raw_opps: Any,
+        hotspot_files: List[str],
+    ) -> List[Dict[str, Any]]:
+        if isinstance(raw_opps, dict):
+            items = list(raw_opps.values())
+        elif isinstance(raw_opps, list):
+            items = raw_opps
+        else:
+            items = []
+        coerced: List[Dict[str, Any]] = []
+        for idx, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                continue
+            op_id = str(
+                item.get("opportunity_id")
+                or item.get("id")
+                or item.get("name")
+                or f"opportunity_{idx}"
+            ).strip()
+            title = str(item.get("title") or item.get("name") or op_id).strip()
+            category = str(item.get("category") or item.get("type") or "novel").strip()
+            target_files = self._to_str_list(item.get("target_files") or item.get("files"))
+            if not target_files and hotspot_files:
+                target_files = [hotspot_files[min(idx - 1, len(hotspot_files) - 1)]]
+            target_functions = self._to_str_list(
+                item.get("target_functions") or item.get("functions")
+            )
+            diagnosis = str(item.get("diagnosis") or item.get("problem") or "").strip()
+            mechanism = str(item.get("mechanism") or item.get("approach") or "").strip()
+            compiler_gap = str(
+                item.get("compiler_gap")
+                or item.get("gap")
+                or "Requires semantic/source-level transformation beyond compiler heuristics."
+            ).strip()
+            evidence = self._to_str_list(item.get("evidence"))
+            if not evidence:
+                asm = str(item.get("assembly_evidence") or "").strip()
+                rpt = str(item.get("compiler_report_evidence") or "").strip()
+                if asm:
+                    evidence.append(asm[:300])
+                if rpt:
+                    evidence.append(rpt[:300])
+            risk = str(item.get("risk_level") or "medium").strip().lower()
+            if risk not in {"low", "medium", "high"}:
+                risk = "medium"
+            impact = str(item.get("estimated_impact") or "medium").strip().lower()
+            if impact not in {"low", "medium", "high"}:
+                impact = "medium"
+            try:
+                confidence = float(item.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            confidence = max(0.0, min(1.0, confidence))
+            opp: Dict[str, Any] = {
+                "opportunity_id": op_id or f"opportunity_{idx}",
+                "title": title or f"Opportunity {idx}",
+                "category": category or "novel",
+                "family_hint": item.get("family_hint"),
+                "target_files": target_files,
+                "target_functions": target_functions,
+                "diagnosis": diagnosis,
+                "mechanism": mechanism,
+                "compiler_gap": compiler_gap,
+                "evidence": evidence,
+                "code_context": str(item.get("code_context") or "").strip(),
+                "reference_code": str(item.get("reference_code") or "").strip(),
+                "assembly_evidence": str(item.get("assembly_evidence") or "").strip(),
+                "compiler_report_evidence": str(
+                    item.get("compiler_report_evidence") or ""
+                ).strip(),
+                "estimated_impact": impact,
+                "confidence": confidence,
+                "risk_level": risk,
+                "expected_effect": self._to_str_list(item.get("expected_effect")),
+                "depends_on": self._to_str_list(item.get("depends_on")),
+                "conflicts_with": self._to_str_list(item.get("conflicts_with")),
+                "composable_with": self._to_str_list(item.get("composable_with")),
+                "implementation_complexity": str(
+                    item.get("implementation_complexity") or "medium"
+                ).strip(),
+                "lines_of_change_estimate": self._to_int(
+                    item.get("lines_of_change_estimate"), default=0
+                ),
+                "priority_rank": self._to_int(item.get("priority_rank"), default=idx),
+            }
+            coerced.append(opp)
+        return coerced
+
+    def _to_str_list(self, value: Any) -> List[str]:
+        if isinstance(value, list):
+            out: List[str] = []
+            for item in value:
+                s = str(item).strip()
+                if s and s not in out:
+                    out.append(s)
+            return out
+        if value is None:
+            return []
+        s = str(value).strip()
+        return [s] if s else []
+
+    def _to_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _repair_result_from_conversation(
+        self,
+        conversation_log: List[Dict[str, Any]],
+        final_response: str,
+        hotspot_files: List[str],
+    ) -> Optional[DeepCodeAnalysisResult]:
+        context = self._build_repair_context(
+            conversation_log=conversation_log,
+            final_response=final_response,
+            max_chars=24000,
+        )
+        if not context:
+            return None
+        repair_system = (
+            "You are a strict JSON formatter for HPC code analysis results. "
+            "Output exactly one JSON object matching DeepCodeAnalysisResult. "
+            "No markdown, no prose."
+        )
+        repair_user = (
+            "Convert the analysis transcript into a valid DeepCodeAnalysisResult JSON.\n"
+            "Rules:\n"
+            "1) Return JSON only.\n"
+            "2) Include 'status', 'hotspot_files', and 'opportunities'.\n"
+            "3) If evidence is weak, keep opportunities concise and lower confidence.\n"
+            f"4) Preserve these hotspot files when possible: {json.dumps(hotspot_files[:10])}\n\n"
+            "Transcript excerpt:\n"
+            f"{context}\n"
+        )
+        repair_session = self.llm_client.create_session(repair_system)
+        try:
+            response = self.llm_client.chat(
+                repair_session, repair_user, auto_execute_tools=False
+            )
+        except Exception:
+            return None
+        parsed = self._extract_json(response or "")
+        if not parsed:
+            try:
+                parsed = json.loads((response or "").strip())
+            except Exception:
+                parsed = None
+        if not isinstance(parsed, dict):
+            try:
+                retry = self.llm_client.chat(
+                    repair_session,
+                    "Return one valid JSON object only. No markdown. Include keys: "
+                    "status, hotspot_files, opportunities.",
+                    auto_execute_tools=False,
+                )
+            except Exception:
+                retry = ""
+            parsed = self._extract_json(retry or "")
+            if not parsed:
                 try:
-                    clean = match.strip()
-                    if not clean.startswith("{"):
-                        clean = "{" + clean.split("{", 1)[-1]
-                    if not clean.endswith("}"):
-                        clean = clean.rsplit("}", 1)[0] + "}"
-                    parsed = json.loads(clean)
-                    if "opportunities" in parsed:
-                        return parsed
-                except json.JSONDecodeError:
-                    continue
-        return None
+                    parsed = json.loads((retry or "").strip())
+                except Exception:
+                    parsed = None
+        if not isinstance(parsed, dict):
+            return None
+        return self._coerce_analysis_result(parsed, hotspot_files)
+
+    def _build_repair_context(
+        self,
+        conversation_log: List[Dict[str, Any]],
+        final_response: str,
+        max_chars: int = 24000,
+    ) -> str:
+        chunks: List[str] = []
+        total = 0
+        if final_response:
+            frag = final_response.strip()
+            if frag:
+                frag = frag[:1200]
+                chunks.append(f"[assistant-final]\n{frag}")
+                total += len(chunks[-1])
+        for entry in reversed(conversation_log):
+            role = str(entry.get("role", ""))
+            if role not in {"assistant", "tool"}:
+                continue
+            content = str(entry.get("content") or "").strip()
+            if not content:
+                continue
+            lower = content.lower()
+            if (
+                role == "tool"
+                and not any(
+                    k in lower
+                    for k in (
+                        "hotspot",
+                        "compiler",
+                        "assembly",
+                        "vector",
+                        "opportun",
+                        "cache",
+                        "bottleneck",
+                        "missed",
+                    )
+                )
+            ):
+                continue
+            snippet = content[:2000]
+            block = f"[{role}]\n{snippet}"
+            if total + len(block) + 2 > max_chars:
+                break
+            chunks.append(block)
+            total += len(block) + 2
+        chunks.reverse()
+        return "\n\n".join(chunks)
 
     def _extract_conversation_log(
         self, session: AgentSession
@@ -527,11 +1397,7 @@ class DeepCodeAnalysisAgent:
         for msg in session.messages:
             entry: Dict[str, Any] = {"role": msg.role}
             if msg.content:
-                entry["content"] = (
-                    msg.content[:500] + "..."
-                    if len(msg.content) > 500
-                    else msg.content
-                )
+                entry["content"] = msg.content
             if msg.tool_calls:
                 entry["tool_calls"] = [
                     {"name": tc.name, "arguments": tc.arguments}

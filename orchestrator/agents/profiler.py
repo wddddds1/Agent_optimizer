@@ -20,6 +20,8 @@ class ProfilerAgent:
         wrapper_command: Optional[list[str]],
         repeats: int,
         launcher_cfg: Optional[Dict[str, object]] = None,
+        profiling_cfg: Optional[Dict[str, object]] = None,
+        is_baseline: bool = False,
     ) -> Tuple[object, ProfileReport]:
         return profile_job(
             job=job,
@@ -31,4 +33,6 @@ class ProfilerAgent:
             wrapper_command=wrapper_command,
             repeats=repeats,
             launcher_cfg=launcher_cfg,
+            profiling_cfg=profiling_cfg,
+            is_baseline=is_baseline,
         )

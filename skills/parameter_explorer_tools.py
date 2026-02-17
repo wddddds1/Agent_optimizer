@@ -149,7 +149,8 @@ class ParameterExplorerTools:
             description=(
                 "Get the baseline performance profile including timing breakdown "
                 "(pair, neigh, comm, output, modify, other), system metrics "
-                "(CPU utilisation, RSS), and any notes."
+                "(CPU utilisation, RSS), function hotspots (when available), "
+                "and any notes."
             ),
             parameters={"type": "object", "properties": {}},
             handler=self._handle_get_profile,

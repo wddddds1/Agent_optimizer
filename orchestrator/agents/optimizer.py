@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Dict, List, Optional
 
 from schemas.action_ir import ActionIR
@@ -10,8 +11,10 @@ from schemas.candidate_ir import CandidateList
 from schemas.optimizer_output_ir import OptimizerOutput
 from schemas.plan_ir import PlanIR
 from schemas.profile_report import ProfileReport
+from orchestrator.errors import LLMUnavailableError
 from orchestrator.router import RuleContext, filter_actions
 from orchestrator.llm_client import LLMClient
+from skills.profile_payload import build_profile_payload
 
 
 class OptimizerAgent:
@@ -95,10 +98,7 @@ class OptimizerAgent:
         prompt = _load_prompt("optimizer")
         payload = {
             "plan": plan.model_dump(),
-            "profile": {
-                "timing_breakdown": profile.timing_breakdown,
-                "system_metrics": profile.system_metrics,
-            },
+            "profile": build_profile_payload(profile),
             "policy": policy,
             "exclude_action_ids": exclude_action_ids,
             "system_caps": system_caps or {},
@@ -115,8 +115,12 @@ class OptimizerAgent:
         try:
             output = OptimizerOutput(**data)
         except ValidationError:
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError("OptimizerAgent returned invalid OptimizerOutput JSON")
             return None
         if output.status != "OK":
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError(f"OptimizerAgent returned non-OK status: {output.status}")
             return None
         candidate_lists = _build_llm_candidates(
             output, plan, family_actions, exclude_action_ids
@@ -217,7 +221,12 @@ def _ensure_memory_keep(
             candidate_list.candidates.insert(0, action)
             existing.add(action.action_id)
         if len(candidate_list.candidates) > max_candidates:
-            candidate_list.candidates = candidate_list.candidates[:max_candidates]
+            candidate_list.candidates = _trim_candidates_for_family(
+                candidate_list.candidates,
+                family,
+                keep_set,
+                max_candidates,
+            )
     return candidate_lists
 
 
@@ -246,6 +255,78 @@ def _dedupe_candidate_lists(candidate_lists: List[CandidateList], plan: PlanIR) 
                 )
             )
     return deduped
+
+
+def _trim_candidates_for_family(
+    candidates: List[ActionIR],
+    family: str,
+    keep_set: set[str],
+    max_candidates: int,
+) -> List[ActionIR]:
+    if len(candidates) <= max_candidates:
+        return candidates
+    if family in {"parallel_pthread", "parallel_omp"}:
+        return _trim_thread_candidates(candidates, keep_set, max_candidates)
+    return candidates[:max_candidates]
+
+
+def _trim_thread_candidates(
+    candidates: List[ActionIR],
+    keep_set: set[str],
+    max_candidates: int,
+) -> List[ActionIR]:
+    trimmed = list(candidates)
+    while len(trimmed) > max_candidates:
+        removable = [
+            (idx, _thread_count(action))
+            for idx, action in enumerate(trimmed)
+            if action.action_id not in keep_set
+        ]
+        if not removable:
+            trimmed = trimmed[:max_candidates]
+            break
+        drop_idx, _ = min(
+            removable,
+            key=lambda item: (
+                10 ** 6 if item[1] is None else item[1],
+                item[0],
+            ),
+        )
+        trimmed.pop(drop_idx)
+    return trimmed
+
+
+def _thread_count(action: ActionIR) -> Optional[int]:
+    params = action.parameters or {}
+    run_args = params.get("run_args")
+    if isinstance(run_args, dict):
+        set_flags = run_args.get("set_flags")
+        if isinstance(set_flags, list):
+            for item in set_flags:
+                if not isinstance(item, dict):
+                    continue
+                values = item.get("values")
+                if not isinstance(values, list):
+                    continue
+                for raw in values:
+                    try:
+                        return int(raw)
+                    except (TypeError, ValueError):
+                        continue
+    env = params.get("env")
+    if isinstance(env, dict):
+        raw = env.get("OMP_NUM_THREADS")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"\.t(\d+)_", action.action_id)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 def _action_signature(action: ActionIR) -> str:

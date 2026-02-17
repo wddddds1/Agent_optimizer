@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Callable
 
@@ -13,8 +16,20 @@ from skills.verify import verify_run
 
 
 class VerifierAgent:
-    def __init__(self, llm_client: Optional[LLMClient] = None) -> None:
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        contract_store_path: Optional[Path] = None,
+    ) -> None:
         self.llm_client = llm_client
+        self._contract_store_path: Optional[Path] = None
+        self._contract_store: Dict[str, object] = {"version": 1, "contracts": {}}
+        if contract_store_path is not None:
+            self.configure_contract_store(contract_store_path)
+
+    def configure_contract_store(self, path: Path) -> None:
+        self._contract_store_path = path
+        self._load_contract_store()
 
     def verify(
         self,
@@ -43,7 +58,88 @@ class VerifierAgent:
             is_final_validation=is_final_validation,
             agentic_decider=agentic_decider,
             agentic_cfg=agentic_cfg if use_agent else None,
+            contract_getter=self._get_contract,
+            contract_putter=self._put_contract,
         )
+
+    def _job_fingerprint(self, job: JobIR) -> Dict[str, object]:
+        payload: Dict[str, object] = {
+            "app": job.app,
+            "case_id": job.case_id,
+            "run_args": list(job.run_args or []),
+            "env_keys": sorted((job.env or {}).keys()),
+            "app_bin": str(job.app_bin or ""),
+            "input_script": str(job.input_script or ""),
+        }
+        app_bin = Path(job.app_bin) if job.app_bin else None
+        if app_bin and app_bin.exists():
+            stat = app_bin.stat()
+            payload["app_bin_size"] = int(stat.st_size)
+            payload["app_bin_mtime_ns"] = int(stat.st_mtime_ns)
+        input_script = Path(job.input_script) if job.input_script else None
+        if input_script and input_script.exists():
+            stat = input_script.stat()
+            payload["input_size"] = int(stat.st_size)
+            payload["input_mtime_ns"] = int(stat.st_mtime_ns)
+        return payload
+
+    def _job_key(self, job: JobIR) -> str:
+        payload = self._job_fingerprint(job)
+        blob = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+    def _load_contract_store(self) -> None:
+        path = self._contract_store_path
+        if path is None:
+            return
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("contracts"), dict):
+                    self._contract_store = data
+                    return
+        except Exception:
+            pass
+        self._contract_store = {"version": 1, "contracts": {}}
+
+    def _save_contract_store(self) -> None:
+        path = self._contract_store_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(self._contract_store, indent=2, ensure_ascii=True),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        except Exception:
+            pass
+
+    def _get_contract(self, job: JobIR) -> Optional[Dict[str, object]]:
+        contracts = self._contract_store.get("contracts", {})
+        if not isinstance(contracts, dict):
+            return None
+        item = contracts.get(self._job_key(job))
+        if isinstance(item, dict):
+            contract = item.get("contract")
+            if isinstance(contract, dict):
+                return contract
+        return None
+
+    def _put_contract(self, job: JobIR, contract: Dict[str, object]) -> None:
+        contracts = self._contract_store.get("contracts")
+        if not isinstance(contracts, dict):
+            contracts = {}
+            self._contract_store["contracts"] = contracts
+        key = self._job_key(job)
+        contracts[key] = {
+            "fingerprint": self._job_fingerprint(job),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "contract": contract,
+        }
+        self._save_contract_store()
 
     def _agentic_decide(self, payload: Dict[str, object]) -> Dict[str, object]:
         prompt_path = Path(__file__).resolve().parents[2] / "prompts" / "agents" / "correctness_agent.md"

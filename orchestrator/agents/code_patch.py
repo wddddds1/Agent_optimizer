@@ -7,12 +7,14 @@ from typing import Dict, List, Optional
 
 from pydantic import ValidationError
 
+from orchestrator.errors import LLMUnavailableError
 from orchestrator.llm_client import LLMClient
 from schemas.action_ir import ActionIR
 from schemas.patch_edit_ir import PatchEdit, PatchEditProposal
 from schemas.patch_proposal_ir import PatchProposal
 from schemas.profile_report import ProfileReport
 from skills.patch_edit import StructuredEditError, apply_structured_edits
+from skills.profile_payload import build_profile_payload
 
 
 class CodePatchAgent:
@@ -45,11 +47,7 @@ class CodePatchAgent:
                 "expected_effect": action.expected_effect,
                 "risk_level": action.risk_level,
             },
-            "profile": {
-                "timing_breakdown": profile.timing_breakdown,
-                "system_metrics": profile.system_metrics,
-                "notes": profile.notes,
-            },
+            "profile": build_profile_payload(profile),
             "patch_rules": patch_rules,
             "allowed_files": allowed_files,
             "code_snippets": code_snippets,
@@ -67,6 +65,8 @@ class CodePatchAgent:
                     edit_proposal = PatchEditProposal(**data)
                     break
                 except ValidationError:
+                    if self.llm_client.config.strict_availability and attempt > 0:
+                        raise LLMUnavailableError("CodePatchAgent returned invalid PatchEditProposal JSON")
                     edit_proposal = None
             if attempt == 0:
                 hint = "Previous response invalid or empty; output one JSON object only."
@@ -75,8 +75,12 @@ class CodePatchAgent:
                 else:
                     payload["feedback"] = hint
                 continue
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError("CodePatchAgent returned empty response after retry")
             return None
         if edit_proposal is None:
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError("CodePatchAgent failed to produce a valid edit proposal")
             return None
         patch_proposal = PatchProposal(
             status=edit_proposal.status,

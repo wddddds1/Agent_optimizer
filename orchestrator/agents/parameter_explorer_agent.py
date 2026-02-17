@@ -38,7 +38,7 @@ current platform.  You do NOT know in advance which application you are tuning
   a different command.
 
 - **read_file**: Read source files, configs, etc.
-- **get_profile**: Get baseline timing breakdown.
+- **get_profile**: Get baseline timing/system metrics plus function hotspots when available.
 - **get_action_space**: Get available parameter families and concrete actions.
   Use `family_filter` to focus on a specific family.  **Read the family
   descriptions carefully** — they tell you what each family does and what
@@ -68,7 +68,7 @@ current platform.  You do NOT know in advance which application you are tuning
 
 3. **Understand the workload**:
    - Read the input script/config
-   - Look at the baseline profile to identify bottleneck categories
+   - Look at the baseline profile and function hotspots to identify bottlenecks
 
 4. **Check available actions**:
    - Use `get_action_space` to see all parameter families and their
@@ -129,6 +129,19 @@ When done, output a JSON object:
 - **build_config**: `"build_pack_id": "name"`
 - When unsure, call `get_action_space(family_filter="<family>")` to see
   concrete examples with the exact parameter structure.
+
+## Thread Count Selection (Important)
+- Do NOT exhaustively sweep thread counts.
+- Use `Platform Probe` to get `physical_cores`, `logical_cores`, and `core_groups`.
+- If `core_groups` include a performance cluster, treat that count as the
+  primary thread target.
+- Pick **2–3 representative counts**:
+  - `P` (performance cores, or physical_cores if no clusters)
+  - `ceil(P/2)` (or a similar mid-point)
+  - `1` **only if** baseline is not already single-thread or you need a
+    scaling sanity check
+- Avoid counts ≤4 on high-core machines unless the workload is tiny or
+  baseline CPU utilisation is extremely low and you need to confirm saturation.
 
 ## Rules
 
@@ -209,6 +222,8 @@ class ParameterExplorerAgent:
             )
             return self._parse_result(response, session)
         except Exception as exc:
+            if self.config.strict_availability:
+                raise
             return ExplorationResult(
                 status="ERROR",
                 candidates=[],
@@ -227,7 +242,7 @@ class ParameterExplorerAgent:
         job_context: Optional[Dict[str, Any]],
         platform_probe: Optional[Dict[str, str]] = None,
     ) -> str:
-        app = (job_context or {}).get("app", "lammps")
+        app = (job_context or {}).get("app", "target application")
         parts = [
             "## Task: Explore Platform and Propose Parameter Candidates",
             "",
@@ -374,11 +389,7 @@ class ParameterExplorerAgent:
         for msg in session.messages:
             entry: Dict[str, Any] = {"role": msg.role}
             if msg.content:
-                entry["content"] = (
-                    msg.content[:500] + "..."
-                    if len(msg.content) > 500
-                    else msg.content
-                )
+                entry["content"] = msg.content
             if msg.tool_calls:
                 entry["tool_calls"] = [
                     {"name": tc.name, "arguments": tc.arguments}

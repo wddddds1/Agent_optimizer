@@ -5,6 +5,7 @@ from typing import Dict, Optional
 
 from pydantic import ValidationError
 
+from orchestrator.errors import LLMUnavailableError
 from orchestrator.llm_client import LLMClient
 from schemas.review_ir import ReviewDecision
 
@@ -20,18 +21,26 @@ class ReviewerAgent:
         self._consecutive_fallbacks = 0
 
     def review(self, payload: Dict[str, object]) -> ReviewDecision:
-        if not self.llm_client or not self.llm_client.config.enabled:
-            return self._fallback("LLM disabled; continue by default.")
+        if not self.llm_client:
+            return self._fallback("LLM client unavailable; continue by default.")
+        if not self.llm_client.config.enabled:
+            return self._fallback("LLM disabled by config; continue by default.")
         prompt = _load_prompt("reviewer")
         data = self.llm_client.request_json(prompt, payload)
         self.last_llm_trace = {"payload": payload, "response": data}
         if not data:
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError("ReviewerAgent returned empty response")
             return self._fallback("LLM returned empty response; continue by default.")
         try:
             decision = ReviewDecision(**data)
         except ValidationError:
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError("ReviewerAgent returned invalid ReviewDecision JSON")
             return self._fallback("LLM response invalid; continue by default.")
         if decision.status != "OK":
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError(f"ReviewerAgent returned non-OK status: {decision.status}")
             return self._fallback(
                 "LLM returned non-OK status; continue by default.",
                 extra_evidence={"status": decision.status},

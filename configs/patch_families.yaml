@@ -8,6 +8,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["comm_reduce"]
+    detection_hints:
+      patterns:
+        - "MPI collective called every iteration but result stable for N iterations"
+        - "allreduce/bcast inside tight loop with slowly-changing data"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "high MPI time fraction in profile"
+        - "collective call count >> expected from algorithm"
 
   - id: comm_overlap
     description: "Overlap communication with computation."
@@ -17,6 +25,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["comm_reduce", "compute_opt"]
+    detection_hints:
+      patterns:
+        - "blocking recv followed by independent compute that doesn't use recv data"
+        - "Isend→compute→Wait pattern possible but currently uses Send"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "MPI wait time visible in profile"
+        - "computation and communication are serialized"
 
   - id: message_aggregation
     description: "Aggregate small messages to reduce overhead."
@@ -26,6 +42,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["comm_reduce"]
+    detection_hints:
+      patterns:
+        - "many small Send/Recv calls to same rank in sequence"
+        - "per-element or per-particle messages instead of packed buffers"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "high message count with small average message size"
+        - "MPI latency dominates bandwidth"
 
   - id: nonblocking_overlap
     description: "Use nonblocking communication to overlap compute/comm."
@@ -35,6 +59,13 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["comm_reduce", "compute_opt"]
+    detection_hints:
+      patterns:
+        - "synchronous collective where async would overlap with independent compute"
+        - "MPI_Barrier or MPI_Allreduce blocking when partial results could proceed"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "idle time between collective and next compute visible in trace"
 
   - id: mpi_hoist_out_of_inner_loop
     description: "Hoist MPI collectives out of inner loops."
@@ -44,6 +75,13 @@ families:
     mandatory_gates: ["runtime", "correctness", "variance"]
     requires_strict_correctness: true
     patch_tags: ["comm_reduce", "compute_opt"]
+    detection_hints:
+      patterns:
+        - "MPI collective inside inner loop where result depends only on outer-loop variables"
+        - "allreduce called per-particle or per-element instead of per-timestep"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "collective call count scales with problem size, not iteration count"
 
   - id: compute_comm_reorder
     description: "Reorder compute/communication to avoid redundant sync."
@@ -53,6 +91,13 @@ families:
     mandatory_gates: ["runtime", "correctness", "variance"]
     requires_strict_correctness: true
     patch_tags: ["comm_reduce"]
+    detection_hints:
+      patterns:
+        - "computation depends on stale halo; reorder to hide latency"
+        - "barrier separating phases that could overlap"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "idle time at synchronization points in trace"
 
   - id: omp_scope_adjust
     description: "Move OpenMP scope to inner-most hot loops."
@@ -61,6 +106,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["compute_opt"]
+    detection_hints:
+      patterns:
+        - "parallel region around outer loop but work is in inner loop"
+        - "nested parallelism or parallel region with serial sections"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "load imbalance in per-thread TAU times"
+        - "low parallel efficiency despite sufficient work"
 
   - id: loop_interchange_blocking
     description: "Loop interchange/blocking for cache locality."
@@ -69,6 +122,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["mem_locality"]
+    detection_hints:
+      patterns:
+        - "nested loops where inner loop strides across rows (C/C++) or columns (Fortran)"
+        - "2D array access with non-unit stride in inner loop"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "high L1/L2 cache miss rate in hotspot function"
+        - "memory bandwidth bound despite low arithmetic intensity"
 
   - id: loop_fission
     description: "Split optional/flag-guarded diagnostics from hot loops (do not duplicate core updates)."
@@ -77,6 +138,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["mem_locality"]
+    detection_hints:
+      patterns:
+        - "flag-guarded diagnostics mixed with hot compute inside tight loop"
+        - "conditional branches inside tight loop that could be split into separate pass"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "branch mispredictions in hot loop"
+        - "working set exceeds cache due to diagnostic arrays"
 
   - id: loop_fusion
     description: "Fuse adjacent loops to reduce passes over data."
@@ -85,6 +154,13 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["mem_locality"]
+    detection_hints:
+      patterns:
+        - "adjacent loops over same range and data; redundant passes over array"
+        - "write-then-read pattern across consecutive loops on same array"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "multiple passes over same data visible in cache miss profile"
 
   - id: array_packing
     description: "Pack multiple arrays to improve cache line reuse."
@@ -93,6 +169,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["mem_locality"]
+    detection_hints:
+      patterns:
+        - "multiple separate arrays accessed together in hot loop (AoS↔SoA opportunity)"
+        - "multiple loads from different base addresses per iteration"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "cache line utilization below 50% due to scattered accesses"
+        - "assembly shows loads from many distinct base pointers per iteration"
 
   - id: temporary_elision
     description: "Eliminate temporary arrays and redundant stores."
@@ -101,6 +185,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["mem_locality"]
+    detection_hints:
+      patterns:
+        - "intermediate arrays written then immediately read in next loop"
+        - "redundant stores to temporary that could be kept in register"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "store-to-load forwarding stalls in profile"
+        - "unnecessary memory traffic from temporaries"
 
   - id: cache_local_pointers
     description: "Cache frequently accessed pointers/arrays locally in hot loops."
@@ -111,6 +203,12 @@ families:
     patch_tags: ["mem_locality", "compute_opt"]
     compiler_covered: true
     tier: "micro"
+    detection_hints:
+      patterns:
+        - "repeated pointer dereference chains in hot loop (e.g., obj->field->data[i])"
+      languages: ["c", "cpp"]
+      indicators:
+        - "compiler report shows aliasing prevents hoisting"
 
   - id: cache_local_pointers_multi
     description: "Cache pointers/arrays across related hot functions (multi-function)."
@@ -121,6 +219,12 @@ families:
     patch_tags: ["mem_locality", "compute_opt"]
     compiler_covered: true
     tier: "micro"
+    detection_hints:
+      patterns:
+        - "same pointer dereference chains repeated across multiple related functions"
+      languages: ["c", "cpp"]
+      indicators:
+        - "multiple functions with identical aliasing issues in compiler report"
 
   - id: loop_unroll
     description: "Loop unrolling for hot inner loops."
@@ -131,6 +235,13 @@ families:
     patch_tags: ["compute_opt"]
     compiler_covered: true
     tier: "micro"
+    detection_hints:
+      patterns:
+        - "short-trip inner loops with fixed bounds"
+        - "inner loop body too small for compiler to auto-unroll"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "compiler report says 'not unrolled: trip count too low'"
 
   - id: prefetch_hints
     description: "Add prefetch hints for predictable access."
@@ -139,6 +250,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["mem_locality"]
+    detection_hints:
+      patterns:
+        - "predictable but long-stride access patterns in inner loop"
+        - "linked-list or indirect-indexed traversal with regular pattern"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "high cache miss rate with predictable access pattern"
+        - "memory-bound hotspot with strided or indirect access"
 
   - id: branch_simplify
     description: "Simplify branches and avoid redundant condition checks."
@@ -149,6 +268,13 @@ families:
     patch_tags: ["compute_opt"]
     compiler_covered: true
     tier: "micro"
+    detection_hints:
+      patterns:
+        - "redundant conditions; branches that are almost always taken/not-taken"
+        - "invariant condition tested inside hot loop"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "branch misprediction rate >5% in hot loop"
 
   - id: alignment_hints
     description: "Add alignment/contiguous hints to improve vectorization."
@@ -157,6 +283,13 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["compute_opt"]
+    detection_hints:
+      patterns:
+        - "unaligned SIMD loads in assembly; arrays allocated without alignment guarantee"
+        - "compiler report says 'unaligned access' or 'cannot prove alignment'"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "unaligned load/store instructions in assembly (vmovupd vs vmovapd)"
 
   - id: vectorization_enablers
     description: "Enable vector-friendly access patterns."
@@ -165,6 +298,14 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["compute_opt"]
+    detection_hints:
+      patterns:
+        - "gather/scatter preventing vectorization; pointer aliasing blocks SIMD"
+        - "data-dependent branches in inner loop preventing vectorization"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "compiler report says 'not vectorized: data dependency' or 'assumed alias'"
+        - "scalar instructions (mulsd) where SIMD expected"
 
   - id: hoist_invariant
     description: "Hoist loop-invariant computations."
@@ -175,6 +316,13 @@ families:
     patch_tags: ["compute_opt"]
     compiler_covered: true
     tier: "micro"
+    detection_hints:
+      patterns:
+        - "expressions recomputed every iteration but depend only on outer-loop variables"
+        - "function calls with constant arguments inside inner loop"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "compiler report shows loop-carried dependency preventing hoisting"
 
   - id: conditional_elision
     description: "Move guarded updates inside conditionals."
@@ -183,6 +331,13 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["compute_opt"]
+    detection_hints:
+      patterns:
+        - "unconditional updates followed by conditional overwrite"
+        - "guard condition can be moved outward to avoid unnecessary work"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "wasted stores visible in memory write profile"
 
   - id: math_equivalence
     description: "Math equivalence (pow->mul, fast exp)."
@@ -192,6 +347,13 @@ families:
     mandatory_gates: ["runtime", "correctness", "variance"]
     requires_strict_correctness: true
     patch_tags: ["compute_opt"]
+    detection_hints:
+      patterns:
+        - "pow(x,2)→x*x; exp→fast approximation; division→reciprocal multiply"
+        - "transcendental functions (sin/cos/exp/log) in hot loop"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "high cycles on math library calls in profile"
 
   - id: precision_policy
     description: "Localized precision policy adjustments."
@@ -201,6 +363,13 @@ families:
     mandatory_gates: ["runtime", "correctness", "variance"]
     requires_strict_correctness: true
     patch_tags: ["compute_opt"]
+    detection_hints:
+      patterns:
+        - "double precision where float suffices for intermediate values"
+        - "expensive transcendentals that could use reduced-precision versions"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "SIMD width halved due to double vs float (2x throughput opportunity)"
 
   - id: vectorization_hints
     description: "Add restrict/align/simd hints."
@@ -209,6 +378,13 @@ families:
     risk: "medium"
     mandatory_gates: ["runtime", "correctness", "variance"]
     patch_tags: ["compute_opt"]
+    detection_hints:
+      patterns:
+        - "missing restrict/align/simd pragmas; compiler report says 'assumed alias'"
+        - "loop could vectorize but compiler lacks aliasing proof"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "compiler vectorization report shows 'not vectorized' for hot loop"
 
   - id: partitioning_rebalance
     description: "Partitioning/load rebalance adjustments."
@@ -218,45 +394,11 @@ families:
     mandatory_gates: ["runtime", "correctness", "variance"]
     requires_strict_correctness: true
     patch_tags: ["imbalance_reduce"]
-
-  # ──── Algorithm-level families (reference: LAMMPS OPT backend) ────
-
-  - id: param_table_pack
-    description: "Pack multiple coefficient arrays (cutsq, lj1-lj4, offset) into a single cache-aligned struct for one-cache-line lookup. Reference: pair_lj_cut_opt.cpp fast_alpha_t."
-    transform_types: ["param_table_pack"]
-    requires_caps: ["memory_tuning_knobs"]
-    requires_hotspot: ["pair"]
-    risk: "medium"
-    mandatory_gates: ["runtime", "correctness", "variance"]
-    patch_tags: ["mem_locality", "compute_opt", "algorithm"]
-    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
-
-  - id: special_pair_split
-    description: "Split sbindex==0 fast path from special-bond handling. ~99% of pairs skip factor_lj and NEIGHMASK. Reference: pair_lj_cut_opt.cpp lines 123-192."
-    transform_types: ["special_pair_split"]
-    requires_caps: ["source_patch"]
-    requires_hotspot: ["pair"]
-    risk: "medium"
-    mandatory_gates: ["runtime", "correctness", "variance"]
-    patch_tags: ["compute_opt", "algorithm"]
-    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
-
-  - id: flat_coeff_lookup
-    description: "Flatten 2D coefficient arrays cutsq[i][j] into 1D tabsix[i*ntypes+j] to eliminate pointer indirection. Usually combined with param_table_pack."
-    transform_types: ["flat_coeff_lookup"]
-    requires_caps: ["memory_tuning_knobs"]
-    requires_hotspot: ["pair"]
-    risk: "medium"
-    mandatory_gates: ["runtime", "correctness", "variance"]
-    patch_tags: ["mem_locality", "algorithm"]
-    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
-
-  - id: neighbor_prefetch
-    description: "Insert software prefetch for next neighbor's coordinates in inner loop: __builtin_prefetch(&x[jlist[jj+dist]])."
-    transform_types: ["neighbor_prefetch"]
-    requires_caps: ["memory_tuning_knobs"]
-    requires_hotspot: ["pair"]
-    risk: "low"
-    mandatory_gates: ["runtime", "correctness", "variance"]
-    patch_tags: ["mem_locality"]
-    profiling_trigger: ["memory_bound", "cache_thrashing"]
+    detection_hints:
+      patterns:
+        - "static work distribution with varying per-element cost"
+        - "fixed partitioning that doesn't account for density variation"
+      languages: ["c", "cpp", "fortran"]
+      indicators:
+        - "load imbalance visible in TAU per-thread/per-rank times"
+        - "max thread time >> mean thread time"

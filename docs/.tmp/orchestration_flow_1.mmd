@@ -1,0 +1,43 @@
+flowchart TD
+    A[CLI Start<br/>orchestrator.main] --> B[Load Configs + Case<br/>Build JobIR/Action Space]
+    B --> C[LLM Preflight<br/>all enabled endpoints]
+    C --> D[run_optimization]
+
+    D --> E[Init Agents/Memory/Trace]
+    E --> F[Run Baseline via Executor]
+    F --> G{Baseline PASS?}
+    G -- No --> G1[Stop + Write Report]
+    G -- Yes --> H{Two-Phase Enabled?}
+
+    H -- Yes --> I{Phase1 Cache Hit?}
+    I -- Yes --> I1[Single Validation Run]
+    I -- No --> J[ParameterExplorerAgent<br/>propose run/build candidates]
+    J --> K[Batch Execute Phase1 Candidates]
+    I1 --> L{Phase1 Best Valid?}
+    K --> L
+    L -- No --> M[Fallback to iterative mode]
+    L -- Yes --> N[Enter PATCH phase]
+
+    H -- No --> M
+    N --> O[DeepCodeAnalysisAgent once]
+    M --> P[Main Iteration Loop]
+    O --> P
+
+    P --> Q[Build Context from best_chain<br/>profile/features/hotspot/memory]
+    Q --> R[Generate action pool<br/>replay/deep-analysis/patch-planner/legacy]
+    R --> S[Planner analyze + plan]
+    S --> T[Optimizer propose candidates]
+    T --> U[Ranker rank candidates<br/>heuristic + memory Bayes + optional LLM]
+    U --> V{Ranked actions empty?}
+    V -- Yes --> V1[Stop or promote patch scope]
+    V -- No --> W[Execute ranked actions]
+
+    W --> X[Patch path:<br/>proposal->review->apply->preflight->debug]
+    X --> Y[_run_experiment<br/>run/build/profile/verify/persist]
+    Y --> Z[Update memory/state<br/>select winners/composite]
+    Z --> AA[Reviewer decision<br/>continue/stop/switch phase]
+    AA --> AB{Stop condition hit?}
+    AB -- No --> P
+    AB -- Yes --> AC[Validation Top1 if configured]
+    AC --> AD[Final Composite Validation]
+    AD --> AE[Write report.md/report_zh.md<br/>agent_trace.json/best_state.json]

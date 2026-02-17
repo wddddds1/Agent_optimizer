@@ -81,6 +81,72 @@ patch_rules:
   max_snippets: 12
   debug_max_attempts: 2
 
+patch_families:
+  - id: param_table_pack
+    description: "Pack multiple coefficient arrays (cutsq, lj1-lj4, offset) into a single cache-aligned struct for one-cache-line lookup per type pair. Reference: pair_lj_cut_opt.cpp fast_alpha_t."
+    transform_types: ["param_table_pack"]
+    requires_caps: ["memory_tuning_knobs"]
+    requires_hotspot: ["pair"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality", "compute_opt", "algorithm"]
+    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
+    detection_hints:
+      patterns:
+        - "multiple coefficient arrays (cutsq, lj1-lj4, offset) loaded separately per type pair"
+        - "struct-of-arrays coefficient layout causing multiple cache line loads"
+      languages: ["cpp"]
+      indicators:
+        - "multiple movsd from different base addresses per neighbor iteration"
+  - id: special_pair_split
+    description: "Split sbindex==0 fast path from special-bond handling. ~99% of pairs skip factor_lj and NEIGHMASK. Reference: pair_lj_cut_opt.cpp lines 123-192."
+    transform_types: ["special_pair_split"]
+    requires_caps: ["source_patch"]
+    requires_hotspot: ["pair"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["compute_opt", "algorithm"]
+    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
+    detection_hints:
+      patterns:
+        - "sbmask/NEIGHMASK check on every neighbor when >99% are zero"
+        - "factor_lj = special_lj[sbmask(j)] branch in inner loop"
+      languages: ["cpp"]
+      indicators:
+        - "branch in inner loop that is almost always not-taken"
+  - id: flat_coeff_lookup
+    description: "Flatten 2D coefficient arrays cutsq[i][j] into 1D tabsix[i*ntypes+j] to eliminate pointer indirection. Usually combined with param_table_pack."
+    transform_types: ["flat_coeff_lookup"]
+    requires_caps: ["memory_tuning_knobs"]
+    requires_hotspot: ["pair"]
+    risk: "medium"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality", "algorithm"]
+    reference_file: "third_party/lammps/src/OPT/pair_lj_cut_opt.cpp"
+    detection_hints:
+      patterns:
+        - "2D array indexing cutsq[itype][jtype] with pointer-to-pointer indirection"
+        - "double** coefficient lookup in inner loop"
+      languages: ["cpp"]
+      indicators:
+        - "pointer chase visible in assembly for coefficient access"
+  - id: neighbor_prefetch
+    description: "Insert software prefetch for next neighbor's coordinates in inner loop: __builtin_prefetch(&x[jlist[jj+dist]])."
+    transform_types: ["neighbor_prefetch"]
+    requires_caps: ["memory_tuning_knobs"]
+    requires_hotspot: ["pair"]
+    risk: "low"
+    mandatory_gates: ["runtime", "correctness", "variance"]
+    patch_tags: ["mem_locality"]
+    profiling_trigger: ["memory_bound", "cache_thrashing"]
+    detection_hints:
+      patterns:
+        - "indirect neighbor coordinate access x[jlist[jj]] without prefetch"
+        - "inner loop iterates over neighbor list with random access to coordinate array"
+      languages: ["cpp"]
+      indicators:
+        - "high L1/L2 cache miss rate on coordinate loads in pair force loop"
+
 variants_prefer_mode: exclusive
 variants:
   - id: "openmp_backend"

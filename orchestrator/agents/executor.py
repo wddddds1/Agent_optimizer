@@ -26,6 +26,7 @@ class ExecutorAgent:
         verifier,
         artifacts_dir,
         time_command: Optional[str],
+        profiling_cfg: Optional[Dict[str, object]],
         wrappers_cfg: Optional[list[dict]],
         build_cfg: Dict[str, object],
         build_packs: Optional[Dict[str, object]],
@@ -41,6 +42,8 @@ class ExecutorAgent:
         iteration: Optional[int],
         llm_trace: Optional[Dict[str, object]],
         reporter,
+        arg_rules: Optional[list[dict]] = None,
+        run_purpose: str = "score",
     ) -> ExperimentIR:
         return self.runner(
             exp_id=exp_id,
@@ -56,6 +59,7 @@ class ExecutorAgent:
             verifier=verifier,
             artifacts_dir=artifacts_dir,
             time_command=time_command,
+            profiling_cfg=profiling_cfg,
             wrappers_cfg=wrappers_cfg,
             build_cfg=build_cfg,
             build_packs=build_packs,
@@ -71,4 +75,6 @@ class ExecutorAgent:
             iteration=iteration,
             llm_trace=llm_trace,
             reporter=reporter,
+            arg_rules=arg_rules,
+            run_purpose=run_purpose,
         )

@@ -9,6 +9,7 @@ from orchestrator.agents.patch_debug import PatchDebugAgent
 from orchestrator.agents.patch_review import PatchReviewAgent
 from orchestrator.agents.patch_planner import PatchPlannerAgent
 from orchestrator.agents.code_analysis_agent import DeepCodeAnalysisAgent
+from orchestrator.agents.orchestrator_agent import OrchestratorAgent
 from orchestrator.agents.parameter_explorer_agent import ParameterExplorerAgent
 from orchestrator.agents.reflection import ReflectionAgent
 from orchestrator.agents.reviewer import ReviewerAgent
@@ -31,6 +32,7 @@ __all__ = [
     "CodePatchAgent",
     "AgenticCodePatchAgent",
     "DeepCodeAnalysisAgent",
+    "OrchestratorAgent",
     "create_agentic_code_patch_agent",
     "PatchDebugAgent",
     "PatchReviewAgent",

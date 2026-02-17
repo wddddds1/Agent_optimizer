@@ -60,17 +60,29 @@ class RunOutput:
     time_output_path: Optional[str]
     system_metrics: Dict[str, float]
     samples: List[float]
+    per_repeat_exit_codes: List[int] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.per_repeat_exit_codes is None:
+            self.per_repeat_exit_codes = []
 
 
-def _extract_log_path(run_args: List[str], workdir: Path, artifacts_dir: Optional[Path] = None) -> Path:
+def _extract_log_path(
+    run_args: List[str],
+    workdir: Path,
+    artifacts_dir: Optional[Path] = None,
+    stdout_fallback: Optional[Path] = None,
+) -> Path:
     if "-log" in run_args:
         idx = run_args.index("-log")
         if idx + 1 < len(run_args):
             return (workdir / run_args[idx + 1]).resolve()
+    if stdout_fallback is not None:
+        return stdout_fallback.resolve()
     # For non-LAMMPS apps (no -log flag), fall back to stdout capture
     if artifacts_dir is not None:
         return (artifacts_dir / "stdout.log").resolve()
-    return (workdir / "log.lammps").resolve()
+    return (workdir / "run.log").resolve()
 
 
 def _monitor_process(
@@ -155,6 +167,7 @@ def run_job(
     env.update(env_overrides)
 
     runtime_samples: List[float] = []
+    per_repeat_exit_codes: List[int] = []
     exit_code = 0
     system_metrics: Dict[str, float] = {}
 
@@ -192,11 +205,12 @@ def run_job(
                 daemon=True,
             )
             monitor_thread.start()
-            exit_code = proc.wait()
+            repeat_exit = proc.wait()
             stop_event.set()
             monitor_thread.join(timeout=monitor_interval * 2 if monitor_interval else 0.1)
         end = time.monotonic()
         runtime_samples.append(end - start)
+        per_repeat_exit_codes.append(repeat_exit)
 
         if time_command:
             if time_file != stderr_file:
@@ -205,12 +219,19 @@ def run_job(
                 except FileNotFoundError:
                     pass
 
-    # For non-LAMMPS apps without a -log flag, use the actual stdout capture file
-    # (stdout_path already accounts for repeats: stdout.log or stdout_0.log)
-    if job.app != "lammps":
-        log_path = stdout_path.resolve()
-    else:
-        log_path = _extract_log_path(run_args, workdir)
+    # Determine overall exit code: first non-zero, or 0 if all passed
+    exit_code = 0
+    for rc in per_repeat_exit_codes:
+        if rc != 0:
+            exit_code = rc
+            break
+
+    log_path = _extract_log_path(
+        run_args,
+        workdir,
+        artifacts_dir=artifacts_dir,
+        stdout_fallback=stdout_path,
+    )
 
     mean_runtime = sum(runtime_samples) / len(runtime_samples) if runtime_samples else 0.0
     return RunOutput(
@@ -222,4 +243,5 @@ def run_job(
         time_output_path=str(time_output_path) if time_command else None,
         system_metrics=system_metrics,
         samples=runtime_samples,
+        per_repeat_exit_codes=per_repeat_exit_codes,
     )

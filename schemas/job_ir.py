@@ -17,7 +17,7 @@ class Budgets(BaseModel):
 
 
 class JobIR(BaseModel):
-    app: Literal["lammps", "bwa"] = "lammps"
+    app: str = "lammps"
     case_id: str
     workdir: str
     app_bin: str = ""
@@ -32,6 +32,8 @@ class JobIR(BaseModel):
 
     @model_validator(mode="after")
     def _validate_paths(self) -> "JobIR":
+        if not self.app or not str(self.app).strip():
+            raise ValueError("app must be set")
         # Sync app_bin ↔ lammps_bin for backward compatibility
         if self.app_bin and not self.lammps_bin:
             self.lammps_bin = self.app_bin

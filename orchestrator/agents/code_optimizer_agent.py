@@ -2,15 +2,23 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from orchestrator.agent_llm import AgentConfig, AgentLLMClient, AgentSession, MAX_TURNS_SENTINEL
+from orchestrator.agent_llm import (
+    AgentConfig,
+    AgentLLMClient,
+    AgentSession,
+    MAX_TURNS_SENTINEL,
+    TOOL_REPAIR_EXHAUSTED_SENTINEL,
+)
 from schemas.action_ir import ActionIR
 from schemas.patch_proposal_ir import PatchProposal
 from schemas.profile_report import ProfileReport
 from skills.agent_tools import CodeOptimizationTools
+from skills.profile_payload import build_profile_payload
 
 
 SYSTEM_PROMPT = """\
@@ -66,6 +74,11 @@ that require semantic understanding beyond the compiler's reach.
 - **preview_patch**: Preview what a patch would look like when applied
 - **find_anchor_occurrences**: Find where an anchor string occurs
 - **apply_patch_dry_run**: Test if a patch applies cleanly
+
+Tool-call contract for `create_patch` (STRICT):
+- `arguments` MUST be a JSON object.
+- It MUST include both required fields: `file_path` (string) and `changes` (array).
+- Never call `create_patch` with `{}` or missing fields.
 
 ### Verification
 - **compile**: Full build with the patch applied
@@ -223,12 +236,11 @@ class CodeOptimizerAgent:
         Returns:
             OptimizationResult with the patch and metadata
         """
+        # Clear per-action patch state so a failed action cannot reuse stale diffs.
+        self.tools.reset_session_state()
+
         # Set up profile data for tools
-        profile_data = {
-            "timing_breakdown": profile.timing_breakdown,
-            "system_metrics": profile.system_metrics,
-            "notes": profile.notes,
-        }
+        profile_data = build_profile_payload(profile)
         self.tools.set_profile_data(profile_data)
 
         # Create session with system prompt
@@ -248,9 +260,21 @@ class CodeOptimizerAgent:
 
             # Parse the final response
             result = self._parse_result(response, session)
+            if (
+                result.status == "NEED_MORE_CONTEXT"
+                and response != MAX_TURNS_SENTINEL
+                and not response.startswith(TOOL_REPAIR_EXHAUSTED_SENTINEL)
+            ):
+                retry_response = self._request_final_json_retry(session)
+                if retry_response:
+                    retry_result = self._parse_result(retry_response, session)
+                    if retry_result.status != "NEED_MORE_CONTEXT":
+                        return retry_result
             return result
 
         except Exception as e:
+            if self.config.strict_availability:
+                raise
             return OptimizationResult(
                 status="ERROR",
                 patch_diff="",
@@ -400,8 +424,25 @@ class CodeOptimizerAgent:
             "6. Identify the **specific gap** the compiler cannot fill",
             "7. Check **search_experience** for similar past patches and their results",
             "8. Design a targeted patch that addresses the identified gap",
-            "9. **create_patch** and **compile_single** to verify",
-            "10. Output final result as JSON",
+            "9. **create_patch** to produce a concrete diff",
+            "10. Run **compile_single** at most ONCE for sanity verification "
+            "(skip repeated compile attempts)",
+            "11. Output final result as JSON immediately after patch+sanity check",
+            "",
+            "## Tool Call Contract (STRICT)",
+            "When calling `create_patch`, arguments MUST be a JSON object containing:",
+            '- `file_path`: string',
+            '- `changes`: array',
+            "Do NOT call `create_patch` with `{}` or missing fields.",
+            "If you receive a tool argument error, fix arguments and retry immediately.",
+            "",
+            "## Termination Rules (STRICT)",
+            "- After the first successful `create_patch`, you MUST output final JSON "
+            "within the next 2 assistant turns.",
+            "- If `compile_single` reports 'no compile_commands.json' or fallback-mode "
+            "success/failure, do NOT call `compile_single` again.",
+            "- Do NOT keep exploring unrelated files after a valid patch is created. "
+            "Finalize with JSON.",
             "",
             "IMPORTANT: If the compiler optimization report shows that your intended "
             "optimization is already performed, DO NOT create a patch. Instead, report "
@@ -418,29 +459,30 @@ class CodeOptimizerAgent:
         """Parse the agent's final response into an OptimizationResult."""
         conversation_log = self._extract_conversation_log(session)
 
-        # Guard: if the agent ran out of turns, check whether it still managed
-        # to produce a substantive patch via tool calls.
-        if response == MAX_TURNS_SENTINEL:
-            patch_diff = self.tools._current_patch or ""
-            if patch_diff:
-                # Agent created a patch but ran out of turns before outputting
-                # the final JSON.  Accept with reduced confidence.
-                return OptimizationResult(
-                    status="OK",
-                    patch_diff=patch_diff,
-                    rationale="Agent exhausted max turns but produced a patch via tools.",
-                    diagnosis="",
-                    confidence=0.4,
-                    expected_improvement="unknown",
-                    conversation_log=conversation_log,
-                    total_turns=session.turn_count,
-                    total_tokens=session.total_tokens,
-                )
-            # No patch produced at all — truly incomplete.
+        if response.startswith(TOOL_REPAIR_EXHAUSTED_SENTINEL):
             return OptimizationResult(
                 status="NEED_MORE_CONTEXT",
                 patch_diff="",
-                rationale="Agent exhausted maximum turns without producing a patch.",
+                rationale=(
+                    "Agent produced repeated invalid tool calls; repair budget exhausted. "
+                    + response
+                ),
+                diagnosis="",
+                confidence=0.0,
+                expected_improvement="0%",
+                conversation_log=conversation_log,
+                total_turns=session.turn_count,
+                total_tokens=session.total_tokens,
+            )
+
+        # Strict mode: no fallback to tool-side patch state without final JSON.
+        if response == MAX_TURNS_SENTINEL:
+            return OptimizationResult(
+                status="NEED_MORE_CONTEXT",
+                patch_diff="",
+                rationale=(
+                    "Agent exhausted maximum turns before returning final JSON output."
+                ),
                 diagnosis="",
                 confidence=0.0,
                 expected_improvement="0%",
@@ -453,9 +495,23 @@ class CodeOptimizerAgent:
         json_result = self._extract_json(response)
 
         if json_result:
+            _status = json_result.get("status", "NEED_MORE_CONTEXT")
+            _patch = json_result.get("patch_diff", "")
+            if _status == "OK" and not _patch:
+                return OptimizationResult(
+                    status="NEED_MORE_CONTEXT",
+                    patch_diff="",
+                    rationale="Invalid final JSON: status=OK but patch_diff is empty.",
+                    diagnosis=json_result.get("diagnosis", ""),
+                    confidence=0.0,
+                    expected_improvement="0%",
+                    conversation_log=conversation_log,
+                    total_turns=session.turn_count,
+                    total_tokens=session.total_tokens,
+                )
             return OptimizationResult(
-                status=json_result.get("status", "OK"),
-                patch_diff=json_result.get("patch_diff", ""),
+                status=_status,
+                patch_diff=_patch,
                 rationale=json_result.get("rationale", ""),
                 diagnosis=json_result.get("diagnosis", ""),
                 confidence=float(json_result.get("confidence", 0.5)),
@@ -465,16 +521,16 @@ class CodeOptimizerAgent:
                 total_tokens=session.total_tokens,
             )
 
-        # If no JSON, try to extract patch from tools
-        patch_diff = self.tools._current_patch or ""
-
         return OptimizationResult(
-            status="OK" if patch_diff else "NEED_MORE_CONTEXT",
-            patch_diff=patch_diff,
-            rationale=response[:500],
+            status="NEED_MORE_CONTEXT",
+            patch_diff="",
+            rationale=(
+                "Invalid final response: missing machine-readable JSON result. "
+                + response[:500]
+            ),
             diagnosis="",
-            confidence=0.3,
-            expected_improvement="unknown",
+            confidence=0.0,
+            expected_improvement="0%",
             conversation_log=conversation_log,
             total_turns=session.turn_count,
             total_tokens=session.total_tokens,
@@ -482,30 +538,74 @@ class CodeOptimizerAgent:
 
     def _extract_json(self, text: str) -> Optional[Dict[str, Any]]:
         """Extract JSON from text, handling markdown code blocks."""
-        # Try to find JSON block
-        json_patterns = [
+        if not text:
+            return None
+        payloads: List[Dict[str, Any]] = []
+        candidates: List[str] = []
+        for pattern in (
             r"```json\s*([\s\S]*?)\s*```",
             r"```\s*([\s\S]*?)\s*```",
-            r"\{[\s\S]*\}",
-        ]
-
-        for pattern in json_patterns:
-            import re
-            matches = re.findall(pattern, text)
-            for match in matches:
-                try:
-                    if isinstance(match, str):
-                        # Clean up the match
-                        clean = match.strip()
-                        if not clean.startswith("{"):
-                            clean = "{" + clean.split("{", 1)[-1]
-                        if not clean.endswith("}"):
-                            clean = clean.rsplit("}", 1)[0] + "}"
-                        return json.loads(clean)
-                except json.JSONDecodeError:
+        ):
+            candidates.extend(re.findall(pattern, text))
+        candidates.append(text)
+        for candidate in candidates:
+            for parsed in self._iter_json_objects(candidate):
+                if not isinstance(parsed, dict):
                     continue
+                if {"status", "patch_diff", "rationale"} & set(parsed.keys()):
+                    payloads.append(parsed)
+        if not payloads:
+            return None
+        payloads.sort(key=self._result_payload_score, reverse=True)
+        return payloads[0]
 
-        return None
+    def _iter_json_objects(self, text: str):
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(text):
+            start = text.find("{", idx)
+            if start < 0:
+                break
+            try:
+                obj, end = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                idx = start + 1
+                continue
+            if isinstance(obj, dict):
+                yield obj
+            idx = start + max(1, end)
+
+    def _result_payload_score(self, payload: Dict[str, Any]) -> float:
+        score = 0.0
+        status = str(payload.get("status", "")).upper()
+        if status == "OK":
+            score += 8.0
+        if status == "NO_OPTIMIZATION_POSSIBLE":
+            score += 5.0
+        patch_diff = str(payload.get("patch_diff", ""))
+        if patch_diff:
+            score += 10.0 + min(len(patch_diff) / 5000.0, 4.0)
+        if str(payload.get("rationale", "")).strip():
+            score += 1.0
+        if str(payload.get("diagnosis", "")).strip():
+            score += 1.0
+        return score
+
+    def _request_final_json_retry(self, session: AgentSession) -> Optional[str]:
+        if session.turn_count >= self.config.max_turns:
+            return None
+        try:
+            return self.llm_client.chat(
+                session,
+                (
+                    "Return exactly one final JSON object now. "
+                    "No markdown, no tool calls. "
+                    "Required keys: status, patch_diff, rationale, diagnosis, confidence, expected_improvement."
+                ),
+                auto_execute_tools=False,
+            )
+        except Exception:
+            return None
 
     def _extract_conversation_log(self, session: AgentSession) -> List[Dict[str, Any]]:
         """Extract a simplified conversation log for debugging."""
@@ -517,7 +617,12 @@ class CodeOptimizerAgent:
                 entry["content"] = msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
             if msg.tool_calls:
                 entry["tool_calls"] = [
-                    {"name": tc.name, "arguments": tc.arguments}
+                    {
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                        "raw_arguments": tc.raw_arguments,
+                        "parse_error": tc.parse_error,
+                    }
                     for tc in msg.tool_calls
                 ]
             if msg.tool_call_id:

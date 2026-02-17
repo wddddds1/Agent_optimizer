@@ -3,7 +3,10 @@ active_profile: aggressive
 defaults:
   max_candidates: 3
   min_patch_candidates: 3
+  prefer_phase1_cache_seed: true
   chain_min_improvement_pct: 0.0
+  profile_each_iteration: true
+  profile_probe_repeats: 1
   evaluation:
     baseline_repeats: 1
     candidate_repeats_stage0: 1
@@ -45,6 +48,10 @@ defaults:
     min_comm_ratio: 0.08
     min_output_ratio: 0.08
   ranking:
+    value_density_min: 0.015
+    macro_first:
+      enabled: true
+      protect_top_n: 2
     weights:
       memory: 1.0
       llm: 1.0
@@ -53,6 +60,16 @@ defaults:
       novelty_bonus: 0.2
       risk_penalty: 0.3
     epsilon_explore: 0.2
+    bayesian:
+      heuristic_pseudo: 1.0
+      evidence_pseudo: 1.2
+      llm_pseudo: 0.6
+      heuristic_scale: 2.0
+      llm_scale: 6.0
+      uncertainty_weight: 0.15
+      gain_floor: 0.05
+      heuristic_gain_boost: 0.15
+      evidence_gain_boost: 0.2
     evidence_thresholds:
       neigh_ratio: 0.08
       comm_ratio: 0.08
@@ -81,15 +98,24 @@ defaults:
     min_gain_pct: 1.0
   # Agentic code patching: multi-turn LLM with tool use for better code understanding
   agentic_code_patch:
-    enabled: true
+    enabled: false
     api_key_env: "DEEPSEEK_API_KEY"
     base_url: "https://api.deepseek.com"
     model: "deepseek-chat"
     max_turns: 25
     max_tool_calls_per_turn: 5
+  orchestrator_agent:
+    enabled: false
+    api_key_env: "DEEPSEEK_API_KEY"
+    base_url: "https://api.deepseek.com"
+    model: "deepseek-chat"
+    temperature: 0.3
+    max_tokens: 4096
+    max_turns: 30
+    max_tool_calls_per_turn: 8
   # Two-phase optimization: Phase 1 (parameter sweep) + Phase 2 (source patches)
   two_phase:
-    enabled: false
+    enabled: true
     parameter_explorer:
       enabled: true
       api_key_env: "DEEPSEEK_API_KEY"
@@ -99,22 +125,35 @@ defaults:
       max_turns: 30
       max_tool_calls_per_turn: 5
       max_candidates: 15
+    phase1_cache:
+      enabled: true
+      path: "knowledge/phase1_cache.json"
     # Deep code analysis: agentic agent that explores source code at the start
     # of Phase 2 to produce ranked optimization opportunities.
     deep_analysis:
       enabled: true
+      strict_required: false
+      top_k: 8
+      max_context_retry: 1
       api_key_env: "DEEPSEEK_API_KEY"
       base_url: "https://api.deepseek.com"
       model: "deepseek-chat"
       temperature: 0.3
       max_tokens: 4096
-      max_turns: 35
+      max_turns: 30
       max_tool_calls_per_turn: 5
+      selection_policy:
+        cost_penalty_power: 0.65
+        cost_penalty_weight: 0.7
+        macro_quota_ratio: 0.6
+        macro_quota_min: 2
+        algorithmic_quota_min: 1
     code_optimization:
       enabled: true
       max_iterations: 5
   batch_selection:
     enabled: true
+    enable_for_opportunity_graph: true
     min_batch: 3
     max_batch: 5
   reflection:
@@ -125,6 +164,8 @@ profiles:
     max_candidates: 5
     min_patch_candidates: 3
     chain_min_improvement_pct: 0.0
+    profile_each_iteration: true
+    profile_probe_repeats: 1
     evaluation:
       baseline_repeats: 1
       candidate_repeats_stage0: 1
@@ -166,6 +207,10 @@ profiles:
       min_comm_ratio: 0.08
       min_output_ratio: 0.08
     ranking:
+      value_density_min: 0.02
+      macro_first:
+        enabled: true
+        protect_top_n: 2
       weights:
         memory: 1.2
         llm: 1.0
@@ -174,6 +219,16 @@ profiles:
         novelty_bonus: 0.3
         risk_penalty: 0.3
       epsilon_explore: 0.25
+      bayesian:
+        heuristic_pseudo: 1.0
+        evidence_pseudo: 1.2
+        llm_pseudo: 0.6
+        heuristic_scale: 2.0
+        llm_scale: 6.0
+        uncertainty_weight: 0.15
+        gain_floor: 0.05
+        heuristic_gain_boost: 0.15
+        evidence_gain_boost: 0.2
       evidence_thresholds:
         neigh_ratio: 0.08
         comm_ratio: 0.08
@@ -201,7 +256,7 @@ profiles:
       max_actions: 6
       min_gain_pct: 1.0
     agentic_code_patch:
-      enabled: true
+      enabled: false
       api_key_env: "DEEPSEEK_API_KEY"
       base_url: "https://api.deepseek.com"
       model: "deepseek-chat"
@@ -218,11 +273,15 @@ profiles:
         max_turns: 30
         max_tool_calls_per_turn: 5
         max_candidates: 15
+      phase1_cache:
+        enabled: true
+        path: "knowledge/phase1_cache.json"
       code_optimization:
         enabled: true
         max_iterations: 5
     batch_selection:
       enabled: true
+      enable_for_opportunity_graph: true
       min_batch: 3
       max_batch: 5
     reflection:

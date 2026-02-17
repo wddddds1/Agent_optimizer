@@ -10,3 +10,4 @@ class ProfileReport(BaseModel):
     system_metrics: Dict[str, float] = Field(default_factory=dict)
     notes: List[str] = Field(default_factory=list)
     log_path: Optional[str] = None
+    tau_hotspots: List[Dict[str, object]] = Field(default_factory=list)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -107,9 +108,15 @@ class CodeOptimizationTools:
         self.experience_db = experience_db
         self._profile_data: Optional[Dict[str, Any]] = None
         self._current_patch: Optional[str] = None
+        self._patch_created_this_session: bool = False
         self._last_build_errors: Optional[str] = None
         self._benchmark_input: Optional[str] = None  # Path to benchmark input script
         self._shell_tool = ShellTool(cwd=repo_root)
+
+    def reset_session_state(self) -> None:
+        """Reset per-action transient state before a new optimization attempt."""
+        self._current_patch = None
+        self._patch_created_this_session = False
 
     def set_profile_data(self, profile: Dict[str, Any]) -> None:
         """Set the current profile data for analysis."""
@@ -1046,6 +1053,7 @@ ACCESS PATTERN for tagint:
                 return "No changes made"
 
             self._current_patch = diff_text
+            self._patch_created_this_session = True
             return f"Patch created:\n\n{diff_text}"
 
         except Exception as e:
@@ -1274,7 +1282,11 @@ ACCESS PATTERN for tagint:
         # Get compile command from compile_commands.json
         compile_cmds = self.build_dir / "compile_commands.json"
         if not compile_cmds.exists():
-            return "Error: compile_commands.json not found. Run cmake first."
+            return self._compile_single_without_compile_commands(
+                file_path=file_path,
+                full_path=full_path,
+                with_opt_report=with_opt_report,
+            )
 
         try:
             cmds = json.loads(compile_cmds.read_text())
@@ -1351,6 +1363,80 @@ ACCESS PATTERN for tagint:
             return "Error: Compilation timed out"
         except Exception as e:
             return f"Error: {e}"
+
+    def _compile_single_without_compile_commands(
+        self,
+        file_path: str,
+        full_path: Path,
+        with_opt_report: bool,
+    ) -> str:
+        """Compile a single file when compile_commands.json is unavailable.
+
+        This supports make-based projects where no compilation database exists.
+        """
+        compiler = os.environ.get("CC", "cc")
+        cmd: List[str] = [compiler, "-c", str(full_path), "-o", "/dev/null"]
+        if not with_opt_report:
+            cmd.append("-fsyntax-only")
+
+        include_dirs = [full_path.parent, self.repo_root, self.repo_root / "include"]
+        seen: set[str] = set()
+        for inc in include_dirs:
+            inc_str = str(inc)
+            if not Path(inc_str).exists() or inc_str in seen:
+                continue
+            cmd.extend(["-I", inc_str])
+            seen.add(inc_str)
+
+        if with_opt_report:
+            opt_flags = _compiler_opt_report_flags(" ".join(cmd))
+            if opt_flags:
+                cmd.extend(opt_flags)
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120 if with_opt_report else 60,
+                cwd=str(self.repo_root),
+            )
+        except subprocess.TimeoutExpired:
+            return "Error: Compilation timed out"
+        except Exception as e:
+            return f"Error: {e}"
+
+        stderr_text = result.stderr or ""
+        stdout_text = result.stdout or ""
+        if result.returncode != 0:
+            self._last_build_errors = stderr_text or stdout_text
+            return (
+                f"✗ Compilation errors in {file_path} "
+                "(fallback mode: no compile_commands.json):\n\n"
+                f"{(stderr_text or stdout_text)[:5000]}"
+            )
+
+        if with_opt_report:
+            opt_lines = _filter_opt_report_lines(stderr_text)
+            if opt_lines:
+                return (
+                    f"✓ {file_path} compiled (fallback mode: no compile_commands.json). "
+                    "Compiler optimization report:\n\n"
+                    + "\n".join(opt_lines[:200])
+                )
+            return (
+                f"✓ {file_path} compiled (fallback mode: no compile_commands.json). "
+                "No optimization remarks found."
+            )
+
+        warnings = stderr_text.strip()
+        if warnings:
+            return (
+                f"✓ {file_path} compiled (fallback mode: no compile_commands.json). "
+                "Compiler warnings:\n\n"
+                + warnings[:3000]
+            )
+        return f"✓ {file_path} compiles successfully (fallback mode: no compile_commands.json)"
 
     # -----------------------------------------------------------------
     # Compiler optimization report

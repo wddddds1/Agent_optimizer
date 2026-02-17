@@ -9,6 +9,7 @@ from schemas.plan_ir import EvaluationPlan, FusePlan, PlanIR, StopPlan
 from schemas.analysis_ir import AnalysisResult
 from schemas.job_ir import Budgets
 from schemas.profile_report import ProfileReport
+from orchestrator.errors import LLMUnavailableError
 from orchestrator.llm_client import LLMClient
 
 
@@ -16,6 +17,7 @@ class PlannerAgent:
     def __init__(self, defaults: Dict[str, object], llm_client: Optional[LLMClient]) -> None:
         self.defaults = defaults or {}
         self.llm_client = llm_client
+        self.last_llm_trace: Optional[Dict[str, object]] = None
 
     def plan(
         self,
@@ -96,13 +98,18 @@ class PlannerAgent:
             "cost_model": cost_model or {},
         }
         data = self.llm_client.request_json(prompt, payload)
+        self.last_llm_trace = {"payload": payload, "response": data}
         if not data:
             return None
         try:
             plan = PlanIR(**data)
         except ValidationError:
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError("PlannerAgent returned invalid PlanIR JSON")
             return None
         if plan.status != "OK":
+            if self.llm_client.config.strict_availability:
+                raise LLMUnavailableError(f"PlannerAgent returned non-OK status: {plan.status}")
             return None
         return plan
 
@@ -207,13 +214,18 @@ def _load_prompt(name: str) -> str:
 def _analysis_confidence(profile: ProfileReport) -> float:
     timing = profile.timing_breakdown or {}
     total = timing.get("total", 0.0) or 0.0
+    tau_hotspots = profile.tau_hotspots or []
     if total <= 0.0:
+        if tau_hotspots:
+            return 0.75
         return 0.2
     keys = ["pair", "kspace", "neigh", "comm", "modify", "output"]
     present = [key for key in keys if timing.get(key) is not None]
     positive = [key for key in keys if (timing.get(key) or 0.0) > 0.0]
     if len(positive) >= 2:
         return 0.9
+    if tau_hotspots:
+        return 0.75
     if len(present) >= 2:
         return 0.6
     return 0.3

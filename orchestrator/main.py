@@ -3,17 +3,42 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import platform
 import shutil
 import time
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
 from orchestrator.console import ConsoleUI
+from orchestrator.errors import LLMUnavailableError
 from orchestrator.graph import run_optimization
 from orchestrator.llm_client import LLMClient, LLMConfig
 from orchestrator.router import load_action_space, load_direction_space, load_gates, load_policy
 from schemas.job_ir import Budgets, JobIR
+
+
+_LLM_BACKEND_PRESETS = {
+    "deepseek": {
+        "provider": "deepseek",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+    },
+    "openai": {
+        "provider": "openai",
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-5",
+    },
+    "codex": {
+        "provider": "openai",
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-5",
+    },
+}
 
 
 def _deep_merge_dicts(base: dict, overlay: dict) -> dict:
@@ -38,6 +63,53 @@ def _load_planner_cfg(path: Path) -> dict:
         if isinstance(profile_cfg, dict):
             return _deep_merge_dicts(defaults or {}, profile_cfg)
     return defaults or {}
+
+
+def _resolve_runtime_llm_cfg(
+    base_cfg: dict,
+    backend: str,
+    model_override: str | None,
+    base_url_override: str | None,
+    api_key_env_override: str | None,
+) -> dict:
+    cfg = dict(base_cfg or {})
+    # Keep codex as a backward-compatible alias of openai preset.
+    if backend == "codex":
+        backend = "openai"
+    if backend in _LLM_BACKEND_PRESETS:
+        cfg.update(_LLM_BACKEND_PRESETS[backend])
+    if model_override:
+        cfg["model"] = model_override
+    if base_url_override:
+        cfg["base_url"] = base_url_override
+    if api_key_env_override:
+        cfg["api_key_env"] = api_key_env_override
+    return cfg
+
+
+def _apply_agent_llm_overrides(planner_cfg: dict, llm_cfg: dict) -> None:
+    if not isinstance(planner_cfg, dict):
+        return
+    paths = [
+        ("agentic_code_patch",),
+        ("orchestrator_agent",),
+        ("two_phase", "parameter_explorer"),
+        ("two_phase", "deep_analysis"),
+    ]
+    for path in paths:
+        node = planner_cfg
+        for key in path:
+            child = node.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                node[key] = child
+            node = child
+        for field in ("api_key_env", "base_url", "model"):
+            value = llm_cfg.get(field)
+            if value:
+                node[field] = value
+        if "strict_availability" in llm_cfg:
+            node["strict_availability"] = bool(llm_cfg.get("strict_availability"))
 
 
 def _migrate_legacy_artifacts(artifacts_root: Path) -> Path | None:
@@ -93,6 +165,112 @@ def _init_artifacts_session(artifacts_root: Path) -> Path:
     return session_dir
 
 
+def _resolved_agent_llm_cfg(base_llm_cfg: dict, block_cfg: dict) -> dict:
+    return {
+        "enabled": bool(block_cfg.get("enabled", True)),
+        "api_key_env": str(block_cfg.get("api_key_env") or base_llm_cfg.get("api_key_env", "")),
+        "base_url": str(block_cfg.get("base_url") or base_llm_cfg.get("base_url", "")),
+        "model": str(block_cfg.get("model") or base_llm_cfg.get("model", "")),
+        "temperature": float(base_llm_cfg.get("temperature", 0.0)),
+        "max_tokens": int(base_llm_cfg.get("max_tokens", 64)),
+        "strict_availability": bool(
+            block_cfg.get(
+                "strict_availability",
+                base_llm_cfg.get("strict_availability", True),
+            )
+        ),
+    }
+
+
+def _collect_llm_preflight_targets(base_llm_cfg: dict, planner_cfg: dict) -> List[Tuple[str, dict]]:
+    targets: List[Tuple[str, dict]] = []
+    if bool(base_llm_cfg.get("enabled", False)):
+        targets.append(("llm", dict(base_llm_cfg)))
+
+    if not isinstance(planner_cfg, dict):
+        return targets
+
+    for name in ("agentic_code_patch", "orchestrator_agent"):
+        block = planner_cfg.get(name)
+        if isinstance(block, dict) and bool(block.get("enabled", False)):
+            targets.append((name, _resolved_agent_llm_cfg(base_llm_cfg, block)))
+
+    two_phase = planner_cfg.get("two_phase")
+    if isinstance(two_phase, dict) and bool(two_phase.get("enabled", False)):
+        for name in ("parameter_explorer", "deep_analysis"):
+            block = two_phase.get(name)
+            if isinstance(block, dict) and bool(block.get("enabled", False)):
+                targets.append((f"two_phase.{name}", _resolved_agent_llm_cfg(base_llm_cfg, block)))
+    return targets
+
+
+def _run_llm_preflight(targets: List[Tuple[str, dict]]) -> None:
+    grouped_labels: Dict[Tuple[str, str, str], List[str]] = {}
+    cfg_by_key: Dict[Tuple[str, str, str], dict] = {}
+    for label, cfg in targets:
+        if not bool(cfg.get("enabled", False)):
+            continue
+        key = (
+            str(cfg.get("api_key_env", "")),
+            str(cfg.get("base_url", "")),
+            str(cfg.get("model", "")),
+        )
+        grouped_labels.setdefault(key, []).append(label)
+        cfg_by_key[key] = cfg
+
+    for key, labels in grouped_labels.items():
+        cfg = cfg_by_key[key]
+        probe_cfg = LLMConfig(
+            enabled=True,
+            api_key_env=str(cfg.get("api_key_env", "DEEPSEEK_API_KEY")),
+            base_url=str(cfg.get("base_url", "https://api.deepseek.com")),
+            model=str(cfg.get("model", "deepseek-chat")),
+            temperature=0.0,
+            max_tokens=8,
+            strict_availability=bool(cfg.get("strict_availability", True)),
+        )
+        client = LLMClient(probe_cfg)
+        try:
+            client.preflight_check()
+        except LLMUnavailableError as exc:
+            scope = ",".join(sorted(labels))
+            raise LLMUnavailableError(
+                f"{scope}: {exc}"
+            ) from exc
+
+
+def _normalize_wrappers_for_platform(
+    wrappers_cfg: Optional[List[Dict[str, object]]],
+    reporter: Optional[ConsoleUI],
+) -> Optional[List[Dict[str, object]]]:
+    if not wrappers_cfg:
+        return wrappers_cfg
+    if not isinstance(wrappers_cfg, list):
+        return None
+    if platform.system().lower() != "darwin":
+        return wrappers_cfg
+
+    normalized: List[Dict[str, object]] = []
+    dropped: List[str] = []
+    for wrapper in wrappers_cfg:
+        if not isinstance(wrapper, dict):
+            continue
+        wrapper_id = str(wrapper.get("id") or "").strip().lower()
+        allow_on_macos = bool(wrapper.get("allow_on_macos", False))
+        if wrapper_id == "tau" and not allow_on_macos:
+            dropped.append(wrapper_id or "tau")
+            continue
+        normalized.append(wrapper)
+
+    if dropped and reporter:
+        unique = ", ".join(sorted(set(dropped)))
+        reporter._print(
+            f"Wrapper disabled on macOS for runtime fairness: {unique} "
+            f"(set allow_on_macos: true to force-enable)."
+        )
+    return normalized or None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="HPC agent platform MVP")
     parser.add_argument("--case", required=True, help="Case ID from configs/*_cases.yaml")
@@ -118,6 +296,11 @@ def main() -> None:
         type=int,
         default=2048,
         help="Max bytes per output preview when raw preview is enabled",
+    )
+    parser.add_argument(
+        "--ui-agent",
+        action="store_true",
+        help="Show full agent LLM payloads/responses and tool call logs",
     )
     parser.add_argument(
         "--max-iters",
@@ -182,6 +365,33 @@ def main() -> None:
         default=None,
         help="Override top-1 validation repeats for this run",
     )
+    parser.add_argument(
+        "--model",
+        choices=["deepseek", "openai"],
+        default=None,
+        help="Simple provider preset: deepseek or openai (maps to gpt-5).",
+    )
+    parser.add_argument(
+        "--llm-backend",
+        choices=["deepseek", "openai", "codex", "custom"],
+        default="deepseek",
+        help="LLM backend preset (default: deepseek). 'codex' is an alias of openai; use custom for full manual config.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Override LLM model id for all agents in this run",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        default=None,
+        help="Override LLM API base URL for all agents in this run",
+    )
+    parser.add_argument(
+        "--llm-api-key-env",
+        default=None,
+        help="Override API key env var name for all agents in this run",
+    )
     args = parser.parse_args()
 
     config_dir = Path(args.config_dir)
@@ -197,15 +407,23 @@ def main() -> None:
 
     # Search all *_cases.yaml files for the requested case ID
     case = None
+    selected_cases_file: Path | None = None
     for cases_file in sorted(config_dir.glob("*_cases.yaml")):
         cases_cfg = yaml.safe_load(cases_file.read_text(encoding="utf-8")) or {}
         case = (cases_cfg.get("cases") or {}).get(args.case)
         if case is not None:
+            selected_cases_file = cases_file
             break
     if not case:
         raise SystemExit(f"Unknown case_id: {args.case}")
 
-    app = case.get("app", "lammps")
+    app = str(case.get("app") or "").strip()
+    if not app and selected_cases_file:
+        stem = selected_cases_file.stem
+        if stem.endswith("_cases"):
+            app = stem[: -len("_cases")].strip()
+    if not app:
+        raise SystemExit(f"Case {args.case} missing app; set `app` in case config")
     default_env = env_cfg.get("default_env", {})
     app_env = env_cfg.get("app_env", {}).get(app, {})
     env = {**default_env, **app_env, **case.get("env", {})}
@@ -290,6 +508,15 @@ def main() -> None:
     adapter_path = adapter_dir / f"{job.app}.yaml"
     if adapter_path.exists():
         adapter_cfg = yaml.safe_load(adapter_path.read_text(encoding="utf-8"))
+    # Merge adapter-level patch_families into global patch_families
+    if isinstance(adapter_cfg, dict) and adapter_cfg.get("patch_families"):
+        if patch_families is None:
+            patch_families = {"version": 1, "families": []}
+        existing_ids = {f["id"] for f in patch_families.get("families", []) if isinstance(f, dict)}
+        for fam in adapter_cfg["patch_families"]:
+            if isinstance(fam, dict) and fam.get("id") not in existing_ids:
+                patch_families["families"].append(fam)
+
     if args.patch_debug_retries is not None:
         if not isinstance(adapter_cfg, dict):
             adapter_cfg = {}
@@ -305,7 +532,19 @@ def main() -> None:
     if args.max_candidates is not None:
         planner_cfg["max_candidates"] = int(args.max_candidates)
 
-    llm_cfg_raw = env_cfg.get("llm", {})
+    selected_backend = args.llm_backend
+    if args.model:
+        selected_backend = args.model
+
+    llm_cfg_raw = _resolve_runtime_llm_cfg(
+        env_cfg.get("llm", {}),
+        backend=selected_backend,
+        model_override=args.llm_model,
+        base_url_override=args.llm_base_url,
+        api_key_env_override=args.llm_api_key_env,
+    )
+    env_cfg["llm"] = llm_cfg_raw
+    _apply_agent_llm_overrides(planner_cfg, llm_cfg_raw)
     llm_config = LLMConfig(
         enabled=bool(llm_cfg_raw.get("enabled", False)),
         api_key_env=llm_cfg_raw.get("api_key_env", "DEEPSEEK_API_KEY"),
@@ -313,8 +552,12 @@ def main() -> None:
         model=llm_cfg_raw.get("model", "deepseek-chat"),
         temperature=float(llm_cfg_raw.get("temperature", 0.0)),
         max_tokens=int(llm_cfg_raw.get("max_tokens", 512)),
+        strict_availability=bool(llm_cfg_raw.get("strict_availability", True)),
     )
     llm_client = LLMClient(llm_config)
+    if llm_config.enabled:
+        preflight_targets = _collect_llm_preflight_targets(llm_cfg_raw, planner_cfg)
+        _run_llm_preflight(preflight_targets)
 
     artifacts_root = Path(env_cfg.get("artifacts_dir", "artifacts"))
     if not artifacts_root.is_absolute():
@@ -406,6 +649,7 @@ def main() -> None:
             verbose=bool(args.ui_verbose),
             show_output_preview=bool(args.ui_verbose) and not args.ui_no_raw,
             preview_bytes=args.ui_preview_bytes,
+            show_agent_trace=bool(args.ui_agent),
         )
         if args.ui
         else None
@@ -438,6 +682,7 @@ def main() -> None:
                 "profile_subdir": tau_cfg.get("profile_subdir", "tau"),
             }
         ]
+    wrappers_cfg = _normalize_wrappers_for_platform(wrappers_cfg, reporter)
 
     result = run_optimization(
         job=job,
@@ -446,6 +691,7 @@ def main() -> None:
         gates=gates,
         artifacts_dir=artifacts_dir,
         time_command=env_cfg.get("time_command"),
+        profiling_cfg=env_cfg.get("profiling"),
         wrappers_cfg=wrappers_cfg,
         min_delta_seconds=env_cfg.get("min_delta_seconds", 0.0),
         top_k=env_cfg.get("top_k", 5),
@@ -461,7 +707,7 @@ def main() -> None:
         adapter_cfg=adapter_cfg,
         planner_cfg=planner_cfg,
         reporter=reporter,
-        build_cfg=env_cfg.get("build", {}),
+        build_cfg=case.get("build") or env_cfg.get("build", {}),
         baseline_repeats=baseline_repeats,
         baseline_stat=env_cfg.get("experiment", {}).get("baseline_stat", "mean"),
         validate_top1_repeats=validate_top1_repeats,
@@ -478,4 +724,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except LLMUnavailableError as exc:
+        raise SystemExit(f"LLM unavailable: {exc}") from exc

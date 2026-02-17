@@ -1,5 +1,16 @@
 app: bwa
 patch_root: "third_party/bwa"
+hotspot_globs:
+  alignment:
+    - "third_party/bwa/bwamem*.c"
+    - "third_party/bwa/bwt*.c"
+    - "third_party/bwa/bntseq*.c"
+  indexing:
+    - "third_party/bwa/bwt*.c"
+    - "third_party/bwa/bwtindex*.c"
+  io:
+    - "third_party/bwa/kseq*.h"
+    - "third_party/bwa/bwa*.c"
 patch_rules:
   allowed_globs:
     - "third_party/bwa/*.c"
@@ -7,5 +18,24 @@ patch_rules:
   forbidden_patterns:
     - "\\bexit\\s*\\("
     - "\\babort\\s*\\("
-  max_lines_changed: 200
-  max_files_changed: 4
+  max_lines_changed: 640
+  max_files_changed: 8
+  max_snippets: 12
+  max_context_chars: 120000
+  debug_max_attempts: 2
+  scope_levels:
+    global:
+      max_lines_changed: 640
+      max_files_changed: 8
+      max_snippets: 20
+      max_context_chars: 180000
+    module:
+      max_lines_changed: 420
+      max_files_changed: 6
+      max_snippets: 16
+      max_context_chars: 150000
+    hotspot:
+      max_lines_changed: 260
+      max_files_changed: 4
+      max_snippets: 12
+      max_context_chars: 120000

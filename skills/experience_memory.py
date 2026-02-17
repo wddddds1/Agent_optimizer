@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from math import exp
+from math import exp, sqrt, tanh
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -20,6 +20,10 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(value, hi))
 
 
 def _detect_backend(run_args: Iterable[str]) -> Optional[str]:
@@ -168,60 +172,149 @@ class ExperienceMemory:
         )
         self._append(record)
 
-    def score_actions(self, actions: Iterable[ActionIR], context: Dict[str, str]) -> Dict[str, float]:
+    def _action_similarity(self, record: ExperienceRecord, action: ActionIR) -> float:
+        params = action.parameters or {}
+        if action.action_id == record.action_id:
+            return 1.0
+        if action.family == record.family:
+            return 0.6
+        if record.patch_family and record.patch_family == params.get("patch_family"):
+            return 0.5
+        if record.target_file and record.target_file == params.get("target_file"):
+            return 0.5
+        record_family = record.patch_family
+        action_family = params.get("patch_family")
+        if record_family in ("loop_fusion", "loop_fission") and action_family in (
+            "loop_fusion",
+            "loop_fission",
+        ):
+            return 0.4
+        return 0.0
+
+    def _context_adjusted_similarity(
+        self,
+        similarity: float,
+        record: ExperienceRecord,
+        case_id: str,
+        app: str,
+        backend: str,
+    ) -> float:
+        sim = similarity
+        if backend and record.backend and backend != record.backend:
+            sim *= self.config.backend_mismatch_penalty
+        if case_id and record.case_id and case_id == record.case_id:
+            sim *= self.config.case_match_boost
+        if app and record.app:
+            if app == record.app:
+                sim *= self.config.app_match_boost
+            else:
+                sim *= self.config.app_mismatch_penalty
+        return sim
+
+    def _recency_decay(self, record: ExperienceRecord, now: datetime, decay_half: float) -> float:
+        age_days = 0.0
+        try:
+            ts = datetime.fromisoformat(record.timestamp)
+            age_days = abs((now - ts).total_seconds()) / 86400.0
+        except Exception:
+            age_days = 0.0
+        return exp(-age_days / decay_half) if decay_half > 0 else 1.0
+
+    def bayesian_posteriors(
+        self,
+        actions: Iterable[ActionIR],
+        context: Dict[str, str],
+        bayes_cfg: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        actions_list = list(actions)
+        alpha0 = _safe_float((bayes_cfg or {}).get("alpha0"), 1.0)
+        beta0 = _safe_float((bayes_cfg or {}).get("beta0"), 1.0)
+        gain_scale_pct = max(_safe_float((bayes_cfg or {}).get("gain_scale_pct"), 20.0), 1.0e-6)
+        uncertainty_penalty = max(_safe_float((bayes_cfg or {}).get("uncertainty_penalty"), 0.1), 0.0)
+        score_scale = max(_safe_float((bayes_cfg or {}).get("score_scale"), 1.0), 1.0e-6)
         if not self.config.enabled or not self.records:
-            return {action.action_id: 0.0 for action in actions}
+            return {
+                action.action_id: {
+                    "alpha": alpha0,
+                    "beta": beta0,
+                    "p_success": alpha0 / (alpha0 + beta0),
+                    "gain_norm": 0.0,
+                    "uncertainty": sqrt(0.25 / (alpha0 + beta0 + 1.0)),
+                    "utility": 0.0,
+                    "sample_weight": 0.0,
+                }
+                for action in actions_list
+            }
+
         backend = context.get("backend")
         case_id = context.get("case_id")
         app = context.get("app")
         now = datetime.now(timezone.utc)
         decay_half = max(self.config.decay_half_life_days, 1e-6)
-        scored: Dict[str, float] = {action.action_id: 0.0 for action in actions}
+        stats: Dict[str, Dict[str, float]] = {
+            action.action_id: {
+                "alpha": alpha0,
+                "beta": beta0,
+                "gain_weight": 0.0,
+                "gain_sum": 0.0,
+                "sample_weight": 0.0,
+            }
+            for action in actions_list
+        }
+
         for record in self.records:
-            sim_base = 0.0
-            for action in actions:
-                sim = 0.0
-                if action.action_id == record.action_id:
-                    sim = 1.0
-                elif action.family == record.family:
-                    sim = 0.6
-                elif record.patch_family and record.patch_family == (action.parameters or {}).get(
-                    "patch_family"
-                ):
-                    sim = 0.5
-                elif record.target_file and record.target_file == (action.parameters or {}).get(
-                    "target_file"
-                ):
-                    sim = 0.5
-                else:
-                    record_family = record.patch_family
-                    action_family = (action.parameters or {}).get("patch_family")
-                    if record_family in ("loop_fusion", "loop_fission") and action_family in (
-                        "loop_fusion",
-                        "loop_fission",
-                    ):
-                        sim = 0.4
+            for action in actions_list:
+                sim = self._action_similarity(record, action)
                 if sim <= 0.0:
                     continue
-                if backend and record.backend and backend != record.backend:
-                    sim *= self.config.backend_mismatch_penalty
-                if case_id and record.case_id and case_id == record.case_id:
-                    sim *= self.config.case_match_boost
-                if app and record.app:
-                    if app == record.app:
-                        sim *= self.config.app_match_boost
-                    else:
-                        sim *= self.config.app_mismatch_penalty
-                sim_base = sim
-                age_days = 0.0
-                try:
-                    ts = datetime.fromisoformat(record.timestamp)
-                    age_days = abs((now - ts).total_seconds()) / 86400.0
-                except Exception:
-                    age_days = 0.0
-                decay = exp(-age_days / decay_half) if decay_half > 0 else 1.0
-                scored[action.action_id] += record.weight * sim_base * decay
-        return scored
+                sim = self._context_adjusted_similarity(sim, record, case_id or "", app or "", backend or "")
+                if sim <= 0.0:
+                    continue
+                weight = sim * self._recency_decay(record, now, decay_half)
+                if weight <= 0.0:
+                    continue
+                item = stats[action.action_id]
+                item["sample_weight"] += weight
+                improvement = _safe_float(record.improvement_pct, 0.0)
+                success = record.outcome == "PASS" and improvement > 0.0
+                if success:
+                    gain_quality = _clamp(
+                        improvement / max(self.config.strong_gain_pct, 1.0e-6),
+                        0.0,
+                        1.0,
+                    )
+                    item["alpha"] += weight * gain_quality
+                    item["gain_weight"] += weight
+                    item["gain_sum"] += weight * improvement
+                else:
+                    item["beta"] += weight
+
+        posteriors: Dict[str, Dict[str, float]] = {}
+        for action in actions_list:
+            item = stats[action.action_id]
+            alpha = max(item["alpha"], 1.0e-6)
+            beta = max(item["beta"], 1.0e-6)
+            denom = alpha + beta
+            p_success = alpha / denom if denom > 0 else 0.5
+            gain_mean_pct = item["gain_sum"] / item["gain_weight"] if item["gain_weight"] > 0 else 0.0
+            gain_norm = _clamp(tanh(gain_mean_pct / gain_scale_pct), 0.0, 1.0)
+            uncertainty = sqrt(max(p_success * (1.0 - p_success), 0.0) / (denom + 1.0))
+            raw_utility = p_success * gain_norm - uncertainty_penalty * uncertainty
+            utility = _clamp(tanh(raw_utility / score_scale), -1.0, 1.0)
+            posteriors[action.action_id] = {
+                "alpha": alpha,
+                "beta": beta,
+                "p_success": p_success,
+                "gain_norm": gain_norm,
+                "uncertainty": uncertainty,
+                "utility": utility,
+                "sample_weight": item["sample_weight"],
+            }
+        return posteriors
+
+    def score_actions(self, actions: Iterable[ActionIR], context: Dict[str, str]) -> Dict[str, float]:
+        posteriors = self.bayesian_posteriors(actions, context)
+        return {action_id: float(item.get("utility", 0.0)) for action_id, item in posteriors.items()}
 
     def family_success_rates(
         self,

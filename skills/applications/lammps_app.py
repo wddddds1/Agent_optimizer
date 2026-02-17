@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from schemas.action_ir import ActionIR
 from schemas.job_ir import JobIR
+from skills.metrics_parse import parse_lammps_timing
 
 _DEFAULT_MPI_LAUNCHER = "mpirun"
 
@@ -152,6 +154,31 @@ def input_edit_allowlist() -> list[str]:
         "comm_modify",
         "newton",
     ]
+
+
+def parse_timing_breakdown(log_text: str) -> Dict[str, float]:
+    return parse_lammps_timing(log_text)
+
+
+def requires_structured_correctness() -> bool:
+    return True
+
+
+def supports_agentic_correctness() -> bool:
+    return True
+
+
+def ensure_log_path(run_args: List[str], run_dir: Path) -> List[str]:
+    args = list(run_args)
+    log_path = run_dir / "log.lammps"
+    if "-log" in args:
+        idx = args.index("-log")
+        if idx + 1 < len(args):
+            args[idx + 1] = str(log_path)
+        else:
+            args.append(str(log_path))
+        return args
+    return args + ["-log", str(log_path)]
 
 
 def _merge_env_bucket(params: Dict[str, object], key: str) -> None:

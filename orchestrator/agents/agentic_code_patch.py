@@ -29,6 +29,8 @@ class AgenticCodePatchAgent:
         enabled: bool = True,
         max_turns: int = 25,
         max_tool_calls_per_turn: int = 5,
+        max_invalid_tool_calls_total: int = 5,
+        max_invalid_tool_calls_per_tool: int = 2,
     ) -> None:
         self.repo_root = repo_root
         self.enabled = enabled
@@ -47,9 +49,58 @@ class AgenticCodePatchAgent:
             max_tokens=4096,
             max_turns=max_turns,
             max_tool_calls_per_turn=max_tool_calls_per_turn,
+            max_invalid_tool_calls_total=max_invalid_tool_calls_total,
+            max_invalid_tool_calls_per_tool=max_invalid_tool_calls_per_tool,
         )
 
         self.agent = CodeOptimizerAgent(config, repo_root, build_dir)
+
+    def _normalize_target_file(self, target_file: str, orchestration_repo_root: Path) -> str:
+        """Normalize target path to this agent's repo_root when possible."""
+        if not target_file:
+            return target_file
+        raw = Path(target_file)
+        try:
+            if raw.is_absolute():
+                resolved = raw.resolve()
+            else:
+                local_candidate = (self.repo_root / raw).resolve()
+                if local_candidate.exists():
+                    return raw.as_posix()
+                global_candidate = (orchestration_repo_root / raw).resolve()
+                if not global_candidate.exists():
+                    return raw.as_posix()
+                resolved = global_candidate
+            return resolved.relative_to(self.repo_root.resolve()).as_posix()
+        except Exception:
+            return raw.as_posix()
+
+    def _normalize_allowed_files(
+        self,
+        allowed_files: List[str],
+        orchestration_repo_root: Path,
+    ) -> List[str]:
+        normalized: List[str] = []
+        for item in allowed_files:
+            if not isinstance(item, str) or not item:
+                continue
+            value = self._normalize_target_file(item, orchestration_repo_root)
+            if value and value not in normalized:
+                normalized.append(value)
+        return normalized
+
+    def _normalize_patch_rules(
+        self,
+        patch_rules: Dict[str, object],
+        orchestration_repo_root: Path,
+    ) -> Dict[str, object]:
+        if not isinstance(patch_rules, dict):
+            return {}
+        normalized_rules = dict(patch_rules)
+        # Keep patch rules as guidance only; do not pass hard file-scope limits.
+        normalized_rules.pop("allowed_globs", None)
+        normalized_rules.pop("patch_root", None)
+        return normalized_rules
 
     def propose(
         self,
@@ -74,6 +125,8 @@ class AgenticCodePatchAgent:
         if not self.agent or not self.enabled:
             return None
 
+        normalized_allowed_files = self._normalize_allowed_files(allowed_files, repo_root)
+
         # Extract target file from action parameters or navigation hints
         params = action.parameters or {}
         target_file = params.get("target_file", "")
@@ -82,22 +135,34 @@ class AgenticCodePatchAgent:
             # Derive from navigation hints first, then allowed_files
             if navigation_hints:
                 target_file = str(navigation_hints[0].get("path", ""))
-            elif allowed_files:
+            elif normalized_allowed_files:
                 patch_files = params.get("patch_files", [])
                 if patch_files:
                     target_file = patch_files[0]
                 else:
-                    target_file = allowed_files[0]
+                    target_file = normalized_allowed_files[0]
+        if isinstance(target_file, str) and target_file:
+            target_file = self._normalize_target_file(target_file, repo_root)
 
         # Build additional context
         additional_context: Dict[str, Any] = {
             "backend": backend_variant or "unknown",
-            "allowed_files": allowed_files,
-            "patch_rules": patch_rules,
+            "allowed_files": normalized_allowed_files,
+            "patch_rules": self._normalize_patch_rules(patch_rules, repo_root),
         }
 
         if navigation_hints:
-            additional_context["navigation_hints"] = navigation_hints
+            normalized_hints: List[Dict[str, object]] = []
+            for hint in navigation_hints:
+                if not isinstance(hint, dict):
+                    continue
+                normalized = dict(hint)
+                path = normalized.get("path")
+                if isinstance(path, str) and path:
+                    normalized["path"] = self._normalize_target_file(path, repo_root)
+                normalized_hints.append(normalized)
+            if normalized_hints:
+                additional_context["navigation_hints"] = normalized_hints
 
         if feedback:
             additional_context["previous_feedback"] = feedback
@@ -237,6 +302,8 @@ def create_agentic_code_patch_agent(
             - enabled: Whether the agent is enabled
             - max_turns: Maximum conversation turns (default 25)
             - max_tool_calls_per_turn: Maximum tool calls per turn (default 5)
+            - max_invalid_tool_calls_total: Max invalid tool calls before hard fail
+            - max_invalid_tool_calls_per_tool: Max consecutive invalid calls per tool
 
     Returns:
         Configured AgenticCodePatchAgent
@@ -252,4 +319,6 @@ def create_agentic_code_patch_agent(
         enabled=config.get("enabled", True),
         max_turns=int(config.get("max_turns", 25)),
         max_tool_calls_per_turn=int(config.get("max_tool_calls_per_turn", 5)),
+        max_invalid_tool_calls_total=int(config.get("max_invalid_tool_calls_total", 5)),
+        max_invalid_tool_calls_per_tool=int(config.get("max_invalid_tool_calls_per_tool", 2)),
     )
