@@ -1,6 +1,13 @@
 app: lammps
 # Application-specific mappings are implemented in skills/applications/lammps_app.py
 patch_root: "third_party/lammps"
+drift:
+  drift_repair_max_attempts: 2
+  thresholds:
+    energy_drift_rel_max: 1.0e-4
+    force_drift_rel_max: 1.0e-3
+    temperature_cv_max: 0.05
+
 patch_rules:
   allowed_globs:
     - "third_party/lammps/src/*.h"
@@ -75,11 +82,12 @@ patch_rules:
     - "\\bMPI_Abort\\b"
     - "\\bMPI_Finalize\\b"
     - "\\bexit\\s*\\("
-  max_lines_changed: 480
-  max_files_changed: 6
+  max_lines_changed: 1000
+  max_files_changed: 10
   max_context_chars: 120000
   max_snippets: 12
   debug_max_attempts: 2
+  runtime_crash_debug_max_attempts: 3
 
 patch_families:
   - id: param_table_pack
@@ -146,6 +154,51 @@ patch_families:
       languages: ["cpp"]
       indicators:
         - "high L1/L2 cache miss rate on coordinate loads in pair force loop"
+
+domain_knowledge:
+  application_type: "molecular dynamics"
+  kernel_semantics:
+    - name: "pair_compute"
+      description: "Newton's third law pairwise force computation, dominates runtime"
+      known_optimizations:
+        - "AoS to SoA data layout for better vectorization"
+        - "neighbor list binning strategy affects cache performance"
+        - "half vs full neighbor list trade-off"
+        - "coefficient struct packing for single cache-line lookup"
+    - name: "neighbor_build"
+      description: "Verlet neighbor list construction"
+      known_optimizations:
+        - "bin size tuning (skin distance)"
+        - "multi-threaded neighbor build"
+        - "stencil-based neighbor finding"
+    - name: "comm"
+      description: "MPI communication for ghost atom exchange"
+      known_optimizations:
+        - "communication buffer packing optimization"
+        - "overlap communication with computation"
+    - name: "kspace"
+      description: "Long-range Coulombic solver (PPPM/Ewald)"
+      known_optimizations:
+        - "FFT grid tuning"
+        - "real-space vs k-space cutoff balance"
+  common_pitfalls:
+    - "Manual loop unrolling hurts compiler auto-vectorization"
+    - "Adding #pragma omp simd can conflict with existing OMP threading"
+    - "Changing neighbor list data structures without updating ghost comm"
+    - "Breaking Newton third law symmetry in pair force computation"
+  effective_strategies:
+    - category: "data_layout"
+      description: "Convert coefficient arrays from AoS to SoA or pack into cache-aligned struct"
+      typical_gain: "15-40%"
+    - category: "memory_path"
+      description: "Local pointer caching for neighbor list traversal, software prefetch"
+      typical_gain: "5-15%"
+    - category: "branch_elimination"
+      description: "Split sbindex==0 fast path from special-bond handling in inner loop"
+      typical_gain: "5-20%"
+    - category: "vectorization"
+      description: "Ensure inner force loop is auto-vectorizable via restrict, alignment, SoA"
+      typical_gain: "10-30%"
 
 variants_prefer_mode: exclusive
 variants:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,11 +34,24 @@ def _format_diff_stats(stats: Optional[Dict[str, object]]) -> Optional[str]:
     return f"[{', '.join(parts)}]" if parts else None
 
 
+def _format_gain_pct_from_ratio(speedup_ratio: Optional[float]) -> str:
+    if speedup_ratio is None:
+        return "n/a"
+    try:
+        ratio = float(speedup_ratio)
+    except (TypeError, ValueError):
+        return "n/a"
+    if ratio <= 0 or not math.isfinite(ratio):
+        return "n/a"
+    return f"{(ratio - 1.0) * 100.0:+.2f}%"
+
+
 @dataclass
 class ConsoleUI:
     enabled: bool = True
     stream: TextIO = sys.stdout
     baseline_runtime: Optional[float] = None
+    current_best_runtime: Optional[float] = None
     verbose: bool = False
     show_output_preview: bool = True
     preview_bytes: int = 2048
@@ -90,19 +104,33 @@ class ConsoleUI:
             return
         self._section("分析")
         rationale = rationale or "无"
+        lines = [
+            f"瓶颈: {', '.join(bottlenecks) if bottlenecks else '无'}",
+            f"画像置信度: {confidence}",
+            f"理由: {rationale}",
+        ]
+        if not (len(allowed_families) == 1 and allowed_families[0] == "source_patch"):
+            lines.insert(
+                1,
+                f"允许动作族: {', '.join(allowed_families) if allowed_families else '无'}",
+            )
         self._agent(
             "PlannerAgent",
-            [
-                f"瓶颈: {', '.join(bottlenecks) if bottlenecks else '无'}",
-                f"允许动作族: {', '.join(allowed_families) if allowed_families else '无'}",
-                f"画像置信度: {confidence}",
-                f"理由: {rationale}",
-            ],
+            lines,
         )
 
     def plan_summary(self, plan: PlanIR) -> None:
         if not self.enabled:
             return
+        reason = plan.reason
+        if (
+            len(plan.chosen_families) == 1
+            and plan.chosen_families[0] == "source_patch"
+            and isinstance(reason, str)
+        ):
+            reason = reason.replace("，允许选择source_patch家族。", "。")
+            reason = reason.replace("允许选择source_patch家族。", "")
+            reason = reason.replace("，且置信度为0.75，允许选择source_patch家族。", "。")
         self._section("计划")
         self._agent(
             "PlannerAgent",
@@ -110,7 +138,7 @@ class ConsoleUI:
                 f"选择方向: {', '.join(plan.chosen_families) if plan.chosen_families else '无'}",
                 f"候选上限: {plan.max_candidates}",
                 f"Top1 复跑: {plan.evaluation.top1_validation_repeats}",
-                f"理由: {plan.reason}",
+                f"理由: {reason}",
             ],
         )
 
@@ -283,6 +311,9 @@ class ConsoleUI:
         hotspot_count = len(profile.tau_hotspots or [])
         if hotspot_count > 0:
             lines.append(f"函数热点: {hotspot_count} 条")
+        portrait_line = _format_bottleneck_portrait_line(profile)
+        if portrait_line:
+            lines.append(f"瓶颈画像: {portrait_line}")
         if profile.notes:
             lines.append(f"采样备注: {'; '.join(profile.notes[:2])}")
         self._agent("ProfilerAgent", lines)
@@ -314,14 +345,29 @@ class ConsoleUI:
     def verify_result(self, exp: ExperimentIR) -> None:
         if not self.enabled:
             return
+        passed = exp.verdict == "PASS" and exp.results.exit_code == 0
         speedup = exp.results.derived_metrics.get("speedup_vs_baseline")
-        speedup_str = f"{speedup:.3f}x" if speedup is not None else "n/a"
+        if not passed:
+            speedup = None
+        baseline_gain_str = _format_gain_pct_from_ratio(speedup)
+
+        runtime = exp.results.runtime_seconds
+        speedup_vs_current_best = None
+        if (
+            passed
+            and self.current_best_runtime is not None
+            and self.current_best_runtime > 0
+            and runtime > 0
+        ):
+            speedup_vs_current_best = self.current_best_runtime / runtime
+        current_best_gain_str = _format_gain_pct_from_ratio(speedup_vs_current_best)
         variance_cv = _extract_variance_cv(exp)
         correctness = exp.results.correctness_metrics.get("correctness_skipped_reason")
         lines = [
             f"判定: {exp.verdict}",
             f"运行耗时: {exp.results.runtime_seconds:.4f}s",
-            f"相对基线加速: {speedup_str}",
+            f"相对基线提升: {baseline_gain_str}",
+            f"相对当前最优提升: {current_best_gain_str}",
         ]
         if variance_cv is not None:
             lines.append(f"方差CV: {variance_cv:.3f}")
@@ -330,6 +376,10 @@ class ConsoleUI:
         if exp.reasons:
             lines.append(f"原因: {', '.join(exp.reasons)}")
         self._agent("VerifierAgent", lines)
+        if passed and runtime > 0 and (
+            self.current_best_runtime is None or runtime < self.current_best_runtime
+        ):
+            self.current_best_runtime = runtime
 
     def iteration_summary(
         self,
@@ -345,19 +395,19 @@ class ConsoleUI:
             self._print("  本轮最优: 无（无通过候选）")
         else:
             speedup = best_exp.results.derived_metrics.get("speedup_vs_baseline")
-            speedup_str = f"{speedup:.3f}x" if speedup is not None else "n/a"
+            speedup_str = _format_gain_pct_from_ratio(speedup)
             action_id = best_exp.action.action_id if best_exp.action else "baseline"
             self._print(
-                f"  本轮最优: {action_id} 耗时={best_exp.results.runtime_seconds:.4f}s 加速={speedup_str}"
+                f"  本轮最优: {action_id} 耗时={best_exp.results.runtime_seconds:.4f}s 提升={speedup_str}"
             )
         if best_overall is None:
             self._print("  历史最优: 无")
             return
         speedup = best_overall.results.derived_metrics.get("speedup_vs_baseline")
-        speedup_str = f"{speedup:.3f}x" if speedup is not None else "n/a"
+        speedup_str = _format_gain_pct_from_ratio(speedup)
         action_id = best_overall.action.action_id if best_overall.action else "baseline"
         self._print(
-            f"  历史最优: {action_id} 耗时={best_overall.results.runtime_seconds:.4f}s 加速={speedup_str}"
+            f"  历史最优: {action_id} 耗时={best_overall.results.runtime_seconds:.4f}s 提升={speedup_str}"
         )
         if best_combo:
             self._print(f"  当前最优组合(生效): {' | '.join(best_combo)}")
@@ -486,9 +536,9 @@ class ConsoleUI:
         else:
             action_id = best.action.action_id if best.action else "baseline"
             speedup = best.results.derived_metrics.get("speedup_vs_baseline")
-            speedup_str = f"{speedup:.3f}x" if speedup is not None else "n/a"
+            speedup_str = _format_gain_pct_from_ratio(speedup)
             self._print(
-                f"  最优: {action_id} 耗时={best.results.runtime_seconds:.4f}s 加速={speedup_str}"
+                f"  最优: {action_id} 耗时={best.results.runtime_seconds:.4f}s 提升={speedup_str}"
             )
         self._print(f"  报告: {report_md}")
         if report_zh:
@@ -496,6 +546,8 @@ class ConsoleUI:
 
     def update_baseline(self, exp: ExperimentIR) -> None:
         self.baseline_runtime = exp.results.runtime_seconds
+        if self.baseline_runtime and self.baseline_runtime > 0:
+            self.current_best_runtime = self.baseline_runtime
 
     def _section(self, title: str) -> None:
         self._print("")
@@ -543,6 +595,25 @@ def _format_timing(profile: ProfileReport) -> str:
             continue
         ratio = (value / total) if total else 0.0
         parts.append(f"{key}={value:.4f}s({ratio:.0%})")
+    return " ".join(parts)
+
+
+def _format_bottleneck_portrait_line(profile: ProfileReport) -> str:
+    portrait = profile.bottleneck_portrait or {}
+    if not isinstance(portrait, dict):
+        return ""
+    cpu = portrait.get("cpu", {}) if isinstance(portrait.get("cpu"), dict) else {}
+    mem = portrait.get("memory_bw", {}) if isinstance(portrait.get("memory_bw"), dict) else {}
+    stall = portrait.get("stall", {}) if isinstance(portrait.get("stall"), dict) else {}
+    th = portrait.get("thread_balance", {}) if isinstance(portrait.get("thread_balance"), dict) else {}
+    io = portrait.get("io_wait", {}) if isinstance(portrait.get("io_wait"), dict) else {}
+    parts = [
+        f"CPU={cpu.get('state', 'unknown')}",
+        f"MEM={mem.get('state', 'unknown')}",
+        f"STALL={stall.get('dominant', 'unknown')}",
+        f"THREAD={th.get('state', 'unknown')}",
+        f"IO={io.get('state', 'unknown')}",
+    ]
     return " ".join(parts)
 
 

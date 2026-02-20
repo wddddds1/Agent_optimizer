@@ -322,9 +322,10 @@ class GitPatchContext(AbstractContextManager):
         if self.patch_root:
             prefix = self.patch_root.as_posix().rstrip("/") + "/"
             patch_text = patch_path.read_text(encoding="utf-8")
-            patch_text = _strip_patch_prefix(patch_text, prefix)
-            patch_to_apply = patch_path.with_name("patch_root_adjusted.diff")
-            patch_to_apply.write_text(patch_text, encoding="utf-8")
+            if _patch_has_prefix(patch_text, prefix):
+                patch_text = _strip_patch_prefix(patch_text, prefix)
+                patch_to_apply = patch_path.with_name("patch_root_adjusted.diff")
+                patch_to_apply.write_text(patch_text, encoding="utf-8")
         result = subprocess.run(
             ["git", "-C", str(patch_repo), "apply", str(patch_to_apply)],
             check=True,
@@ -367,6 +368,19 @@ def _strip_patch_prefix(patch_text: str, prefix: str) -> str:
             line = f"{head}{lead}{rest}"
         lines.append(line)
     return "\n".join(lines) + ("\n" if patch_text.endswith("\n") else "")
+
+
+def _patch_has_prefix(patch_text: str, prefix: str) -> bool:
+    prefixes = (
+        f"--- a/{prefix}",
+        f"+++ b/{prefix}",
+        f"--- {prefix}",
+        f"+++ {prefix}",
+    )
+    for line in patch_text.splitlines():
+        if line.startswith(prefixes):
+            return True
+    return False
 
 
 def get_git_head(repo_root: Path) -> Optional[str]:

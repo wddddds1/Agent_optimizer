@@ -9,9 +9,11 @@ import re
 import shutil
 import subprocess
 import statistics
+import threading
+import tempfile
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -24,6 +26,7 @@ from schemas.patch_proposal_ir import PatchProposal
 from schemas.result_ir import ResultIR
 from schemas.decision_ir import DecisionIR
 from skills.build_local import BuildOutput, build_job, collect_binary_provenance
+from skills.verify import DriftReport, compute_drift
 from skills.run_local import RunOutput
 from skills.system_caps import collect_system_caps
 from skills.profile_features import build_profile_features
@@ -35,6 +38,7 @@ from skills.patch_review import review_patch_diff
 from skills.lammps_templates import get_template_context
 from skills.applications import apply_adapter as apply_app_adapter
 from skills.applications import ensure_log_path as app_ensure_log_path
+from skills.applications import ensure_output_capture as app_ensure_output_capture
 from skills.applications import input_edit_allowlist as app_input_allowlist
 from skills.patch_git import (
     GitPatchContext,
@@ -88,6 +92,45 @@ _EXPECTED_EFFECTS = {
     "imbalance_reduce",
     "io_reduce",
 }
+
+
+def _call_with_timeout(timeout_sec: float, fn):
+    """Run callable with a hard wall-clock timeout using a daemon thread."""
+    if timeout_sec <= 0:
+        return fn()
+    result_holder: Dict[str, object] = {}
+    error_holder: Dict[str, BaseException] = {}
+    done = threading.Event()
+
+    def _runner() -> None:
+        try:
+            result_holder["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            error_holder["error"] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_runner, daemon=True, name="deep-analysis-timeout-worker")
+    worker.start()
+    if not done.wait(timeout_sec):
+        raise TimeoutError(f"timed out after {timeout_sec:.1f}s")
+    if "error" in error_holder:
+        raise error_holder["error"]
+    return result_holder.get("value")
+
+
+def _effective_discovery_timeout_sec(da_cfg: Dict[str, object]) -> Tuple[float, bool]:
+    """Return discovery timeout and whether it was auto-adjusted."""
+    raw_timeout = float(da_cfg.get("discovery_timeout_sec", 150.0) or 0.0)
+    if raw_timeout <= 0:
+        return raw_timeout, False
+    request_timeout = float(da_cfg.get("request_timeout_sec", 120.0) or 0.0)
+    min_floor = float(da_cfg.get("min_discovery_timeout_sec", 60.0) or 0.0)
+    adaptive_floor = min_floor
+    if request_timeout > 0:
+        adaptive_floor = max(adaptive_floor, min(120.0, request_timeout + 15.0))
+    effective_timeout = max(raw_timeout, adaptive_floor)
+    return effective_timeout, effective_timeout > raw_timeout
 
 
 def _slug_token(value: str, max_len: int = 64) -> str:
@@ -716,6 +759,26 @@ def _is_volatile_action(action: Optional[ActionIR]) -> bool:
     return False
 
 
+def _is_crash_like_failure(reason_text: str, exit_code: Optional[int]) -> bool:
+    text = (reason_text or "").lower()
+    if isinstance(exit_code, int):
+        if exit_code < 0:
+            return True
+        if exit_code in {132, 133, 134, 136, 137, 138, 139}:
+            return True
+    crash_tokens = (
+        "segmentation fault",
+        "sigsegv",
+        "bus error",
+        "illegal instruction",
+        "trace/bpt trap",
+        "core dumped",
+        "abort",
+        "signal",
+    )
+    return any(token in text for token in crash_tokens)
+
+
 def _merge_run_args_cfg(
     base: Optional[Dict[str, object]],
     extra: Optional[Dict[str, object]],
@@ -766,7 +829,6 @@ def _actions_conflict(a: ActionIR, b: ActionIR) -> bool:
     Two actions conflict if they touch overlapping resources:
     - Same family (e.g. two parallel_omp variants)
     - Both are build_config
-    - source_patch touching the same files
     - Overlapping env variables
     - Overlapping run_args flags
     """
@@ -776,20 +838,10 @@ def _actions_conflict(a: ActionIR, b: ActionIR) -> bool:
     # build_config cannot compose with another build_config
     if "build_config" in (a.applies_to or []) and "build_config" in (b.applies_to or []):
         return True
-    # source_patch: conflict if touching same files
-    a_is_patch = "source_patch" in (a.applies_to or [])
-    b_is_patch = "source_patch" in (b.applies_to or [])
-    if a_is_patch and b_is_patch:
-        files_a = set((a.parameters or {}).get("patch_files", []))
-        files_b = set((b.parameters or {}).get("patch_files", []))
-        target_a = (a.parameters or {}).get("target_file", "")
-        target_b = (b.parameters or {}).get("target_file", "")
-        if target_a:
-            files_a.add(target_a)
-        if target_b:
-            files_b.add(target_b)
-        if files_a & files_b:
-            return True
+    # source_patch composition is validated by
+    # _source_patch_actions_compose_on_clean_head (git apply --check),
+    # not by file-overlap heuristics.  Removed premature same-file block
+    # so that patches touching the same file can reach the real safety check.
     # env variable overlap
     env_a = set((a.parameters or {}).get("env", {}).keys()) if isinstance((a.parameters or {}).get("env"), dict) else set()
     env_b = set((b.parameters or {}).get("env", {}).keys()) if isinstance((b.parameters or {}).get("env"), dict) else set()
@@ -805,6 +857,100 @@ def _actions_conflict(a: ActionIR, b: ActionIR) -> bool:
     return False
 
 
+def _action_patch_root(action: Optional[ActionIR]) -> str:
+    if not action or not isinstance(action.parameters, dict):
+        return ""
+    raw = action.parameters.get("patch_root")
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
+def _action_patch_paths(action: Optional[ActionIR]) -> List[str]:
+    if not action or not isinstance(action.parameters, dict):
+        return []
+    params = action.parameters or {}
+    ordered: List[str] = []
+    raw_paths = params.get("patch_paths")
+    if isinstance(raw_paths, list):
+        for item in raw_paths:
+            if isinstance(item, str):
+                norm = item.strip()
+                if norm and norm not in ordered:
+                    ordered.append(norm)
+    raw_path = params.get("patch_path")
+    if isinstance(raw_path, str):
+        norm = raw_path.strip()
+        if norm and norm not in ordered:
+            ordered.append(norm)
+    return ordered
+
+
+def _source_patch_actions_compose_on_clean_head(
+    repo_root: Path,
+    actions: List[ActionIR],
+) -> Tuple[bool, str]:
+    patch_actions = [
+        action for action in actions if action and "source_patch" in (action.applies_to or [])
+    ]
+    if len(patch_actions) < 2:
+        return True, ""
+    patch_roots = {_action_patch_root(action) for action in patch_actions}
+    if len(patch_roots) > 1:
+        return False, f"incompatible patch_root values: {sorted(patch_roots)}"
+    patch_root_str = next(iter(patch_roots), "")
+    check_repo = repo_root
+    prefix = ""
+    if patch_root_str:
+        patch_root_path = Path(patch_root_str)
+        check_repo = (
+            patch_root_path if patch_root_path.is_absolute() else (repo_root / patch_root_path)
+        ).resolve()
+        prefix = patch_root_path.as_posix().rstrip("/") + "/"
+    if not check_repo.exists():
+        return False, f"patch check root not found: {check_repo}"
+
+    ordered_patch_paths: List[Path] = []
+    for action in patch_actions:
+        for item in _action_patch_paths(action):
+            path = Path(item)
+            if path not in ordered_patch_paths:
+                ordered_patch_paths.append(path)
+    if len(ordered_patch_paths) < 2:
+        return True, ""
+
+    tmp_worktree_root, tmp_worktree_parent, prep_reason = _prepare_detached_head_worktree(check_repo)
+    if tmp_worktree_root is None:
+        return False, f"compose check worktree failed: {prep_reason}"
+    try:
+        for patch_path in ordered_patch_paths:
+            if not patch_path.exists():
+                return False, f"patch file not found: {patch_path}"
+            patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+            adjusted = _strip_patch_prefix(patch_text, prefix) if prefix else patch_text
+            check_res = subprocess.run(
+                ["git", "-C", str(tmp_worktree_root), "apply", "--check", "-"],
+                input=adjusted,
+                text=True,
+                capture_output=True,
+            )
+            if check_res.returncode != 0:
+                detail = (check_res.stderr or check_res.stdout or "").strip()
+                return False, detail or f"patch does not apply: {patch_path}"
+            apply_res = subprocess.run(
+                ["git", "-C", str(tmp_worktree_root), "apply", "-"],
+                input=adjusted,
+                text=True,
+                capture_output=True,
+            )
+            if apply_res.returncode != 0:
+                detail = (apply_res.stderr or apply_res.stdout or "").strip()
+                return False, detail or f"patch apply failed: {patch_path}"
+    finally:
+        _cleanup_detached_head_worktree(check_repo, tmp_worktree_root, tmp_worktree_parent)
+    return True, ""
+
+
 def _select_non_conflicting(
     experiments: List[ExperimentIR],
     baseline_runtime: float,
@@ -812,6 +958,7 @@ def _select_non_conflicting(
     variance_cfg: Optional[Dict[str, object]] = None,
     variance_repeats: int = 2,
     baseline_run_id: Optional[str] = None,
+    repo_root: Optional[Path] = None,
 ) -> List[ExperimentIR]:
     """Select the best non-conflicting set of improvements from an iteration.
 
@@ -866,6 +1013,24 @@ def _select_non_conflicting(
             if _actions_conflict(exp.action, sel.action):
                 conflicts = True
                 break
+        if (
+            not conflicts
+            and repo_root is not None
+            and exp.action
+            and "source_patch" in (exp.action.applies_to or [])
+        ):
+            source_actions = [
+                item.action
+                for item in selected
+                if item.action and "source_patch" in (item.action.applies_to or [])
+            ]
+            if source_actions:
+                compose_ok, _compose_reason = _source_patch_actions_compose_on_clean_head(
+                    repo_root,
+                    source_actions + [exp.action],
+                )
+                if not compose_ok:
+                    conflicts = True
         if not conflicts:
             selected.append(exp)
 
@@ -1074,6 +1239,83 @@ def _opportunity_graph_summary(graph: OpportunityGraph) -> Dict[str, object]:
     }
 
 
+def _run_algorithm_preanalysis(
+    *,
+    llm_client: Optional[LLMClient],
+    profile: Dict[str, object],
+    domain_knowledge: Dict[str, object],
+    hotspot_files: List[str],
+    repo_root: Path,
+    reporter: Optional[ConsoleUI],
+    trace_events: List[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    """Lightweight 1-round LLM call for algorithm-level pre-analysis.
+
+    Identifies algorithm-level optimization opportunities (data structure
+    changes, algorithmic substitutions, communication pattern redesign) that
+    loop-level analysis would miss.
+    """
+    if not llm_client or not llm_client.config.enabled:
+        return None
+
+    # Collect top hotspot file contents (first 200 lines, max 3 files)
+    file_snippets: List[str] = []
+    for rel in hotspot_files[:3]:
+        path = repo_root / rel
+        if path.is_file():
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[:200]
+                file_snippets.append(f"### {rel}\n```\n" + "\n".join(lines) + "\n```")
+            except OSError:
+                pass
+
+    prompt = """\
+You are an HPC algorithm analysis expert.  Given profiling data, domain knowledge,
+and top hotspot source code, identify algorithm-level optimization opportunities
+that a loop-level analysis would miss.
+
+Focus on:
+1. Data structure changes (AoS→SoA, struct packing, layout transforms)
+2. Algorithmic substitutions (better algorithms, reduced complexity)
+3. Communication pattern redesign (overlap, batching, topology-aware)
+4. Compute pattern changes (blocking, tiling, work partitioning)
+
+Return ONLY a JSON object with this exact schema:
+{
+  "algorithm_opportunities": [
+    {"title": "...", "rationale": "...", "estimated_impact": "high|medium|low", "target_files": ["..."]}
+  ],
+  "data_structure_observations": "...",
+  "communication_pattern": "..."
+}
+Keep response concise (~500 tokens).  If insufficient data, return empty lists."""
+
+    payload: Dict[str, object] = {
+        "profile": profile,
+        "domain_knowledge": domain_knowledge,
+        "hotspot_source_snippets": file_snippets,
+    }
+
+    try:
+        result = llm_client.request_json(prompt, payload)
+        if reporter:
+            n = len(result.get("algorithm_opportunities", [])) if isinstance(result, dict) else 0
+            reporter._print(f"Algorithm pre-analysis: {n} opportunities identified")
+        trace_events.append({
+            "event": "algorithm_preanalysis",
+            "agent": "Orchestrator",
+            "result_keys": list(result.keys()) if isinstance(result, dict) else [],
+        })
+        return result
+    except Exception as exc:
+        trace_events.append({
+            "event": "algorithm_preanalysis_error",
+            "agent": "Orchestrator",
+            "error": str(exc),
+        })
+        return None
+
+
 def _run_phase2_deep_analysis_init(
     *,
     use_two_phase: bool,
@@ -1093,6 +1335,9 @@ def _run_phase2_deep_analysis_init(
     patch_planner: object,
     artifacts_dir: Path,
     trace_events: List[Dict[str, object]],
+    llm_client: Optional[LLMClient] = None,
+    analysis_stage: str = "init",
+    iteration: Optional[int] = None,
 ) -> DeepAnalysisInitOutput:
     deep_analysis_opportunities: List[ActionIR] = []
     deep_analysis_result: Optional[DeepCodeAnalysisResult] = None
@@ -1120,7 +1365,11 @@ def _run_phase2_deep_analysis_init(
     from orchestrator.agents.code_analysis_agent import DeepCodeAnalysisAgent
 
     if reporter:
-        reporter._section("Phase 2 Init: Deep Code Analysis")
+        if analysis_stage == "init":
+            reporter._section("Phase 2 Init: Deep Code Analysis")
+        else:
+            iter_label = f" #{iteration}" if isinstance(iteration, int) else ""
+            reporter._section(f"Phase 2 Refresh{iter_label}: Deep Code Analysis")
     da_agent_config = AgentConfig(
         enabled=True,
         api_key_env=da_cfg.get("api_key_env", "DEEPSEEK_API_KEY"),
@@ -1130,6 +1379,8 @@ def _run_phase2_deep_analysis_init(
         max_tokens=int(da_cfg.get("max_tokens", 4096)),
         max_turns=int(da_cfg.get("max_turns", 50)),
         max_tool_calls_per_turn=int(da_cfg.get("max_tool_calls_per_turn", 5)),
+        request_timeout_sec=float(da_cfg.get("request_timeout_sec", 120.0)),
+        api_timeout_retries=int(da_cfg.get("api_timeout_retries", 2)),
     )
     da_input_script = best_chain_exp.job.input_script or ""
     da_input_text = _safe_read(Path(da_input_script)) if da_input_script else ""
@@ -1180,16 +1431,56 @@ def _run_phase2_deep_analysis_init(
         else []
     )
     da_profile = (
-        {
-            "timing_breakdown": best_chain_exp.profile_report.timing_breakdown,
-            "system_metrics": best_chain_exp.profile_report.system_metrics,
-            "notes": best_chain_exp.profile_report.notes,
-        }
+        build_profile_payload(best_chain_exp.profile_report)
         if best_chain_exp.profile_report
         else {}
     )
     if da_tau:
         da_profile["tau_hotspots"] = da_tau
+        da_profile["function_hotspots"] = da_tau
+        notes = da_profile.get("notes", [])
+        if isinstance(notes, list):
+            da_profile["notes"] = [
+                str(item) for item in notes
+                if "no function hotspots available" not in str(item).lower()
+            ]
+
+    # Classify bottleneck from profiling data
+    from skills.profile_payload import classify_bottleneck
+    bottleneck_classification = None
+    if best_chain_exp.profile_report:
+        try:
+            bottleneck_classification = classify_bottleneck(best_chain_exp.profile_report)
+            if reporter:
+                reporter._print(
+                    f"Bottleneck classification: {bottleneck_classification.bottleneck_type} "
+                    f"(IPC={bottleneck_classification.ipc:.2f})"
+                )
+            trace_events.append({
+                "event": "bottleneck_classification",
+                "agent": "Orchestrator",
+                "type": bottleneck_classification.bottleneck_type,
+                "ipc": bottleneck_classification.ipc,
+                "effective": bottleneck_classification.effective_directions,
+                "ineffective": bottleneck_classification.ineffective_directions,
+            })
+        except Exception:
+            pass
+
+    # Load domain knowledge from adapter config
+    from skills.applications import get_domain_knowledge
+    domain_knowledge = get_domain_knowledge(adapter_cfg)
+
+    # Run algorithm-level pre-analysis before deep code analysis
+    algorithm_preanalysis = _run_algorithm_preanalysis(
+        llm_client=llm_client,
+        profile=da_profile,
+        domain_knowledge=domain_knowledge,
+        hotspot_files=da_hotspot_files,
+        repo_root=repo_root,
+        reporter=reporter,
+        trace_events=trace_events,
+    )
 
     # Keep deep-analysis tools rooted at repository root so file paths like
     # "third_party/bwa/bwt.c" resolve consistently.
@@ -1208,24 +1499,94 @@ def _run_phase2_deep_analysis_init(
 
     context_retry = 0
     max_context_retry = int(da_cfg.get("max_context_retry", 1) or 1)
+    discovery_timeout_sec, discovery_timeout_adjusted = _effective_discovery_timeout_sec(da_cfg)
+    full_discovery_timeout_sec = discovery_timeout_sec
+    refresh_timeout_sec = float(da_cfg.get("refresh_discovery_timeout_sec", 30.0) or 0.0)
+    if analysis_stage != "init" and refresh_timeout_sec > 0:
+        prev_timeout = discovery_timeout_sec
+        discovery_timeout_sec = min(discovery_timeout_sec, refresh_timeout_sec)
+        if discovery_timeout_sec != prev_timeout:
+            trace_events.append(
+                {
+                    "event": "deep_analysis_refresh_timeout_applied",
+                    "agent": "Orchestrator",
+                    "analysis_stage": analysis_stage,
+                    "iteration": iteration,
+                    "full_timeout_sec": prev_timeout,
+                    "refresh_timeout_sec": discovery_timeout_sec,
+                }
+            )
+            if reporter:
+                reporter._print(
+                    "Deep analysis refresh timeout: "
+                    f"{prev_timeout:.0f}s -> {discovery_timeout_sec:.0f}s"
+                )
+    if discovery_timeout_adjusted:
+        trace_events.append(
+            {
+                "event": "deep_analysis_timeout_adjusted",
+                "agent": "Orchestrator",
+                "configured_timeout_sec": float(da_cfg.get("discovery_timeout_sec", 150.0) or 0.0),
+                "effective_timeout_sec": full_discovery_timeout_sec,
+            }
+        )
+        if reporter:
+            reporter._print(
+                "Deep analysis timeout auto-adjusted: "
+                f"{float(da_cfg.get('discovery_timeout_sec', 150.0) or 0.0):.0f}s -> {full_discovery_timeout_sec:.0f}s"
+            )
     supplemental_context: Dict[str, str] = {}
     graph_result: Optional[OpportunityGraphResult] = None
     last_discovery: Optional[object] = None
     while True:
         try:
-            graph_result = da_agent.discover_opportunity_graph(
-                profile=da_profile,
-                hotspot_files=da_hotspot_files,
-                system_caps=system_caps,
-                patch_families=patch_families,
-                experience_hints=da_exp_hints,
-                backend_variant=da_backend,
-                input_script_path=job.input_script or None,
-                supplemental_context=supplemental_context,
+            graph_result = _call_with_timeout(
+                discovery_timeout_sec,
+                lambda: da_agent.discover_opportunity_graph(
+                    profile=da_profile,
+                    hotspot_files=da_hotspot_files,
+                    system_caps=system_caps,
+                    patch_families=patch_families,
+                    experience_hints=da_exp_hints,
+                    backend_variant=da_backend,
+                    input_script_path=job.input_script or None,
+                    supplemental_context=supplemental_context,
+                    algorithm_preanalysis=algorithm_preanalysis,
+                    domain_knowledge=domain_knowledge,
+                    bottleneck_classification=(
+                        bottleneck_classification.model_dump()
+                        if bottleneck_classification else None
+                    ),
+                ),
             )
             last_discovery = da_agent.last_discovery_run
         except LLMUnavailableError:
             raise
+        except TimeoutError as exc:
+            graph_result = OpportunityGraphResult(
+                status=OpportunityStatus.NO_ACTIONABLE,
+                graph=None,
+                missing=[],
+                needs_profile=[],
+                rationale=f"deep_analysis_timeout: {exc}",
+                suggestions=["deep analysis timed out; reuse previous opportunity graph"],
+            )
+            last_discovery = None
+            trace_events.append(
+                {
+                    "event": "deep_analysis_timeout",
+                    "agent": "DeepCodeAnalysisAgent",
+                    "timeout_sec": discovery_timeout_sec,
+                    "error": str(exc),
+                    "analysis_stage": analysis_stage,
+                    "iteration": iteration,
+                }
+            )
+            if reporter:
+                reporter._print(
+                    f"Deep analysis timeout after {discovery_timeout_sec:.0f}s; "
+                    "continuing with previous opportunity graph."
+                )
         except Exception as exc:
             graph_result = OpportunityGraphResult(
                 status=OpportunityStatus.NO_ACTIONABLE,
@@ -1264,6 +1625,11 @@ def _run_phase2_deep_analysis_init(
                     json.dumps(last_discovery.conversation_log, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+                if analysis_stage != "init" and isinstance(iteration, int):
+                    (artifacts_dir / f"deep_analysis_conversation.iter{iteration}.json").write_text(
+                        json.dumps(last_discovery.conversation_log, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
             except Exception:
                 pass
             deep_analysis_result = (
@@ -1345,6 +1711,15 @@ def _run_phase2_deep_analysis_init(
                 selected_opportunities.model_dump_json(indent=2),
                 encoding="utf-8",
             )
+            if analysis_stage != "init" and isinstance(iteration, int):
+                (artifacts_dir / f"opportunity_graph.iter{iteration}.json").write_text(
+                    opportunity_graph.model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
+                (artifacts_dir / f"opportunity_selection.iter{iteration}.json").write_text(
+                    selected_opportunities.model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
         except Exception:
             pass
         if reporter:
@@ -1352,6 +1727,12 @@ def _run_phase2_deep_analysis_init(
                 f"Deep analysis graph: {len(opportunity_graph.opportunities)} nodes, "
                 f"selected {len(selected_opportunities.selected)} actions"
             )
+            if selected_opportunities.selected:
+                next_focus = ", ".join(
+                    f"{item.opportunity.opportunity_id}({item.opportunity.mechanism.value})"
+                    for item in selected_opportunities.selected[:4]
+                )
+                reporter._print(f"Next-round focus: {next_focus}")
     else:
         status = graph_result.status if graph_result else OpportunityStatus.NO_ACTIONABLE
         rationale = graph_result.rationale if graph_result else "unknown"
@@ -1669,6 +2050,8 @@ def _run_parameter_exploration_phase(
         max_tokens=4096,
         max_turns=_explorer_max_turns,
         max_tool_calls_per_turn=_explorer_max_tool_calls,
+        request_timeout_sec=float(explorer_cfg.get("request_timeout_sec", 120.0)),
+        api_timeout_retries=int(explorer_cfg.get("api_timeout_retries", 2)),
     )
 
     input_script_path = Path(job.input_script) if job.input_script else None
@@ -1786,6 +2169,11 @@ def _run_parameter_exploration_phase(
         exp_id = f"phase1-{candidate.action_id}"
         if reporter:
             reporter._print(f"  [{i + 1}/{len(result.candidates)}] {candidate.action_id}")
+        verify_base_exp = (
+            _find_experiment_by_run_id(all_experiments, base_run_id)
+            if base_run_id
+            else baseline_exp
+        ) or baseline_exp
 
         try:
             exp = executor.execute(
@@ -1810,7 +2198,7 @@ def _run_parameter_exploration_phase(
                 repeats=1,
                 runtime_agg="mean",
                 baseline_exp=baseline_exp,
-                baseline_exp_for_verify=baseline_exp,
+                baseline_exp_for_verify=verify_base_exp,
                 baseline_runtime=baseline_runtime,
                 prior_samples=None,
                 trace_events=trace_events,
@@ -1824,7 +2212,8 @@ def _run_parameter_exploration_phase(
             memory.record(exp)
             state.run_count += 1
 
-            experience_memory.record_experiment(exp, baseline_exp)
+            memory_base_exp = _resolve_experiment_base(exp, all_experiments, baseline_exp)
+            experience_memory.record_experiment(exp, memory_base_exp)
             if exp.verdict == "PASS" and exp.results and exp.results.runtime_seconds > 0:
                 improvement = (
                     (current_base_runtime - exp.results.runtime_seconds) / current_base_runtime
@@ -1863,6 +2252,7 @@ def _run_parameter_exploration_phase(
         baseline_runtime,
         chain_min_improvement_pct,
         baseline_run_id=baseline_exp.run_id,
+        repo_root=repo_root,
     )
 
     if not winners:
@@ -2405,6 +2795,34 @@ def _best_non_patch_experiment(experiments: List[ExperimentIR]) -> Optional[Expe
     return best
 
 
+def _is_profile_probe_action_id(action_id: str) -> bool:
+    return str(action_id or "").startswith("profile_probe.")
+
+
+def _is_profile_probe_experiment(exp: ExperimentIR) -> bool:
+    if not exp or not exp.action:
+        return False
+    action_id = str(exp.action.action_id or "")
+    if _is_profile_probe_action_id(action_id):
+        return True
+    run_id = str(exp.run_id or "")
+    if run_id.endswith("-profile"):
+        return True
+    return False
+
+
+def _resolve_experiment_base(
+    exp: ExperimentIR,
+    experiments: List[ExperimentIR],
+    fallback: ExperimentIR,
+) -> ExperimentIR:
+    if exp and exp.base_run_id:
+        base = _find_experiment_by_run_id(experiments, exp.base_run_id)
+        if base:
+            return base
+    return fallback
+
+
 def _load_patch_replay_actions(
     artifacts_root: Path,
     case_id: str,
@@ -2436,6 +2854,8 @@ def _load_patch_replay_actions(
                 exp = ExperimentIR.model_validate_json(exp_path.read_text())
             except Exception:
                 continue
+            if _is_profile_probe_experiment(exp):
+                continue
             if exp.action is None or exp.action.family != "source_patch":
                 continue
             params = exp.action.parameters or {}
@@ -2453,14 +2873,38 @@ def _load_patch_replay_actions(
                 if _backend_from_args(exp.job.run_args) not in (backend, None):
                     continue
             derived = exp.results.derived_metrics or {}
-            speedup = derived.get("speedup_vs_baseline_check") or derived.get("speedup_vs_baseline")
+            improvement_pct = None
+            raw_improvement = derived.get("improvement_vs_base_pct")
             try:
-                speedup = float(speedup)
+                if raw_improvement is not None:
+                    improvement_pct = float(raw_improvement)
             except (TypeError, ValueError):
-                speedup = None
-            if speedup is None:
+                improvement_pct = None
+            if improvement_pct is None and exp.base_run_id:
+                base_exp_path = runs_dir / str(exp.base_run_id) / "experiment.json"
+                if base_exp_path.exists():
+                    try:
+                        base_exp = ExperimentIR.model_validate_json(base_exp_path.read_text())
+                        base_rt = float(base_exp.results.runtime_seconds)
+                        cur_rt = float(exp.results.runtime_seconds)
+                        if base_rt > 0 and cur_rt > 0:
+                            improvement_pct = (base_rt - cur_rt) / base_rt * 100.0
+                    except Exception:
+                        improvement_pct = None
+            if improvement_pct is None:
+                speedup = (
+                    derived.get("speedup_vs_base_run")
+                    or derived.get("speedup_vs_baseline_check")
+                    or derived.get("speedup_vs_baseline")
+                )
+                try:
+                    speedup = float(speedup)
+                except (TypeError, ValueError):
+                    speedup = None
+                if speedup is not None:
+                    improvement_pct = (speedup - 1.0) * 100.0
+            if improvement_pct is None:
                 continue
-            improvement_pct = (speedup - 1.0) * 100.0
             if improvement_pct < min_gain_pct:
                 continue
             patch_path = exp.patch_path
@@ -2939,6 +3383,7 @@ def _build_planner_context(
         "profile": {
             "timing_breakdown": profile.timing_breakdown,
             "system_metrics": profile.system_metrics,
+            "bottleneck_portrait": profile.bottleneck_portrait,
         },
         "profile_features": profile_features,
         "hotspot_map": hotspot_map,
@@ -3347,6 +3792,15 @@ def _collect_code_snippets(
     if max_snippets <= 0 or max_chars <= 0:
         return snippets
     budget_per = max(800, max_chars // max_snippets)
+
+    # Try tree-sitter for AST-aware features
+    _use_ts = False
+    try:
+        from skills.code_structure import is_available as _ts_avail, extract_snippet_features
+        _use_ts = _ts_avail()
+    except ImportError:
+        pass
+
     for rel in files:
         if len(snippets) >= max_snippets:
             break
@@ -3364,14 +3818,25 @@ def _collect_code_snippets(
                 continue
             seen.add(snippet)
             anchor_hints = _anchor_hints_for_snippet(text, snippet)
-            features = _snippet_features(snippet)
+
+            # Use tree-sitter features when available, else regex fallback
+            start_line = block.get("start_line") or 1
+            end_line = block.get("end_line") or (start_line + len(snippet.splitlines()))
+            if _use_ts:
+                try:
+                    features = extract_snippet_features(str(path), start_line, end_line)
+                except Exception:
+                    features = _snippet_features(snippet)
+            else:
+                features = _snippet_features(snippet)
+
             snippets.append(
                 {
                     "path": rel,
                     "snippet": snippet,
                     "tag": block.get("tag"),
-                    "start_line": block.get("start_line"),
-                    "end_line": block.get("end_line"),
+                    "start_line": start_line,
+                    "end_line": end_line,
                     "anchor_hints": anchor_hints,
                     "features": features,
                 }
@@ -3404,6 +3869,28 @@ def _infer_target_anchor_for_action(
                 pat = re.compile(rf"\b{re.escape(func)}\s*\(")
                 for line in lines:
                     if pat.search(line):
+                        return line.strip()
+    if target_file:
+        path = repo_root / target_file
+        if path.is_file():
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            search_blob = " ".join(
+                [
+                    str(action.action_id or ""),
+                    str(params.get("hypothesis") or ""),
+                    str(params.get("rationale") or ""),
+                ]
+            )
+            if search_blob.strip():
+                func_sig = re.compile(
+                    r"^\s*(?:[A-Za-z_]\w*[\s\*]+)+([A-Za-z_]\w*)\s*\([^;]*\)\s*\{?\s*$"
+                )
+                for line in lines:
+                    m = func_sig.match(line)
+                    if not m:
+                        continue
+                    name = m.group(1)
+                    if name and name in search_blob:
                         return line.strip()
     for snippet_item in code_snippets:
         snippet_path = snippet_item.get("path")
@@ -3488,7 +3975,6 @@ def _find_marker_line(lines: List[str]) -> Tuple[Optional[int], str]:
         "eval(",
         "compute<",
         "compute(",
-        "compute ",
     ]
     for marker in markers:
         for idx, line in enumerate(lines):
@@ -3498,6 +3984,7 @@ def _find_marker_line(lines: List[str]) -> Tuple[Optional[int], str]:
 
 
 def _find_function_start(lines: List[str], from_idx: int) -> Optional[int]:
+    control_kw = ("if", "for", "while", "switch", "return")
     for idx in range(from_idx, -1, -1):
         line = lines[idx]
         if "compute" in line and "(" in line:
@@ -3506,6 +3993,23 @@ def _find_function_start(lines: List[str], from_idx: int) -> Optional[int]:
             if idx + 1 < len(lines) and "{" in lines[idx + 1]:
                 return idx
         if "::" in line and "(" in line and "{" in line:
+            return idx
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("//", "/*", "*", "#")):
+            continue
+        if "(" not in stripped or ")" not in stripped:
+            continue
+        head = stripped.split("(", 1)[0].strip()
+        head_last = head.split()[-1] if head.split() else ""
+        if head_last in control_kw:
+            continue
+        if stripped.endswith(";"):
+            continue
+        if "{" in stripped:
+            return idx
+        if idx + 1 < len(lines) and "{" in lines[idx + 1]:
             return idx
     return None
 
@@ -3845,6 +4349,14 @@ def _retry_patch_after_review(
     reason_text = "\n".join(review_reasons).strip() or "review_failed"
     debug_snippets = list(code_snippets)
     debug_allowed_files = list(allowed_files)
+    params = action.parameters if isinstance(action.parameters, dict) else {}
+    target_file = params.get("target_file") if isinstance(params.get("target_file"), str) else None
+    target_anchor = (
+        params.get("target_anchor").strip()
+        if isinstance(params.get("target_anchor"), str) and params.get("target_anchor").strip()
+        else _infer_target_anchor_for_action(action=action, repo_root=repo_root, code_snippets=debug_snippets)
+    )
+    max_snippets = int(patch_rules.get("max_snippets", 0) or 0)
     for attempt in range(debug_max_attempts):
         debug_proposal = patch_debugger.repair(
             action=action,
@@ -3893,18 +4405,35 @@ def _retry_patch_after_review(
                 if expand_round > max_expand_rounds:
                     break
                 expand_budget = min(expand_budget + base_context, expand_cap)
-                expanded = _expand_snippets_for_missing_context(
-                    debug_proposal.missing_fields,
-                    repo_root,
-                    snippet_files,
-                    patch_rules,
-                    max_chars_override=expand_budget,
+                expanded = _expand_retry_snippets(
+                    repo_root=repo_root,
+                    missing_fields=debug_proposal.missing_fields,
+                    patch_rules=patch_rules,
+                    max_snippets=max_snippets,
+                    expand_budget=expand_budget,
+                    expand_cap=expand_cap,
+                    snippet_files=debug_allowed_files or snippet_files,
+                    target_file=target_file,
+                    target_anchor=target_anchor,
                 )
                 if not expanded:
                     break
                 new_fingerprint = _snippet_fingerprint(expanded)
                 if new_fingerprint == last_fingerprint:
-                    break
+                    expanded = _expand_retry_snippets(
+                        repo_root=repo_root,
+                        missing_fields=debug_proposal.missing_fields,
+                        patch_rules=patch_rules,
+                        max_snippets=max_snippets,
+                        expand_budget=expand_cap,
+                        expand_cap=expand_cap,
+                        snippet_files=debug_allowed_files or snippet_files,
+                        target_file=target_file,
+                        target_anchor=target_anchor,
+                    )
+                    new_fingerprint = _snippet_fingerprint(expanded)
+                    if new_fingerprint == last_fingerprint:
+                        break
                 last_fingerprint = new_fingerprint
                 snippet_paths = [item.get("path") for item in expanded if item.get("path")]
                 debug_allowed_files = snippet_paths or debug_allowed_files
@@ -4129,7 +4658,12 @@ def _parse_edit_failure_anchor(
         if len(parts) < 4:
             continue
         error_kind = parts[0]
-        if error_kind not in {"anchor_not_unique", "anchor_not_found", "old_text_not_found"}:
+        if error_kind not in {
+            "anchor_not_unique",
+            "anchor_not_found",
+            "old_text_not_unique",
+            "old_text_not_found",
+        }:
             continue
         file_path = parts[1]
         if parts[2] != "b64":
@@ -4175,6 +4709,129 @@ def _parse_need_more_context_targets(
         seen.add(key)
         deduped.append((file_path, anchor))
     return deduped
+
+
+def _extract_context_symbols_from_missing_fields(
+    missing_fields: List[str],
+    max_symbols: int = 12,
+) -> List[str]:
+    if not missing_fields:
+        return []
+    symbols: List[str] = []
+    seen: set[str] = set()
+    # Keep these permissive; we only use them to locate local definitions.
+    blocked = {
+        "need_more_context",
+        "context",
+        "function",
+        "functions",
+        "struct",
+        "structure",
+        "header",
+        "headers",
+        "macro",
+        "macros",
+        "simd",
+        "sse",
+        "avx",
+        "neon",
+        "cpu",
+        "compiler",
+        "intrinsics",
+    }
+    for item in missing_fields:
+        text = str(item or "")
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text):
+            lowered = token.lower()
+            if lowered in blocked:
+                continue
+            # Prefer project symbols with underscore/mixed-case/prefix patterns.
+            if "_" not in token and not token.startswith("bwt") and not token.startswith("ksw"):
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            symbols.append(token)
+            if len(symbols) >= max_symbols:
+                return symbols
+    return symbols
+
+
+def _expand_snippets_for_symbols(
+    repo_root: Path,
+    symbols: List[str],
+    search_files: List[str],
+    max_snippets: int,
+    max_chars: int,
+) -> List[Dict[str, object]]:
+    if not symbols or max_snippets <= 0 or max_chars <= 0:
+        return []
+    files: List[str] = []
+    seen_files: set[str] = set()
+    for rel in search_files or []:
+        if not isinstance(rel, str) or not rel:
+            continue
+        if rel not in seen_files:
+            seen_files.add(rel)
+            files.append(rel)
+        if rel.endswith(".c"):
+            hdr = rel[:-2] + ".h"
+            if hdr not in seen_files and (repo_root / hdr).is_file():
+                seen_files.add(hdr)
+                files.append(hdr)
+    # Fallback: include nearby headers/sources from the same directory.
+    if files:
+        parent = (repo_root / files[0]).parent
+        if parent.is_dir():
+            for cand in sorted(parent.glob("*")):
+                if len(files) >= 48:
+                    break
+                if not cand.is_file() or cand.suffix not in {".c", ".h", ".cc", ".cpp", ".hpp"}:
+                    continue
+                try:
+                    rel = cand.relative_to(repo_root).as_posix()
+                except Exception:
+                    continue
+                if rel in seen_files:
+                    continue
+                seen_files.add(rel)
+                files.append(rel)
+    snippets: List[Dict[str, object]] = []
+    seen_snippets: set[str] = set()
+    budget_per = max(800, max_chars // max(1, max_snippets))
+    for symbol in symbols:
+        pat = re.compile(rf"\b{re.escape(symbol)}\b")
+        for rel in files:
+            if len(snippets) >= max_snippets:
+                break
+            path = repo_root / rel
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+            for idx, line in enumerate(lines):
+                if len(snippets) >= max_snippets:
+                    break
+                if not pat.search(line):
+                    continue
+                for block in _build_anchor_snippet_blocks(lines, idx, budget_per):
+                    if len(snippets) >= max_snippets:
+                        break
+                    snippet = str(block.get("snippet") or "")
+                    if not snippet or snippet in seen_snippets:
+                        continue
+                    seen_snippets.add(snippet)
+                    snippets.append(
+                        {
+                            "path": rel,
+                            "snippet": snippet,
+                            "tag": f"symbol:{symbol}",
+                            "start_line": block.get("start_line"),
+                            "end_line": block.get("end_line"),
+                            "anchor_hints": _anchor_hints_for_snippet(text, snippet),
+                        }
+                    )
+    return snippets
 
 
 def _expand_snippets_for_missing_context(
@@ -4232,6 +4889,80 @@ def _expand_snippets_for_missing_context(
     return expanded
 
 
+def _expand_retry_snippets(
+    *,
+    repo_root: Path,
+    missing_fields: Optional[List[str]],
+    patch_rules: Dict[str, object],
+    max_snippets: int,
+    expand_budget: int,
+    expand_cap: int,
+    snippet_files: List[str],
+    target_file: Optional[str],
+    target_anchor: Optional[str],
+) -> List[Dict[str, object]]:
+    snippet_files_for_expand = [item for item in (snippet_files or []) if isinstance(item, str) and item]
+    max_snippets = max(1, int(max_snippets))
+    if isinstance(target_file, str) and target_file:
+        snippet_files_for_expand = [target_file]
+
+    expanded: List[Dict[str, object]] = []
+    if (
+        isinstance(target_file, str)
+        and target_file
+        and isinstance(target_anchor, str)
+        and target_anchor
+    ):
+        expanded = _expand_snippets_for_anchor(
+            repo_root=repo_root,
+            file_path=target_file,
+            anchor=target_anchor,
+            max_snippets=max_snippets,
+            max_chars=expand_budget,
+        )
+    if not expanded:
+        anchor_ctx = _parse_edit_failure_anchor(missing_fields or [])
+        if anchor_ctx:
+            expanded = _expand_snippets_for_anchor(
+                repo_root=repo_root,
+                file_path=anchor_ctx[0],
+                anchor=anchor_ctx[1],
+                max_snippets=max_snippets,
+                max_chars=expand_budget,
+            )
+    if not expanded:
+        symbol_snippets = _expand_snippets_for_symbols(
+            repo_root=repo_root,
+            symbols=_extract_context_symbols_from_missing_fields(missing_fields or []),
+            search_files=snippet_files_for_expand,
+            max_snippets=max_snippets,
+            max_chars=expand_budget,
+        )
+        if symbol_snippets:
+            expanded = symbol_snippets
+    if not expanded:
+        expanded = _expand_snippets_for_missing_context(
+            missing_fields or [],
+            repo_root,
+            snippet_files_for_expand,
+            patch_rules,
+            max_chars_override=expand_budget,
+        )
+    if not expanded:
+        fallback_file = (
+            target_file
+            or (snippet_files_for_expand[0] if snippet_files_for_expand else None)
+        )
+        if isinstance(fallback_file, str) and fallback_file:
+            expanded = _expand_snippets_for_file(
+                repo_root=repo_root,
+                file_path=fallback_file,
+                max_snippets=max_snippets,
+                max_chars=expand_cap,
+            )
+    return expanded
+
+
 def _snippet_fingerprint(snippets: List[Dict[str, object]]) -> Tuple[Tuple[str, int, int], ...]:
     items: List[Tuple[str, int, int]] = []
     for item in snippets:
@@ -4282,6 +5013,17 @@ def _expand_snippets_for_file(
         return []
     text = path.read_text(encoding="utf-8", errors="replace")
     blocks = _build_snippet_blocks(text, max(800, max_chars // max_snippets))
+    lines = text.splitlines()
+    full_snippet, full_start, full_end = _slice_line_block(lines, 0, len(lines), max_chars)
+    if full_snippet:
+        blocks.append(
+            {
+                "tag": "full_file",
+                "snippet": full_snippet,
+                "start_line": full_start + 1,
+                "end_line": full_end,
+            }
+        )
     snippets: List[Dict[str, object]] = []
     seen = set()
     for block in blocks:
@@ -4765,6 +5507,144 @@ def _check_patch_apply(
     return False, stderr or "patch does not apply"
 
 
+def _check_patch_file_apply(check_root: Path, patch_path: Path) -> Tuple[bool, str]:
+    if not patch_path.exists():
+        return False, "patch file not found"
+    result = subprocess.run(
+        ["git", "-C", str(check_root), "apply", "--check", str(patch_path)],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True, ""
+    stderr = (result.stderr or result.stdout or "").strip()
+    return False, stderr or "patch file does not apply"
+
+
+def _prepare_chain_context_worktree(
+    repo_root: Path,
+    chain_patch_paths: List[str],
+    patch_root: Optional[str] = None,
+) -> Tuple[Optional[Path], Optional[Path], str]:
+    """Create a temporary worktree with the chain's patches applied.
+
+    This is used so the code patch agent reads source files that reflect the
+    current chain state (previous patches already applied) rather than the
+    original HEAD.  The caller must clean up via
+    ``_cleanup_detached_head_worktree``.
+    """
+    wt_dir, tmp_root, reason = _prepare_detached_head_worktree(repo_root)
+    if wt_dir is None:
+        return None, None, reason
+    # Init submodule worktrees inside the temp worktree so patched
+    # submodule files are accessible.
+    sub_worktrees: List[Tuple[Path, Path]] = []
+    gitmodules = repo_root / ".gitmodules"
+    if gitmodules.exists():
+        for line in gitmodules.read_text(encoding="utf-8").splitlines():
+            if "path" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() != "path":
+                continue
+            sub_path_str = value.strip()
+            if not sub_path_str:
+                continue
+            source_repo = (repo_root / sub_path_str).resolve()
+            if not source_repo.exists():
+                continue
+            target = (wt_dir / sub_path_str).resolve()
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            # Get the commit from the worktree's tree
+            ls_res = subprocess.run(
+                ["git", "-C", str(wt_dir), "ls-tree", "HEAD", sub_path_str],
+                check=False, capture_output=True, text=True,
+            )
+            parts = (ls_res.stdout or "").strip().split()
+            commit = parts[2] if len(parts) >= 3 else None
+            if not commit:
+                continue
+            subprocess.run(
+                ["git", "-C", str(source_repo), "worktree", "prune", "--expire", "now"],
+                check=False, capture_output=True, text=True,
+            )
+            add_res = subprocess.run(
+                ["git", "-C", str(source_repo), "worktree", "add", "--detach",
+                 str(target), commit],
+                check=False, capture_output=True, text=True,
+            )
+            if add_res.returncode == 0:
+                sub_worktrees.append((source_repo, target))
+    apply_root = wt_dir
+    if patch_root:
+        candidate = (wt_dir / patch_root).resolve()
+        if candidate.exists():
+            apply_root = candidate
+    prefix = ""
+    if patch_root:
+        prefix = Path(patch_root).as_posix().rstrip("/") + "/"
+    for patch_path_str in chain_patch_paths:
+        patch_file = Path(patch_path_str)
+        if not patch_file.exists():
+            for src, tgt in sub_worktrees:
+                subprocess.run(
+                    ["git", "-C", str(src), "worktree", "remove", "-f", str(tgt)],
+                    check=False, capture_output=True, text=True,
+                )
+            _cleanup_detached_head_worktree(repo_root, wt_dir, tmp_root)
+            return None, None, f"chain patch file not found: {patch_path_str}"
+        patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
+        if prefix:
+            patch_text = _strip_patch_prefix(patch_text, prefix)
+        apply_res = subprocess.run(
+            ["git", "-C", str(apply_root), "apply", "-"],
+            input=patch_text, text=True, capture_output=True,
+        )
+        if apply_res.returncode != 0:
+            detail = (apply_res.stderr or apply_res.stdout or "").strip()
+            for src, tgt in sub_worktrees:
+                subprocess.run(
+                    ["git", "-C", str(src), "worktree", "remove", "-f", str(tgt)],
+                    check=False, capture_output=True, text=True,
+                )
+            _cleanup_detached_head_worktree(repo_root, wt_dir, tmp_root)
+            return None, None, f"chain patch apply failed: {detail}"
+    return wt_dir, tmp_root, ""
+
+
+def _prepare_detached_head_worktree(
+    git_repo_root: Path,
+) -> Tuple[Optional[Path], Optional[Path], str]:
+    tmp_root = Path(tempfile.mkdtemp(prefix="hpc-replay-head-"))
+    worktree_dir = tmp_root / "wt"
+    result = subprocess.run(
+        ["git", "-C", str(git_repo_root), "worktree", "add", "--detach", str(worktree_dir), "HEAD"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        return None, None, stderr or "failed to prepare detached worktree"
+    return worktree_dir, tmp_root, ""
+
+
+def _cleanup_detached_head_worktree(
+    git_repo_root: Path,
+    worktree_dir: Optional[Path],
+    tmp_root: Optional[Path],
+) -> None:
+    if worktree_dir is not None:
+        subprocess.run(
+            ["git", "-C", str(git_repo_root), "worktree", "remove", "-f", str(worktree_dir)],
+            text=True,
+            capture_output=True,
+        )
+    if tmp_root is not None:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 def _compose_patch_from_debug_delta(
     worktree_root: Path,
     debug_patch_diff: str,
@@ -4843,6 +5723,11 @@ def _preflight_patch_compile(
     preflight_dir = run_dir / "preflight"
     preflight_dir.mkdir(parents=True, exist_ok=True)
     build_log_path = preflight_dir / "build.log"
+    # Extract chain patch_paths from action so the preflight worktree
+    # applies the full chain before the new delta.
+    patch_params = _extract_patch_params(action, repo_root)
+    chain_paths = [p for p in (patch_params.get("patch_paths") or [])
+                   if p != patch_path]
     try:
         with GitPatchContext(
             repo_root=repo_root,
@@ -4852,6 +5737,7 @@ def _preflight_patch_compile(
             input_edit=None,
             allowlist=allowlist,
             patch_path=patch_path,
+            patch_paths=chain_paths or None,
             patch_root=patch_root,
             worktree_retries=worktree_retries,
         ) as ctx:
@@ -5576,6 +6462,121 @@ class TraceBuffer(list):
 
 
 @dataclass
+class PatchSubPhase:
+    """Configuration for a single patch sub-phase."""
+    id: str                              # "ALGO", "DATAFLOW", "MICRO"
+    label: str                           # human-readable label
+    max_iters: Optional[int] = None      # None = use remaining budget
+    no_improve_patience: int = 2
+    allowed_families: List[str] = field(default_factory=list)
+
+
+class PatchSubPhaseTracker:
+    """Tracks progression through ALGO -> DATAFLOW -> MICRO sub-phases."""
+
+    def __init__(self, planner_cfg: Optional[Dict[str, object]] = None) -> None:
+        self._phases: List[PatchSubPhase] = []
+        self._current_idx: int = 0
+        self._iters_in_phase: int = 0
+        self._no_improve_streak: int = 0
+        self._enabled: bool = False
+        self._best_runtime_in_phase: Optional[float] = None
+
+        cfg = (planner_cfg or {}).get("patch_sub_phases", {})
+        if not isinstance(cfg, dict) or not cfg.get("enabled", False):
+            return
+
+        self._enabled = True
+        for phase_cfg in cfg.get("phases", []):
+            if not isinstance(phase_cfg, dict):
+                continue
+            max_iters_raw = phase_cfg.get("max_iters")
+            self._phases.append(PatchSubPhase(
+                id=phase_cfg.get("id", "UNKNOWN"),
+                label=phase_cfg.get("label", ""),
+                max_iters=int(max_iters_raw) if max_iters_raw is not None else None,
+                no_improve_patience=int(phase_cfg.get("no_improve_patience", 2)),
+                allowed_families=phase_cfg.get("allowed_families", []),
+            ))
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled and len(self._phases) > 0
+
+    @property
+    def current_phase(self) -> Optional[PatchSubPhase]:
+        if not self.enabled or self._current_idx >= len(self._phases):
+            return None
+        return self._phases[self._current_idx]
+
+    @property
+    def current_phase_id(self) -> str:
+        phase = self.current_phase
+        return phase.id if phase else "NONE"
+
+    @property
+    def allowed_families(self) -> Optional[List[str]]:
+        """Return the allowed families for the current sub-phase, or None if no restriction."""
+        phase = self.current_phase
+        if not phase or not phase.allowed_families:
+            return None
+        return list(phase.allowed_families)
+
+    def record_iteration(self, improved: bool, runtime: Optional[float] = None) -> None:
+        """Record an iteration result and potentially advance sub-phase."""
+        if not self.enabled:
+            return
+        self._iters_in_phase += 1
+        if improved:
+            self._no_improve_streak = 0
+            if runtime is not None:
+                self._best_runtime_in_phase = runtime
+        else:
+            self._no_improve_streak += 1
+
+    def should_advance(self) -> bool:
+        """Check if the current sub-phase should transition to the next."""
+        if not self.enabled:
+            return False
+        phase = self.current_phase
+        if not phase:
+            return False
+        # Advance if max_iters exceeded
+        if phase.max_iters is not None and self._iters_in_phase >= phase.max_iters:
+            return True
+        # Advance if no improvement for patience iterations
+        if self._no_improve_streak >= phase.no_improve_patience:
+            return True
+        return False
+
+    def advance(self) -> bool:
+        """Move to the next sub-phase. Returns True if advanced, False if already at last."""
+        if not self.enabled:
+            return False
+        if self._current_idx + 1 >= len(self._phases):
+            return False
+        self._current_idx += 1
+        self._iters_in_phase = 0
+        self._no_improve_streak = 0
+        self._best_runtime_in_phase = None
+        return True
+
+    def to_dict(self) -> Dict[str, object]:
+        """Return current state for trace events and planner context."""
+        phase = self.current_phase
+        return {
+            "enabled": self._enabled,
+            "current_phase": phase.id if phase else None,
+            "current_phase_label": phase.label if phase else None,
+            "iters_in_phase": self._iters_in_phase,
+            "no_improve_streak": self._no_improve_streak,
+            "allowed_families": self.allowed_families,
+            "phase_index": self._current_idx,
+            "total_phases": len(self._phases),
+        }
+
+
+@dataclass
 class DeepAnalysisInitOutput:
     opportunities: List[ActionIR]
     deep_analysis_result: Optional[DeepCodeAnalysisResult]
@@ -5653,6 +6654,8 @@ def run_optimization(
             "max_tool_calls_per_turn": agentic_cfg.get("max_tool_calls_per_turn", 5),
             "max_invalid_tool_calls_total": agentic_cfg.get("max_invalid_tool_calls_total", 5),
             "max_invalid_tool_calls_per_tool": agentic_cfg.get("max_invalid_tool_calls_per_tool", 2),
+            "request_timeout_sec": agentic_cfg.get("request_timeout_sec", 120.0),
+            "api_timeout_retries": agentic_cfg.get("api_timeout_retries", 2),
         }
         code_patcher = create_agentic_code_patch_agent(
             repo_root=agentic_repo_root,
@@ -5688,6 +6691,8 @@ def run_optimization(
             max_tokens=int(orchestrator_cfg.get("max_tokens", 4096)),
             max_turns=int(orchestrator_cfg.get("max_turns", 25)),
             max_tool_calls_per_turn=int(orchestrator_cfg.get("max_tool_calls_per_turn", 5)),
+            request_timeout_sec=float(orchestrator_cfg.get("request_timeout_sec", 120.0)),
+            api_timeout_retries=int(orchestrator_cfg.get("api_timeout_retries", 2)),
         )
         input_script_path = Path(job.input_script) if job.input_script else None
         orchestrator_agent = OrchestratorAgent(
@@ -5964,6 +6969,68 @@ def run_optimization(
         )
         baseline_seeded_by_phase1_cache = False
     memory.record(baseline_exp)
+    # Run a dedicated drift-capture baseline to collect reference output
+    # without distorting the performance-scoring baseline.
+    baseline_capture_paths: List[str] = []
+    _drift_capture_enabled = bool(
+        isinstance(adapter_cfg, dict) and (adapter_cfg or {}).get("drift")
+    ) or bool(gates.get("drift_thresholds"))
+    if _drift_capture_enabled and baseline_exp.verdict == "PASS":
+        _drift_baseline = executor.execute(
+            exp_id="baseline-drift-capture",
+            job=job if not (baseline_seeded_by_phase1_cache and cached_phase1_action) else baseline_exp.job,
+            base_job=None,
+            base_run_id=baseline_exp.run_id,
+            base_action_id=None,
+            action=None,
+            actions_root=repo_root,
+            policy=policy,
+            gates=gates,
+            profiler=profiler,
+            verifier=verifier,
+            artifacts_dir=artifacts_dir,
+            time_command=time_command,
+            profiling_cfg=None,
+            wrappers_cfg=None,
+            build_cfg=build_cfg or {},
+            build_packs=build_packs,
+            adapter_cfg=adapter_cfg,
+            repeats=1,
+            runtime_agg="mean",
+            baseline_exp=baseline_exp,
+            baseline_exp_for_verify=baseline_exp,
+            baseline_runtime=baseline_exp.results.runtime_seconds,
+            prior_samples=None,
+            trace_events=trace_events,
+            parent_run_id=baseline_exp.run_id,
+            iteration=None,
+            llm_trace=None,
+            reporter=reporter,
+            run_purpose="drift_capture",
+        )
+        baseline_capture_paths = _read_capture_paths(
+            artifacts_dir / "runs" / _drift_baseline.run_id
+        )
+        if reporter and baseline_capture_paths:
+            reporter._print(f"Drift baseline captured: {baseline_capture_paths[0]}")
+        trace_events.append({
+            "event": "drift_baseline_captured",
+            "agent": "Orchestrator",
+            "run_id": _drift_baseline.run_id,
+            "capture_paths": baseline_capture_paths,
+        })
+    drift_thresholds = gates.get("drift_thresholds", {})
+    app_drift_thresholds = drift_thresholds.get(
+        str(job.app).lower(), drift_thresholds.get("default", {})
+    )
+    # Allow adapter-level drift config to override global thresholds
+    adapter_drift_cfg = (adapter_cfg or {}).get("drift", {}) if isinstance(adapter_cfg, dict) else {}
+    if isinstance(adapter_drift_cfg, dict) and adapter_drift_cfg.get("thresholds"):
+        app_drift_thresholds = dict(app_drift_thresholds)
+        app_drift_thresholds.update(adapter_drift_cfg["thresholds"])
+    drift_repair_max_attempts = int(
+        (adapter_drift_cfg.get("drift_repair_max_attempts", 2) if isinstance(adapter_drift_cfg, dict) else 2)
+    )
     chain_min_improvement_pct = float(
         (planner_cfg or {}).get("chain_min_improvement_pct", 0.001) or 0.001
     )
@@ -5972,6 +7039,10 @@ def run_optimization(
     best_chain_runtime = baseline_exp.results.runtime_seconds
     profile_probe_enabled = bool((planner_cfg or {}).get("profile_each_iteration", True))
     profile_probe_repeats = int((planner_cfg or {}).get("profile_probe_repeats", 1) or 1)
+    profile_probe_on_best_change_only = bool(
+        (planner_cfg or {}).get("profile_probe_on_best_change_only", True)
+    )
+    profile_probe_last_best_run_id: Optional[str] = None
     latest_profile_report: Optional[ProfileReport] = baseline_exp.profile_report
     if profile_probe_enabled and profiling_cfg:
         baseline_profile_exp = executor.execute(
@@ -6009,6 +7080,7 @@ def run_optimization(
         latest_profile_report = baseline_profile_exp.profile_report
         if baseline_profile_exp.profile_report:
             baseline_exp.profile_report = baseline_profile_exp.profile_report
+        profile_probe_last_best_run_id = baseline_exp.run_id
     if seed_nonbaseline:
         for exp in seed_nonbaseline:
             memory.record(exp)
@@ -6253,44 +7325,62 @@ def run_optimization(
             })
 
     if profile_probe_enabled and profiling_cfg and best_chain_exp:
-        pre_da_probe_action = _build_source_patch_replay_action(best_chain_exp, memory.experiments)
-        pre_da_probe = executor.execute(
-            exp_id="phase2-precheck-profile",
-            job=job,
-            base_job=best_chain_exp.job,
-            base_run_id=best_chain_exp.run_id,
-            base_action_id=best_chain_exp.action.action_id if best_chain_exp.action else "baseline",
-            action=pre_da_probe_action,
-            actions_root=repo_root,
-            policy=policy,
-            gates=gates,
-            profiler=profiler,
-            verifier=verifier,
-            artifacts_dir=artifacts_dir,
-            time_command=time_command,
-            profiling_cfg=profiling_cfg,
-            wrappers_cfg=wrappers_cfg,
-            build_cfg=build_cfg or {},
-            build_packs=build_packs,
-            adapter_cfg=adapter_cfg,
-            repeats=max(1, profile_probe_repeats),
-            runtime_agg="mean",
-            baseline_exp=baseline_exp,
-            baseline_exp_for_verify=baseline_exp,
-            baseline_runtime=baseline_exp.results.runtime_seconds,
-            prior_samples=None,
-            trace_events=trace_events,
-            parent_run_id=best_chain_exp.run_id,
-            iteration=None,
-            llm_trace=None,
-            reporter=reporter,
-            run_purpose="profile",
-        )
-        latest_profile_report = pre_da_probe.profile_report
-        if pre_da_probe.profile_report:
-            best_chain_exp.profile_report = pre_da_probe.profile_report
-            if best_chain_exp.run_id == baseline_exp.run_id:
-                baseline_exp.profile_report = pre_da_probe.profile_report
+        should_run_precheck_probe = True
+        if (
+            profile_probe_on_best_change_only
+            and profile_probe_last_best_run_id == best_chain_exp.run_id
+        ):
+            should_run_precheck_probe = False
+        if should_run_precheck_probe:
+            pre_da_probe_action = _build_source_patch_replay_action(best_chain_exp, memory.experiments)
+            pre_da_probe = executor.execute(
+                exp_id="phase2-precheck-profile",
+                job=job,
+                base_job=best_chain_exp.job,
+                base_run_id=best_chain_exp.run_id,
+                base_action_id=best_chain_exp.action.action_id if best_chain_exp.action else "baseline",
+                action=pre_da_probe_action,
+                actions_root=repo_root,
+                policy=policy,
+                gates=gates,
+                profiler=profiler,
+                verifier=verifier,
+                artifacts_dir=artifacts_dir,
+                time_command=time_command,
+                profiling_cfg=profiling_cfg,
+                wrappers_cfg=wrappers_cfg,
+                build_cfg=build_cfg or {},
+                build_packs=build_packs,
+                adapter_cfg=adapter_cfg,
+                repeats=max(1, profile_probe_repeats),
+                runtime_agg="mean",
+                baseline_exp=baseline_exp,
+                baseline_exp_for_verify=baseline_exp,
+                baseline_runtime=baseline_exp.results.runtime_seconds,
+                prior_samples=None,
+                trace_events=trace_events,
+                parent_run_id=best_chain_exp.run_id,
+                iteration=None,
+                llm_trace=None,
+                reporter=reporter,
+                run_purpose="profile",
+            )
+            latest_profile_report = pre_da_probe.profile_report
+            if pre_da_probe.profile_report:
+                best_chain_exp.profile_report = pre_da_probe.profile_report
+                if best_chain_exp.run_id == baseline_exp.run_id:
+                    baseline_exp.profile_report = pre_da_probe.profile_report
+            profile_probe_last_best_run_id = best_chain_exp.run_id
+        else:
+            trace_events.append(
+                {
+                    "event": "profile_probe_skipped",
+                    "agent": "ProfilerAgent",
+                    "iteration": None,
+                    "best_run_id": best_chain_exp.run_id,
+                    "reason": "best_unchanged_reuse_previous_profile",
+                }
+            )
 
     # --- Deep Code Analysis (runs once at start of Phase 2) ---
     deep_init = _run_phase2_deep_analysis_init(
@@ -6311,6 +7401,9 @@ def run_optimization(
         patch_planner=patch_planner,
         artifacts_dir=artifacts_dir,
         trace_events=trace_events,
+        llm_client=llm_client,
+        analysis_stage="init",
+        iteration=None,
     )
     deep_analysis_opportunities = deep_init.opportunities
     _deep_analysis_result = deep_init.deep_analysis_result
@@ -6318,17 +7411,60 @@ def run_optimization(
     _selected_opportunities = deep_init.selected_opportunities
 
     opportunity_graph_mode = _opportunity_graph is not None
+    _two_phase_cfg = (planner_cfg or {}).get("two_phase", {})
+    _da_refresh_cfg = (
+        _two_phase_cfg.get("deep_analysis", {})
+        if isinstance(_two_phase_cfg, dict)
+        else {}
+    )
+    deep_analysis_refresh_each_iteration = bool(
+        (_da_refresh_cfg or {}).get("refresh_each_iteration", True)
+    )
+    _simple_patch_cfg = (planner_cfg or {}).get("simple_patch_loop", {})
+    simple_patch_loop_enabled = bool(
+        _simple_patch_cfg.get("enabled", True)
+        if isinstance(_simple_patch_cfg, dict)
+        else True
+    )
+    simple_patch_max_candidates = int(
+        _simple_patch_cfg.get("max_candidates_per_iteration", 4)
+        if isinstance(_simple_patch_cfg, dict)
+        else 4
+    )
+    simple_patch_loop_active = bool(simple_patch_loop_enabled and phase == "PATCH")
+    if simple_patch_loop_active and reporter:
+        reporter._print(
+            f"Simple PATCH loop enabled: max_candidates_per_iteration={simple_patch_max_candidates}"
+        )
+
+    # Initialize patch sub-phase tracker (ALGO -> DATAFLOW -> MICRO)
+    if simple_patch_loop_active:
+        patch_sub_phase_tracker = PatchSubPhaseTracker({"patch_sub_phases": {"enabled": False}})
+    else:
+        patch_sub_phase_tracker = PatchSubPhaseTracker(planner_cfg)
+    if patch_sub_phase_tracker.enabled and reporter:
+        reporter._print(
+            f"Patch sub-phases enabled: starting with {patch_sub_phase_tracker.current_phase_id}"
+        )
 
     # --- Batch selection + reflection state ---
     _batch_cfg = (planner_cfg or {}).get("batch_selection", {})
     _batch_for_opportunity_graph = bool(_batch_cfg.get("enable_for_opportunity_graph", True))
-    use_batch_selection = bool(_batch_cfg.get("enabled", False)) and (
-        _batch_for_opportunity_graph or not opportunity_graph_mode
+    use_batch_selection = (
+        (not simple_patch_loop_active)
+        and bool(_batch_cfg.get("enabled", False))
+        and (_batch_for_opportunity_graph or not opportunity_graph_mode)
     )
     _batch_min = int(_batch_cfg.get("min_batch", 3))
     _batch_max = int(_batch_cfg.get("max_batch", 5))
+    if simple_patch_loop_active and opportunity_graph_mode:
+        # In simple PATCH mode, still seed multiple opportunity actions per round;
+        # otherwise we only try one action each iteration and waste rounds.
+        use_batch_selection = True
+        _batch_min = max(1, min(simple_patch_max_candidates, _batch_min))
+        _batch_max = max(_batch_min, simple_patch_max_candidates)
     _refl_cfg = (planner_cfg or {}).get("reflection", {})
-    use_reflection = bool(_refl_cfg.get("enabled", False))
+    use_reflection = (not simple_patch_loop_active) and bool(_refl_cfg.get("enabled", False))
     deep_succeeded_ids: set = set()
     deep_failed_ids: set = set()
     deep_skipped_ids: set = set()
@@ -6342,6 +7478,7 @@ def run_optimization(
     refine_cfg = (planner_cfg or {}).get("refine_on_best", {})
     refine_enabled = bool(refine_cfg.get("enabled", False))
     refine_min_improvement = float(refine_cfg.get("min_improvement_pct", min_improvement_pct or 0.0))
+    chain_within_iteration = bool((planner_cfg or {}).get("chain_within_iteration", True))
     while True:
         elapsed = time.monotonic() - start_time
         if should_stop(job.budgets, iteration, state, elapsed, min_delta_seconds):
@@ -6392,50 +7529,123 @@ def run_optimization(
         )
         _backend_variant: Optional[str] = None  # set later by _adapter_variant_files
         if profile_probe_enabled and profiling_cfg:
-            probe_action = _build_source_patch_replay_action(best_chain_exp, memory.experiments)
-            probe_base_job = best_chain_exp.job
-            probe_base_run_id = best_chain_exp.run_id
-            probe_base_action_id = best_chain_exp.action.action_id if best_chain_exp.action else "baseline"
-            profile_probe_exp = executor.execute(
-                exp_id=f"iter{iteration}-profile",
-                job=job,
-                base_job=probe_base_job,
-                base_run_id=probe_base_run_id,
-                base_action_id=probe_base_action_id,
-                action=probe_action,
-                actions_root=repo_root,
-                policy=policy,
-                gates=gates,
-                profiler=profiler,
-                verifier=verifier,
-                artifacts_dir=artifacts_dir,
-                time_command=time_command,
-                profiling_cfg=profiling_cfg,
-                wrappers_cfg=wrappers_cfg,
-                build_cfg=build_cfg or {},
-                build_packs=build_packs,
-                adapter_cfg=adapter_cfg,
-                repeats=max(1, profile_probe_repeats),
-                runtime_agg="mean",
-                baseline_exp=baseline_exp,
-                baseline_exp_for_verify=baseline_exp,
-                baseline_runtime=baseline_exp.results.runtime_seconds,
-                prior_samples=None,
-                trace_events=trace_events,
-                parent_run_id=probe_base_run_id,
-                iteration=iteration,
-                llm_trace=None,
+            should_run_iteration_probe = True
+            if (
+                profile_probe_on_best_change_only
+                and profile_probe_last_best_run_id == best_chain_exp.run_id
+            ):
+                should_run_iteration_probe = False
+            if should_run_iteration_probe:
+                probe_action = _build_source_patch_replay_action(best_chain_exp, memory.experiments)
+                probe_base_job = best_chain_exp.job
+                probe_base_run_id = best_chain_exp.run_id
+                probe_base_action_id = best_chain_exp.action.action_id if best_chain_exp.action else "baseline"
+                profile_probe_exp = executor.execute(
+                    exp_id=f"iter{iteration}-profile",
+                    job=job,
+                    base_job=probe_base_job,
+                    base_run_id=probe_base_run_id,
+                    base_action_id=probe_base_action_id,
+                    action=probe_action,
+                    actions_root=repo_root,
+                    policy=policy,
+                    gates=gates,
+                    profiler=profiler,
+                    verifier=verifier,
+                    artifacts_dir=artifacts_dir,
+                    time_command=time_command,
+                    profiling_cfg=profiling_cfg,
+                    wrappers_cfg=wrappers_cfg,
+                    build_cfg=build_cfg or {},
+                    build_packs=build_packs,
+                    adapter_cfg=adapter_cfg,
+                    repeats=max(1, profile_probe_repeats),
+                    runtime_agg="mean",
+                    baseline_exp=baseline_exp,
+                    baseline_exp_for_verify=baseline_exp,
+                    baseline_runtime=baseline_exp.results.runtime_seconds,
+                    prior_samples=None,
+                    trace_events=trace_events,
+                    parent_run_id=probe_base_run_id,
+                    iteration=iteration,
+                    llm_trace=None,
+                    reporter=reporter,
+                    run_purpose="profile",
+                )
+                latest_profile_report = profile_probe_exp.profile_report
+                if profile_probe_exp.profile_report:
+                    best_chain_exp.profile_report = profile_probe_exp.profile_report
+                    if best_chain_exp.run_id == baseline_exp.run_id:
+                        baseline_exp.profile_report = profile_probe_exp.profile_report
+                profile_probe_last_best_run_id = best_chain_exp.run_id
+                trace_events.append(
+                    {
+                        "event": "iteration_profile_probe",
+                        "agent": "ProfilerAgent",
+                        "iteration": iteration,
+                        "run_id": profile_probe_exp.run_id,
+                        "verdict": profile_probe_exp.verdict,
+                        "bottleneck_portrait": (
+                            profile_probe_exp.profile_report.bottleneck_portrait
+                            if profile_probe_exp.profile_report
+                            else {}
+                        ),
+                    }
+                )
+            else:
+                trace_events.append(
+                    {
+                        "event": "iteration_profile_probe_skipped",
+                        "agent": "ProfilerAgent",
+                        "iteration": iteration,
+                        "best_run_id": best_chain_exp.run_id,
+                        "reason": "best_unchanged_reuse_previous_profile",
+                    }
+                )
+        if (
+            use_two_phase
+            and phase == "PATCH"
+            and deep_analysis_refresh_each_iteration
+        ):
+            deep_iter = _run_phase2_deep_analysis_init(
+                use_two_phase=use_two_phase,
+                phase=phase,
+                planner_cfg=planner_cfg,
                 reporter=reporter,
-                run_purpose="profile",
+                job=job,
+                best_chain_exp=best_chain_exp,
+                baseline_exp=baseline_exp,
+                memory=memory,
+                repo_root=repo_root,
+                adapter_cfg=adapter_cfg,
+                build_cfg=build_cfg,
+                experience_memory=experience_memory,
+                system_caps=system_caps,
+                patch_families=patch_families,
+                patch_planner=patch_planner,
+                artifacts_dir=artifacts_dir,
+                trace_events=trace_events,
+                llm_client=llm_client,
+                analysis_stage="refresh",
+                iteration=iteration,
             )
-            latest_profile_report = profile_probe_exp.profile_report
+            refresh_has_payload = bool(
+                deep_iter.opportunity_graph is not None or deep_iter.opportunities
+            )
+            if refresh_has_payload:
+                deep_analysis_opportunities = deep_iter.opportunities
+                _deep_analysis_result = deep_iter.deep_analysis_result
+                _opportunity_graph = deep_iter.opportunity_graph
+                _selected_opportunities = deep_iter.selected_opportunities
+                opportunity_graph_mode = _opportunity_graph is not None
             trace_events.append(
                 {
-                    "event": "iteration_profile_probe",
-                    "agent": "ProfilerAgent",
+                    "event": "deep_analysis_refresh",
+                    "agent": "DeepCodeAnalysisAgent",
                     "iteration": iteration,
-                    "run_id": profile_probe_exp.run_id,
-                    "verdict": profile_probe_exp.verdict,
+                    "updated": refresh_has_payload,
+                    "opportunity_graph_mode": opportunity_graph_mode,
+                    "opportunity_count": len(deep_analysis_opportunities or []),
                 }
             )
         profile_ref = latest_profile_report or best_chain_exp.profile_report
@@ -6504,17 +7714,25 @@ def run_optimization(
             hotspot_map=hotspot_map,
             system_caps=system_caps,
         )
+        # Inject patch sub-phase context for the planner
+        if phase == "PATCH" and patch_sub_phase_tracker.enabled:
+            planner_context["patch_sub_phase"] = patch_sub_phase_tracker.to_dict()
         generated_actions: List[ActionIR] = []
         generated_ideas_payload: Optional[Dict[str, object]] = None
         code_survey_payload: Optional[Dict[str, object]] = None
         snippet_feature_map: Dict[Tuple[str, Optional[str]], Dict[str, object]] = {}
         strict_patch_generation = bool((planner_cfg or {}).get("strict_patch_generation", True))
         replay_cfg = (planner_cfg or {}).get("memory_replay", {})
+        best_chain_is_source_patch = bool(
+            best_chain_exp.action
+            and best_chain_exp.action.family == "source_patch"
+        )
         if (
             phase == "PATCH"
             and not opportunity_graph_mode
             and isinstance(replay_cfg, dict)
             and replay_cfg.get("enabled", False)
+            and not best_chain_is_source_patch
         ):
             replay_max = int(replay_cfg.get("max_actions", 0) or 0)
             replay_min_gain = float(replay_cfg.get("min_gain_pct", 1.0) or 1.0)
@@ -6532,6 +7750,84 @@ def run_optimization(
                 patch_families or {},
             )
             if replay_actions:
+                replay_check_root = repo_root
+                if isinstance(adapter_cfg, dict):
+                    replay_patch_root = str(adapter_cfg.get("patch_root") or "").strip()
+                    if replay_patch_root:
+                        replay_patch_path = Path(replay_patch_root)
+                        replay_check_root = (
+                            replay_patch_path
+                            if replay_patch_path.is_absolute()
+                            else (repo_root / replay_patch_path)
+                        )
+                check_on_clean_head = bool(replay_cfg.get("check_on_clean_head", True))
+                apply_check_root = replay_check_root
+                tmp_worktree_root: Optional[Path] = None
+                tmp_worktree_parent: Optional[Path] = None
+                if check_on_clean_head:
+                    tmp_worktree_root, tmp_worktree_parent, prep_reason = _prepare_detached_head_worktree(
+                        replay_check_root
+                    )
+                    if tmp_worktree_root is not None:
+                        apply_check_root = tmp_worktree_root
+                    else:
+                        trace_events.append(
+                            {
+                                "event": "memory_replay_head_check_setup_failed",
+                                "agent": "Orchestrator",
+                                "iteration": iteration,
+                                "check_root": str(replay_check_root),
+                                "reason": prep_reason[:240],
+                            }
+                        )
+                filtered_replay_actions: List[ActionIR] = []
+                replay_filtered: List[Dict[str, str]] = []
+                try:
+                    for replay_action in replay_actions:
+                        params = replay_action.parameters or {}
+                        patch_path_raw = params.get("patch_path")
+                        if not isinstance(patch_path_raw, str) or not patch_path_raw.strip():
+                            filtered_replay_actions.append(replay_action)
+                            continue
+                        ok, reason = _check_patch_file_apply(
+                            apply_check_root,
+                            Path(patch_path_raw),
+                        )
+                        if ok:
+                            filtered_replay_actions.append(replay_action)
+                        else:
+                            replay_filtered.append(
+                                {
+                                    "action_id": replay_action.action_id,
+                                    "reason": reason[:240],
+                                }
+                            )
+                finally:
+                    _cleanup_detached_head_worktree(
+                        replay_check_root,
+                        tmp_worktree_root,
+                        tmp_worktree_parent,
+                    )
+                replay_actions = filtered_replay_actions
+                if replay_filtered:
+                    trace_events.append(
+                        {
+                            "event": "memory_replay_actions_filtered",
+                            "agent": "Orchestrator",
+                            "iteration": iteration,
+                            "check_root": str(replay_check_root),
+                            "check_mode": ("clean_head" if check_on_clean_head else "working_tree"),
+                            "filtered_count": len(replay_filtered),
+                            "kept_count": len(replay_actions),
+                            "filtered": replay_filtered[:12],
+                        }
+                    )
+                    if reporter:
+                        reporter._print(
+                            f"Filtered {len(replay_filtered)} replay patches that "
+                            "do not apply to current source tree."
+                        )
+            if replay_actions:
                 generated_actions.extend(replay_actions)
                 trace_events.append(
                     {
@@ -6541,6 +7837,23 @@ def run_optimization(
                         "action_ids": [action.action_id for action in replay_actions],
                     }
                 )
+        elif (
+            phase == "PATCH"
+            and isinstance(replay_cfg, dict)
+            and replay_cfg.get("enabled", False)
+            and best_chain_is_source_patch
+        ):
+            trace_events.append(
+                {
+                    "event": "memory_replay_skipped_chained_base",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "best_chain_run_id": best_chain_exp.run_id,
+                    "best_chain_action_id": (
+                        best_chain_exp.action.action_id if best_chain_exp.action else ""
+                    ),
+                }
+            )
 
         if not generated_actions and llm_client and llm_client.config.enabled:
             available_families = sorted({action.family for action in actions})
@@ -7630,6 +8943,27 @@ def run_optimization(
                             "code_survey_count": opp_count,
                         }
                     )
+        if simple_patch_loop_active:
+            available_patch = remaining_by_family.get("source_patch", 0)
+            plan.chosen_families = ["source_patch"] if available_patch > 0 else []
+            if simple_patch_max_candidates > 0:
+                if available_patch > 0:
+                    plan.max_candidates = max(
+                        1,
+                        min(simple_patch_max_candidates, available_patch),
+                    )
+                else:
+                    plan.max_candidates = max(1, simple_patch_max_candidates)
+            trace_events.append(
+                {
+                    "event": "simple_patch_plan_enforced",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "chosen_families": plan.chosen_families,
+                    "max_candidates": plan.max_candidates,
+                    "available_source_patch": available_patch,
+                }
+            )
         trace_events.append(
             {
                 "event": "plan",
@@ -7789,7 +9123,17 @@ def run_optimization(
             if ranked_subset and any(item.action.family == "source_patch" for item in ranked_subset):
                 ranked_subset = _select_distinct_patch_families(ranked_subset, rank_limit)
             patch_budget_cfg = candidate_policy.get("patch_budgets", {}) if isinstance(candidate_policy, dict) else {}
-            max_patches_per_round = int(patch_budget_cfg.get("max_patches_per_round", 0) or 0) if isinstance(patch_budget_cfg, dict) else 0
+            configured_max_patches = (
+                int(patch_budget_cfg.get("max_patches_per_round", 0) or 0)
+                if isinstance(patch_budget_cfg, dict)
+                else 0
+            )
+            max_patches_per_round = configured_max_patches
+            if phase == "PATCH":
+                # In source-patch iterations, throughput is already bounded by
+                # rank_limit/max_candidates and global run budget.
+                # Do not add an extra per-round patch cap bottleneck.
+                max_patches_per_round = max(max_patches_per_round, rank_limit)
             if max_patches_per_round > 0 and ranked_subset:
                 filtered_subset = []
                 patch_count = 0
@@ -7807,6 +9151,7 @@ def run_optimization(
                             "event": "patch_budget_enforced",
                             "agent": "RouterRankerAgent",
                             "iteration": iteration,
+                            "configured_max_patches_per_round": configured_max_patches,
                             "max_patches_per_round": max_patches_per_round,
                             "dropped_patch_actions": dropped_patch_actions,
                         }
@@ -7942,11 +9287,22 @@ def run_optimization(
         source_patch_attempted = 0
         attempted_source_actions: Dict[str, Optional[str]] = {}
         source_patch_context_miss_actions: set[str] = set()
+        iteration_chain_base_exp = best_chain_exp
+        _prev_chain_ctx_wt: Optional[Path] = None
+        _prev_chain_ctx_tmp: Optional[Path] = None
         for action in ranked_actions:
+            # Clean up any chain context worktree from a previous loop iteration.
+            if _prev_chain_ctx_wt is not None:
+                _cleanup_detached_head_worktree(repo_root, _prev_chain_ctx_wt, _prev_chain_ctx_tmp)
+                _prev_chain_ctx_wt = None
+                _prev_chain_ctx_tmp = None
             if state.run_count >= job.budgets.max_runs:
                 break
             effective_repeats = candidate_repeats
             if _is_volatile_action(action):
+                effective_repeats = max(effective_repeats, variance_repeats)
+            if action and "source_patch" in (action.applies_to or []):
+                # Source patches are noise-sensitive; enforce multi-sample scoring.
                 effective_repeats = max(effective_repeats, variance_repeats)
             exp_id = _iter_exp_id(iteration, action.action_id)
             base_build_cfg = build_cfg or {}
@@ -7973,6 +9329,72 @@ def run_optimization(
                     adapter_root = (adapter_cfg or {}).get("patch_root")
                     if isinstance(adapter_root, str) and adapter_root:
                         action.parameters["patch_root"] = adapter_root
+                context_base_exp = (
+                    iteration_chain_base_exp if chain_within_iteration else best_chain_exp
+                )
+                # Collect chain patch paths so the patcher reads post-patch source.
+                _chain_patch_paths = _collect_source_patch_chain_paths(
+                    context_base_exp, memory.experiments
+                )
+                _patch_root_str = (
+                    str(action.parameters.get("patch_root"))
+                    if isinstance(action.parameters.get("patch_root"), str)
+                    else None
+                )
+                if _chain_patch_paths:
+                    _chain_ctx_wt, _chain_ctx_tmp, _chain_ctx_reason = (
+                        _prepare_chain_context_worktree(
+                            repo_root, _chain_patch_paths, _patch_root_str
+                        )
+                    )
+                    _prev_chain_ctx_wt = _chain_ctx_wt
+                    _prev_chain_ctx_tmp = _chain_ctx_tmp
+                    if _chain_ctx_wt is not None:
+                        patch_repo_root = _chain_ctx_wt
+                        trace_events.append(
+                            {
+                                "event": "chain_context_worktree_created",
+                                "agent": "Orchestrator",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "chain_depth": len(_chain_patch_paths),
+                                "worktree": str(_chain_ctx_wt),
+                            }
+                        )
+                    else:
+                        trace_events.append(
+                            {
+                                "event": "chain_context_worktree_failed",
+                                "agent": "Orchestrator",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "reason": _chain_ctx_reason,
+                            }
+                        )
+                        # Fallback: resolve from experiment paths
+                        patch_repo_root = _resolve_patch_context_repo_root(
+                            repo_root=repo_root,
+                            base_exp=context_base_exp,
+                            patch_root=_patch_root_str,
+                        )
+                else:
+                    patch_repo_root = _resolve_patch_context_repo_root(
+                        repo_root=repo_root,
+                        base_exp=context_base_exp,
+                        patch_root=_patch_root_str,
+                    )
+                if patch_repo_root != repo_root:
+                    trace_events.append(
+                        {
+                            "event": "patch_context_repo_root_resolved",
+                            "agent": "Orchestrator",
+                            "iteration": iteration,
+                            "action_id": action.action_id,
+                            "base_run_id": context_base_exp.run_id if context_base_exp else None,
+                            "repo_root": str(repo_root),
+                            "patch_repo_root": str(patch_repo_root),
+                        }
+                    )
                 action_allowed_files = list(patch_allowed_files)
                 target_file = (action.parameters or {}).get("target_file")
                 target_anchor = (action.parameters or {}).get("target_anchor")
@@ -7990,7 +9412,7 @@ def run_optimization(
                 action_nav_hints = list(nav_hints)
                 if isinstance(target_file, str) and target_file:
                     target_related_files = _target_with_related_files(
-                        repo_root,
+                        patch_repo_root,
                         target_file,
                         patch_allowed_files,
                         max_related=max(2, min(max_snippets or 8, 8)),
@@ -8004,7 +9426,7 @@ def run_optimization(
                     else:
                         # Target file not in global hints — build a hint for it
                         rel = target_file
-                        _tf_path = repo_root / rel
+                        _tf_path = patch_repo_root / rel
                         if _tf_path.is_file():
                             try:
                                 _tf_lines = _tf_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -8028,6 +9450,25 @@ def run_optimization(
                     if isinstance(target_file, str) and target_file
                     else snippet_files
                 )
+                if isinstance(action.parameters, dict) and not target_anchor:
+                    pre_inferred_anchor = _infer_target_anchor_for_action(
+                        action=action,
+                        repo_root=patch_repo_root,
+                        code_snippets=[],
+                    )
+                    if pre_inferred_anchor:
+                        action.parameters["target_anchor"] = pre_inferred_anchor
+                        target_anchor = pre_inferred_anchor
+                        trace_events.append(
+                            {
+                                "event": "target_anchor_inferred",
+                                "agent": "Orchestrator",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "target_anchor": pre_inferred_anchor,
+                                "mode": "pre_snippet",
+                            }
+                        )
                 base_context = int(patch_rules.get("max_context_chars", 0) or 0)
                 if base_context <= 0:
                     base_context = 60000
@@ -8036,12 +9477,41 @@ def run_optimization(
 
                 def _get_debug_snippets(source_root: Optional[Path] = None) -> List[Dict[str, object]]:
                     nonlocal code_snippets
-                    snippet_root = source_root or repo_root
+                    snippet_root = source_root or patch_repo_root
                     cache_key = str(snippet_root.resolve())
                     if cache_key not in action_code_snippets_by_root:
-                        action_code_snippets_by_root[cache_key] = _collect_code_snippets(
+                        anchored_snippets: List[Dict[str, object]] = []
+                        if (
+                            isinstance(target_file, str)
+                            and target_file
+                            and isinstance(target_anchor, str)
+                            and target_anchor
+                        ):
+                            anchored_snippets = _expand_snippets_for_anchor(
+                                repo_root=snippet_root,
+                                file_path=target_file,
+                                anchor=target_anchor,
+                                max_snippets=max_snippets,
+                                max_chars=base_context,
+                            )
+                        fallback_snippets = _collect_code_snippets(
                             snippet_root, _debug_snippet_files, max_snippets, base_context,
                         )
+                        merged: List[Dict[str, object]] = []
+                        seen_sig: set[Tuple[str, int, int]] = set()
+                        for item in anchored_snippets + fallback_snippets:
+                            sig = (
+                                str(item.get("path") or ""),
+                                int(item.get("start_line") or 0),
+                                int(item.get("end_line") or 0),
+                            )
+                            if sig in seen_sig:
+                                continue
+                            seen_sig.add(sig)
+                            merged.append(item)
+                            if len(merged) >= max_snippets:
+                                break
+                        action_code_snippets_by_root[cache_key] = merged
                     snippets_for_root = action_code_snippets_by_root[cache_key]
                     if source_root is None:
                         code_snippets = snippets_for_root
@@ -8050,7 +9520,7 @@ def run_optimization(
                 if isinstance(action.parameters, dict) and not target_anchor:
                     inferred_anchor = _infer_target_anchor_for_action(
                         action=action,
-                        repo_root=repo_root,
+                        repo_root=patch_repo_root,
                         code_snippets=_initial_patch_snippets or _get_debug_snippets(),
                     )
                     if inferred_anchor:
@@ -8114,7 +9584,7 @@ def run_optimization(
                         patch_rules=patch_rules,
                         allowed_files=action_allowed_files,
                         code_snippets=_initial_patch_snippets,
-                        repo_root=repo_root,
+                        repo_root=patch_repo_root,
                         feedback=_patch_feedback_str,
                         backend_variant=_backend_variant,
                         reference_template=_ref_template,
@@ -8162,7 +9632,7 @@ def run_optimization(
                                 patch_rules=patch_rules,
                                 allowed_files=action_allowed_files,
                                 code_snippets=_initial_patch_snippets,
-                                repo_root=repo_root,
+                                repo_root=patch_repo_root,
                                 feedback="no_response_retry: respond with a valid structured patch",
                                 backend_variant=_backend_variant,
                                 reference_template=_ref_template,
@@ -8203,16 +9673,13 @@ def run_optimization(
                                 ):
                                     inferred_anchor = _infer_target_anchor_for_action(
                                         action=action,
-                                        repo_root=repo_root,
+                                        repo_root=patch_repo_root,
                                         code_snippets=expanded_snippets or _get_debug_snippets(),
                                     )
                                     if inferred_anchor:
                                         action.parameters["target_anchor"] = inferred_anchor
                                         target_anchor = inferred_anchor
                                 expand_budget = min(expand_budget + base_context, expand_cap)
-                                targets = _parse_need_more_context_targets(
-                                    _missing_fields, repo_root
-                                )
                                 snippet_files_for_expand = action_allowed_files or snippet_files
                                 if not snippet_files_for_expand:
                                     snippet_files_for_expand = [
@@ -8220,41 +9687,40 @@ def run_optimization(
                                         for item in _get_debug_snippets()
                                         if item.get("path")
                                     ]
-                                if isinstance(target_file, str) and target_file:
-                                    snippet_files_for_expand = [target_file]
-                                expanded = _expand_snippets_for_missing_context(
-                                    patch_proposal.missing_fields or [],
-                                    repo_root,
-                                    snippet_files_for_expand,
-                                    patch_rules,
-                                    max_chars_override=expand_budget,
+                                expanded = _expand_retry_snippets(
+                                    repo_root=patch_repo_root,
+                                    missing_fields=patch_proposal.missing_fields or [],
+                                    patch_rules=patch_rules,
+                                    max_snippets=max_snippets,
+                                    expand_budget=expand_budget,
+                                    expand_cap=expand_cap,
+                                    snippet_files=snippet_files_for_expand,
+                                    target_file=target_file if isinstance(target_file, str) else None,
+                                    target_anchor=target_anchor if isinstance(target_anchor, str) else None,
                                 )
-                                if not expanded:
-                                    expanded = _expand_snippets_for_file(
-                                        repo_root=repo_root,
-                                        file_path=snippet_files_for_expand[0]
-                                        if snippet_files_for_expand
-                                        else (snippet_files[0] if snippet_files else ""),
-                                        max_snippets=max_snippets,
-                                        max_chars=expand_cap,
-                                    )
                                 if not expanded:
                                     break
                                 new_fingerprint = _snippet_fingerprint(expanded)
                                 if new_fingerprint == last_fingerprint:
-                                    expanded = _expand_snippets_for_file(
-                                        repo_root=repo_root,
-                                        file_path=snippet_files_for_expand[0]
-                                        if snippet_files_for_expand
-                                        else (snippet_files[0] if snippet_files else ""),
+                                    expanded = _expand_retry_snippets(
+                                        repo_root=patch_repo_root,
+                                        missing_fields=patch_proposal.missing_fields or [],
+                                        patch_rules=patch_rules,
                                         max_snippets=max_snippets,
-                                        max_chars=expand_cap,
+                                        expand_budget=expand_cap,
+                                        expand_cap=expand_cap,
+                                        snippet_files=snippet_files_for_expand,
+                                        target_file=target_file if isinstance(target_file, str) else None,
+                                        target_anchor=target_anchor if isinstance(target_anchor, str) else None,
                                     )
                                     new_fingerprint = _snippet_fingerprint(expanded)
                                     if new_fingerprint == last_fingerprint:
                                         break
                                 last_fingerprint = new_fingerprint
                                 expanded_snippets = expanded
+                                targets = _parse_need_more_context_targets(
+                                    _missing_fields, patch_repo_root
+                                )
                                 trace_events.append(
                                     {
                                         "event": "code_snippets_expanded",
@@ -8282,7 +9748,7 @@ def run_optimization(
                                     patch_rules=patch_rules,
                                     allowed_files=action_allowed_files,
                                     code_snippets=expanded_snippets,
-                                    repo_root=repo_root,
+                                    repo_root=patch_repo_root,
                                     feedback=reason,
                                     backend_variant=_backend_variant,
                                     reference_template=_ref_template,
@@ -8302,9 +9768,71 @@ def run_optimization(
                                     break
                             if not patch_proposal or patch_proposal.status != "OK":
                                 if patch_proposal and patch_proposal.status == "NEED_MORE_CONTEXT":
-                                    source_patch_context_miss_actions.add(action.action_id)
-                                state.blocked_actions.add(action.action_id)
-                                continue
+                                    # Last-resort forced context retry: include broader source/header scope.
+                                    forced_files: List[str] = []
+                                    for rel in (action_allowed_files or []) + (patch_allowed_files or []) + (snippet_files or []):
+                                        if isinstance(rel, str) and rel and rel not in forced_files:
+                                            forced_files.append(rel)
+                                    forced_snippets = _expand_retry_snippets(
+                                        repo_root=patch_repo_root,
+                                        missing_fields=patch_proposal.missing_fields or [],
+                                        patch_rules=patch_rules,
+                                        max_snippets=max_snippets,
+                                        expand_budget=expand_cap,
+                                        expand_cap=max(expand_cap, base_context * 6),
+                                        snippet_files=forced_files,
+                                        target_file=target_file if isinstance(target_file, str) else None,
+                                        target_anchor=target_anchor if isinstance(target_anchor, str) else None,
+                                    )
+                                    if forced_snippets:
+                                        forced_feedback = (
+                                            "forced_context_retry: all requested context has been expanded; "
+                                            "do not ask for more context; generate a conservative, compilable patch."
+                                        )
+                                        patch_retry_forced = code_patcher.propose(
+                                            action=action,
+                                            profile=profile_ref,
+                                            patch_rules=patch_rules,
+                                            allowed_files=action_allowed_files,
+                                            code_snippets=forced_snippets,
+                                            repo_root=patch_repo_root,
+                                            feedback=forced_feedback,
+                                            backend_variant=_backend_variant,
+                                            reference_template=_ref_template,
+                                        )
+                                        trace_events.append(
+                                            {
+                                                "event": "patch_llm_forced_context_retry",
+                                                "agent": "CodePatchAgent",
+                                                "iteration": iteration,
+                                                "action_id": action.action_id,
+                                                "proposal": patch_retry_forced.model_dump()
+                                                if patch_retry_forced
+                                                else None,
+                                            }
+                                        )
+                                        if patch_retry_forced and patch_retry_forced.status == "OK":
+                                            patch_proposal = patch_retry_forced
+                                if not patch_proposal or patch_proposal.status != "OK":
+                                    if patch_proposal and patch_proposal.status == "NEED_MORE_CONTEXT":
+                                        source_patch_context_miss_actions.add(action.action_id)
+                                        trace_events.append(
+                                            {
+                                                "event": "patch_need_more_context_deferred",
+                                                "agent": "Orchestrator",
+                                                "iteration": iteration,
+                                                "action_id": action.action_id,
+                                                "miss_count": int(
+                                                    state.patch_action_context_misses.get(
+                                                        action.action_id, 0
+                                                    )
+                                                    or 0
+                                                ),
+                                            }
+                                        )
+                                    else:
+                                        state.blocked_actions.add(action.action_id)
+                                    continue
                         elif patch_proposal and "edit_apply_failed" in reason:
                             expanded = None
                             anchor_ctx = _parse_edit_failure_anchor(patch_proposal.missing_fields)
@@ -8312,7 +9840,7 @@ def run_optimization(
                                 max_snippets = int(patch_rules.get("max_snippets", 0) or 0)
                                 max_context = int(patch_rules.get("max_context_chars", 0) or 0)
                                 expanded = _expand_snippets_for_anchor(
-                                    repo_root=repo_root,
+                                    repo_root=patch_repo_root,
                                     file_path=anchor_ctx[0],
                                     anchor=anchor_ctx[1],
                                     max_snippets=max_snippets,
@@ -8342,7 +9870,7 @@ def run_optimization(
                                 patch_rules=patch_rules,
                                 allowed_files=action_allowed_files,
                                 code_snippets=expanded or _get_debug_snippets(),
-                                repo_root=repo_root,
+                                repo_root=patch_repo_root,
                                 feedback=reason,
                                 backend_variant=_backend_variant,
                                 reference_template=_ref_template,
@@ -8366,7 +9894,7 @@ def run_optimization(
                             state.blocked_actions.add(action.action_id)
                             continue
                     format_ok, format_reason = _check_patch_format(
-                        repo_root, patch_proposal.patch_diff
+                        patch_repo_root, patch_proposal.patch_diff
                     )
                     if not format_ok:
                         patch_failures.append(f"patch_format_invalid: {format_reason}")
@@ -8376,7 +9904,7 @@ def run_optimization(
                             patch_rules=patch_rules,
                             allowed_files=allowed_files,
                             code_snippets=_initial_patch_snippets,
-                            repo_root=repo_root,
+                            repo_root=patch_repo_root,
                             feedback=f"patch_format_invalid: {format_reason}",
                             backend_variant=_backend_variant,
                             reference_template=_ref_template,
@@ -8407,14 +9935,14 @@ def run_optimization(
                             continue
                         patch_proposal = patch_retry
                         format_ok, format_reason = _check_patch_format(
-                            repo_root, patch_proposal.patch_diff
+                            patch_repo_root, patch_proposal.patch_diff
                         )
                         if not format_ok:
                             patch_failures.append(f"patch_format_invalid: {format_reason}")
                             state.blocked_actions.add(action.action_id)
                             continue
                     det_ok, det_reasons, det_info = review_patch_diff(
-                        patch_proposal.patch_diff, repo_root, patch_rules
+                        patch_proposal.patch_diff, patch_repo_root, patch_rules
                     )
                     trace_events.append(
                         {
@@ -8527,8 +10055,10 @@ def run_optimization(
                                 profile=profile_ref,
                                 patch_rules=patch_rules,
                                 allowed_files=action_allowed_files,
-                                code_snippets=_collect_code_snippets(repo_root, snippet_files, max_snippets, max_context),
-                                repo_root=repo_root,
+                                code_snippets=_collect_code_snippets(
+                                    patch_repo_root, snippet_files, max_snippets, max_context
+                                ),
+                                repo_root=patch_repo_root,
                                 patch_proposal=patch_proposal,
                                 review_reasons=llm_review.reasons or [],
                                 debug_max_attempts=debug_max_attempts,
@@ -8544,7 +10074,7 @@ def run_optimization(
                     patch_root_value = action.parameters.get("patch_root")
                     patch_root_path = Path(patch_root_value) if patch_root_value else None
                     apply_ok, apply_reason = _check_patch_apply(
-                        repo_root, patch_proposal.patch_diff, patch_root_path
+                        patch_repo_root, patch_proposal.patch_diff, patch_root_path
                     )
                     if reporter:
                         reporter.patch_apply_check(action.action_id, apply_ok, apply_reason)
@@ -8567,7 +10097,7 @@ def run_optimization(
                             patch_rules=patch_rules,
                             allowed_files=allowed_files,
                             code_snippets=_initial_patch_snippets,
-                            repo_root=repo_root,
+                            repo_root=patch_repo_root,
                             feedback=f"patch_apply_failed: {apply_reason}",
                             backend_variant=_backend_variant,
                             reference_template=_ref_template,
@@ -8598,14 +10128,14 @@ def run_optimization(
                             continue
                         patch_proposal = patch_retry
                         format_ok, format_reason = _check_patch_format(
-                            repo_root, patch_proposal.patch_diff
+                            patch_repo_root, patch_proposal.patch_diff
                         )
                         if not format_ok:
                             patch_failures.append(f"patch_format_invalid: {format_reason}")
                             state.blocked_actions.add(action.action_id)
                             continue
                         det_ok, det_reasons, det_info = review_patch_diff(
-                            patch_proposal.patch_diff, repo_root, patch_rules
+                            patch_proposal.patch_diff, patch_repo_root, patch_rules
                         )
                         trace_events.append(
                             {
@@ -8677,8 +10207,10 @@ def run_optimization(
                                     profile=profile_ref,
                                     patch_rules=patch_rules,
                                     allowed_files=action_allowed_files,
-                                    code_snippets=_collect_code_snippets(repo_root, snippet_files, max_snippets, max_context),
-                                    repo_root=repo_root,
+                                    code_snippets=_collect_code_snippets(
+                                        patch_repo_root, snippet_files, max_snippets, max_context
+                                    ),
+                                    repo_root=patch_repo_root,
                                     patch_proposal=patch_proposal,
                                     review_reasons=llm_review.reasons or [],
                                     debug_max_attempts=debug_max_attempts,
@@ -8692,7 +10224,7 @@ def run_optimization(
                                     continue
                                 patch_proposal = patched
                         apply_ok, apply_reason = _check_patch_apply(
-                            repo_root, patch_proposal.patch_diff, patch_root_path
+                            patch_repo_root, patch_proposal.patch_diff, patch_root_path
                         )
                         if reporter:
                             reporter.patch_apply_check(action.action_id, apply_ok, apply_reason)
@@ -8710,6 +10242,13 @@ def run_optimization(
                             patch_failures.append(f"patch_apply_failed: {apply_reason}")
                             state.blocked_actions.add(action.action_id)
                             continue
+                    # Clean up chain context worktree before experiment
+                    # (all patch generation against post-chain source is done).
+                    if _prev_chain_ctx_wt is not None:
+                        _cleanup_detached_head_worktree(repo_root, _prev_chain_ctx_wt, _prev_chain_ctx_tmp)
+                        _prev_chain_ctx_wt = None
+                        _prev_chain_ctx_tmp = None
+                        patch_repo_root = repo_root
                     run_dir = artifacts_dir / "runs" / f"iter{iteration}-{action.action_id}"
                     run_dir.mkdir(parents=True, exist_ok=True)
                     patch_path = run_dir / "patch_llm.diff"
@@ -8717,11 +10256,16 @@ def run_optimization(
                     action.parameters["patch_path"] = str(patch_path)
                     if patch_proposal.touched_files:
                         action.parameters["patch_files"] = patch_proposal.touched_files
+                    # Attach chain patch stack BEFORE preflight so that
+                    # the preflight worktree applies the full chain.
+                    _attach_patch_stack_to_action(action, _chain_patch_paths)
                     allowlist = policy.get("input_edit_allowlist", [])
                     if not allowlist:
                         allowlist = app_input_allowlist(job.app)
                     patch_root_value = action.parameters.get("patch_root")
                     patch_root_path = Path(patch_root_value) if patch_root_value else None
+                    # Use original repo_root for preflight — chain patches
+                    # are in action.parameters["patch_paths"].
                     preflight_ok, preflight_reason, preflight_log = _preflight_patch_compile(
                         repo_root=repo_root,
                         exp_id=exp_id,
@@ -8760,7 +10304,7 @@ def run_optimization(
                             patch_rules=patch_rules,
                             allowed_files=allowed_files,
                             code_snippets=_initial_patch_snippets,
-                            repo_root=repo_root,
+                            repo_root=patch_repo_root,
                             feedback=f"compile_error:\n{preflight_reason}",
                             backend_variant=_backend_variant,
                             reference_template=_ref_template,
@@ -8791,14 +10335,14 @@ def run_optimization(
                             continue
                         patch_proposal = patch_retry
                         format_ok, format_reason = _check_patch_format(
-                            repo_root, patch_proposal.patch_diff
+                            patch_repo_root, patch_proposal.patch_diff
                         )
                         if not format_ok:
                             patch_failures.append(f"patch_format_invalid: {format_reason}")
                             state.blocked_actions.add(action.action_id)
                             continue
                         det_ok, det_reasons, det_info = review_patch_diff(
-                            patch_proposal.patch_diff, repo_root, patch_rules
+                            patch_proposal.patch_diff, patch_repo_root, patch_rules
                         )
                         trace_events.append(
                             {
@@ -8868,7 +10412,7 @@ def run_optimization(
                         patch_root_value = action.parameters.get("patch_root")
                         patch_root_path = Path(patch_root_value) if patch_root_value else None
                         apply_ok, apply_reason = _check_patch_apply(
-                            repo_root, patch_proposal.patch_diff, patch_root_path
+                            patch_repo_root, patch_proposal.patch_diff, patch_root_path
                         )
                         if reporter:
                             reporter.patch_apply_check(action.action_id, apply_ok, apply_reason)
@@ -8891,7 +10435,7 @@ def run_optimization(
                         if patch_proposal.touched_files:
                             action.parameters["patch_files"] = patch_proposal.touched_files
                         preflight_ok, preflight_reason, preflight_log = _preflight_patch_compile(
-                            repo_root=repo_root,
+                            repo_root=patch_repo_root,
                             exp_id=exp_id,
                             patch_path=patch_path,
                             patch_root=patch_root_path,
@@ -8928,7 +10472,7 @@ def run_optimization(
                                     debug_ctx_dir.mkdir(parents=True, exist_ok=True)
                                     try:
                                         with GitPatchContext(
-                                            repo_root=repo_root,
+                                            repo_root=patch_repo_root,
                                             exp_id=debug_ctx_exp_id,
                                             artifacts_dir=debug_ctx_dir,
                                             input_script=Path(job.input_script),
@@ -8987,6 +10531,7 @@ def run_optimization(
                                                     patch_rules.get("max_context_expand_rounds", 0) or 3
                                                 )
                                                 expand_round = 0
+                                                fallback_codegen_used = False
                                                 last_fingerprint = _snippet_fingerprint(debug_snippets)
                                                 while (
                                                     debug_proposal
@@ -8995,22 +10540,98 @@ def run_optimization(
                                                     expand_round += 1
                                                     if expand_round > max_expand_rounds:
                                                         break
+                                                    missing_fields = [
+                                                        str(item)
+                                                        for item in (debug_proposal.missing_fields or [])
+                                                    ]
+                                                    if (
+                                                        isinstance(action.parameters, dict)
+                                                        and any("target_anchor" in field for field in missing_fields)
+                                                    ):
+                                                        inferred_anchor = _infer_target_anchor_for_action(
+                                                            action=action,
+                                                            repo_root=debug_repo_root,
+                                                            code_snippets=debug_snippets,
+                                                        )
+                                                        if inferred_anchor:
+                                                            action.parameters["target_anchor"] = inferred_anchor
+                                                            target_anchor = inferred_anchor
+                                                    edit_apply_failed = any(
+                                                        "edit_apply_failed" in item
+                                                        for item in missing_fields
+                                                    )
+                                                    if edit_apply_failed and not fallback_codegen_used:
+                                                        fallback_feedback = (
+                                                            f"{preflight_reason}; "
+                                                            "debug_repair_failed_with_edit_apply_failed; "
+                                                            "emit full unified diff with concrete line edits"
+                                                        )
+                                                        fallback_proposal = code_patcher.propose(
+                                                            action=action,
+                                                            profile=profile_ref,
+                                                            patch_rules=patch_rules,
+                                                            allowed_files=debug_allowed_files,
+                                                            code_snippets=debug_snippets,
+                                                            repo_root=debug_repo_root,
+                                                            feedback=fallback_feedback,
+                                                            backend_variant=_backend_variant,
+                                                            reference_template=_ref_template,
+                                                            navigation_hints=action_nav_hints,
+                                                        )
+                                                        fallback_codegen_used = True
+                                                        trace_events.append(
+                                                            {
+                                                                "event": "patch_debug_fallback_codegen",
+                                                                "agent": "CodePatchAgent",
+                                                                "iteration": iteration,
+                                                                "action_id": action.action_id,
+                                                                "attempt": attempt + 1,
+                                                                "proposal": (
+                                                                    fallback_proposal.model_dump()
+                                                                    if fallback_proposal
+                                                                    else None
+                                                                ),
+                                                            }
+                                                        )
+                                                        if (
+                                                            fallback_proposal
+                                                            and fallback_proposal.status == "OK"
+                                                        ):
+                                                            debug_proposal = fallback_proposal
+                                                            break
                                                     expand_budget = min(
                                                         expand_budget + base_context,
                                                         expand_cap,
                                                     )
-                                                    expanded = _expand_snippets_for_missing_context(
-                                                        debug_proposal.missing_fields,
-                                                        debug_repo_root,
-                                                        snippet_files,
-                                                        patch_rules,
-                                                        max_chars_override=expand_budget,
+                                                    expanded = _expand_retry_snippets(
+                                                        repo_root=debug_repo_root,
+                                                        missing_fields=debug_proposal.missing_fields,
+                                                        patch_rules=patch_rules,
+                                                        max_snippets=max_snippets,
+                                                        expand_budget=expand_budget,
+                                                        expand_cap=expand_cap,
+                                                        snippet_files=debug_allowed_files or snippet_files,
+                                                        target_file=target_file if isinstance(target_file, str) else None,
+                                                        target_anchor=target_anchor if isinstance(target_anchor, str) else None,
                                                     )
                                                     if not expanded:
                                                         break
                                                     new_fingerprint = _snippet_fingerprint(expanded)
                                                     if new_fingerprint == last_fingerprint:
-                                                        break
+                                                        expanded = _expand_retry_snippets(
+                                                            repo_root=debug_repo_root,
+                                                            missing_fields=debug_proposal.missing_fields,
+                                                            patch_rules=patch_rules,
+                                                            max_snippets=max_snippets,
+                                                            expand_budget=expand_cap,
+                                                            expand_cap=expand_cap,
+                                                            snippet_files=debug_allowed_files or snippet_files,
+                                                            target_file=target_file if isinstance(target_file, str) else None,
+                                                            target_anchor=target_anchor if isinstance(target_anchor, str) else None,
+                                                        )
+                                                        new_fingerprint = _snippet_fingerprint(expanded)
+                                                        if new_fingerprint == last_fingerprint:
+                                                            break
                                                     last_fingerprint = new_fingerprint
                                                     snippet_paths = [
                                                         item.get("path")
@@ -9050,23 +10671,6 @@ def run_optimization(
                                                         build_log=build_log_text,
                                                         feedback=preflight_reason,
                                                     )
-                                                    if reporter:
-                                                        note = preflight_reason or ""
-                                                        if (
-                                                            debug_proposal
-                                                            and debug_proposal.missing_fields
-                                                        ):
-                                                            note = "; ".join(
-                                                                debug_proposal.missing_fields
-                                                            )
-                                                        reporter.patch_debug(
-                                                            action.action_id,
-                                                            attempt + 1,
-                                                            debug_proposal.status
-                                                            if debug_proposal
-                                                            else "NO_RESPONSE",
-                                                            note,
-                                                        )
                                                     trace_events.append(
                                                         {
                                                             "event": "patch_debug_retry",
@@ -9116,7 +10720,7 @@ def run_optimization(
                                         continue
                                     patch_proposal = debug_proposal
                                     format_ok, format_reason = _check_patch_format(
-                                        repo_root, patch_proposal.patch_diff
+                                        patch_repo_root, patch_proposal.patch_diff
                                     )
                                     if not format_ok:
                                         patch_failures.append(
@@ -9124,7 +10728,7 @@ def run_optimization(
                                         )
                                         continue
                                     det_ok, det_reasons, det_info = review_patch_diff(
-                                        patch_proposal.patch_diff, repo_root, patch_rules
+                                        patch_proposal.patch_diff, patch_repo_root, patch_rules
                                     )
                                     trace_events.append(
                                         {
@@ -9172,7 +10776,7 @@ def run_optimization(
                                             )
                                             continue
                                     apply_ok, apply_reason = _check_patch_apply(
-                                        repo_root, patch_proposal.patch_diff, patch_root_path
+                                        patch_repo_root, patch_proposal.patch_diff, patch_root_path
                                     )
                                     trace_events.append(
                                         {
@@ -9199,7 +10803,7 @@ def run_optimization(
                                         )
                                     preflight_ok, preflight_reason, preflight_log = (
                                         _preflight_patch_compile(
-                                            repo_root=repo_root,
+                                            repo_root=patch_repo_root,
                                             exp_id=exp_id,
                                             patch_path=patch_path,
                                             patch_root=patch_root_path,
@@ -9266,7 +10870,7 @@ def run_optimization(
                     }
                 )
                 continue
-            base_exp = best_chain_exp
+            base_exp = iteration_chain_base_exp if chain_within_iteration else best_chain_exp
             base_job = base_exp.job
             base_run_id = base_exp.run_id
             base_action_id = base_exp.action.action_id if base_exp.action else "baseline"
@@ -9328,6 +10932,22 @@ def run_optimization(
                     or "runtime error" in reason_text.lower()
                     or "signal" in reason_text.lower()
                 )
+                crash_failed = _is_crash_like_failure(
+                    reason_text,
+                    exp.results.exit_code if exp and exp.results else None,
+                )
+                runtime_debug_max_attempts = debug_max_attempts
+                if crash_failed:
+                    runtime_debug_max_attempts = max(
+                        debug_max_attempts,
+                        int(
+                            patch_rules.get(
+                                "runtime_crash_debug_max_attempts",
+                                max(debug_max_attempts, 4),
+                            )
+                            or max(debug_max_attempts, 4)
+                        ),
+                    )
                 run_dir = artifacts_dir / "runs" / exp.run_id
                 build_log_path = run_dir / "build.log"
                 stderr_log_path = run_dir / "stderr.log"
@@ -9362,7 +10982,25 @@ def run_optimization(
                         current_reason_text = reason_text
                         current_debug_log_text = "\n\n".join(debug_log_parts).strip() or reason_text
                         debug_allowed_files = action_allowed_files
-                        for attempt in range(debug_max_attempts):
+                        if reporter and crash_failed and runtime_debug_max_attempts > debug_max_attempts:
+                            reporter._print(
+                                "Crash-like runtime failure detected; "
+                                f"expanding debug attempts to {runtime_debug_max_attempts}"
+                            )
+                        if crash_failed and runtime_debug_max_attempts > debug_max_attempts:
+                            trace_events.append(
+                                {
+                                    "event": "patch_debug_attempts_expanded",
+                                    "agent": "Orchestrator",
+                                    "iteration": iteration,
+                                    "action_id": action.action_id,
+                                    "reason": "crash_like_runtime_failure",
+                                    "default_attempts": debug_max_attempts,
+                                    "expanded_attempts": runtime_debug_max_attempts,
+                                    "exit_code": exp.results.exit_code if exp and exp.results else None,
+                                }
+                            )
+                        for attempt in range(runtime_debug_max_attempts):
                             current_patch_value = action.parameters.get("patch_path")
                             current_patch_path = (
                                 Path(current_patch_value)
@@ -9441,6 +11079,7 @@ def run_optimization(
                                             patch_rules.get("max_context_expand_rounds", 0) or 3
                                         )
                                         expand_round = 0
+                                        fallback_codegen_used = False
                                         last_fingerprint = _snippet_fingerprint(debug_snippets)
                                         while (
                                             debug_proposal
@@ -9449,22 +11088,98 @@ def run_optimization(
                                             expand_round += 1
                                             if expand_round > max_expand_rounds:
                                                 break
+                                            missing_fields = [
+                                                str(item)
+                                                for item in (debug_proposal.missing_fields or [])
+                                            ]
+                                            if (
+                                                isinstance(action.parameters, dict)
+                                                and any("target_anchor" in field for field in missing_fields)
+                                            ):
+                                                inferred_anchor = _infer_target_anchor_for_action(
+                                                    action=action,
+                                                    repo_root=debug_repo_root,
+                                                    code_snippets=debug_snippets,
+                                                )
+                                                if inferred_anchor:
+                                                    action.parameters["target_anchor"] = inferred_anchor
+                                                    target_anchor = inferred_anchor
+                                            edit_apply_failed = any(
+                                                "edit_apply_failed" in item
+                                                for item in missing_fields
+                                            )
+                                            if edit_apply_failed and not fallback_codegen_used:
+                                                fallback_feedback = (
+                                                    f"{current_reason_text}; "
+                                                    "debug_repair_failed_with_edit_apply_failed; "
+                                                    "emit full unified diff with concrete line edits"
+                                                )
+                                                fallback_proposal = code_patcher.propose(
+                                                    action=action,
+                                                    profile=profile_ref,
+                                                    patch_rules=patch_rules,
+                                                    allowed_files=debug_allowed_files,
+                                                    code_snippets=debug_snippets,
+                                                    repo_root=debug_repo_root,
+                                                    feedback=fallback_feedback,
+                                                    backend_variant=_backend_variant,
+                                                    reference_template=_ref_template,
+                                                    navigation_hints=action_nav_hints,
+                                                )
+                                                fallback_codegen_used = True
+                                                trace_events.append(
+                                                    {
+                                                        "event": "patch_debug_fallback_codegen",
+                                                        "agent": "CodePatchAgent",
+                                                        "iteration": iteration,
+                                                        "action_id": action.action_id,
+                                                        "attempt": attempt + 1,
+                                                        "proposal": (
+                                                            fallback_proposal.model_dump()
+                                                            if fallback_proposal
+                                                            else None
+                                                        ),
+                                                    }
+                                                )
+                                                if (
+                                                    fallback_proposal
+                                                    and fallback_proposal.status == "OK"
+                                                ):
+                                                    debug_proposal = fallback_proposal
+                                                    break
                                             expand_budget = min(
                                                 expand_budget + base_context,
                                                 expand_cap,
                                             )
-                                            expanded = _expand_snippets_for_missing_context(
-                                                debug_proposal.missing_fields,
-                                                debug_repo_root,
-                                                snippet_files,
-                                                patch_rules,
-                                                max_chars_override=expand_budget,
+                                            expanded = _expand_retry_snippets(
+                                                repo_root=debug_repo_root,
+                                                missing_fields=debug_proposal.missing_fields,
+                                                patch_rules=patch_rules,
+                                                max_snippets=max_snippets,
+                                                expand_budget=expand_budget,
+                                                expand_cap=expand_cap,
+                                                snippet_files=debug_allowed_files or snippet_files,
+                                                target_file=target_file if isinstance(target_file, str) else None,
+                                                target_anchor=target_anchor if isinstance(target_anchor, str) else None,
                                             )
                                             if not expanded:
                                                 break
                                             new_fingerprint = _snippet_fingerprint(expanded)
                                             if new_fingerprint == last_fingerprint:
-                                                break
+                                                expanded = _expand_retry_snippets(
+                                                    repo_root=debug_repo_root,
+                                                    missing_fields=debug_proposal.missing_fields,
+                                                    patch_rules=patch_rules,
+                                                    max_snippets=max_snippets,
+                                                    expand_budget=expand_cap,
+                                                    expand_cap=expand_cap,
+                                                    snippet_files=debug_allowed_files or snippet_files,
+                                                    target_file=target_file if isinstance(target_file, str) else None,
+                                                    target_anchor=target_anchor if isinstance(target_anchor, str) else None,
+                                                )
+                                                new_fingerprint = _snippet_fingerprint(expanded)
+                                                if new_fingerprint == last_fingerprint:
+                                                    break
                                             last_fingerprint = new_fingerprint
                                             snippet_paths = [
                                                 item.get("path")
@@ -9502,23 +11217,6 @@ def run_optimization(
                                                 build_log=current_debug_log_text,
                                                 feedback=current_reason_text,
                                             )
-                                            if reporter:
-                                                note = current_reason_text
-                                                if (
-                                                    debug_proposal
-                                                    and debug_proposal.missing_fields
-                                                ):
-                                                    note = "; ".join(
-                                                        debug_proposal.missing_fields
-                                                    )
-                                                reporter.patch_debug(
-                                                    action.action_id,
-                                                    attempt + 1,
-                                                    debug_proposal.status
-                                                    if debug_proposal
-                                                    else "NO_RESPONSE",
-                                                    note,
-                                                )
                                             trace_events.append(
                                                 {
                                                     "event": "patch_debug_retry",
@@ -9643,14 +11341,270 @@ def run_optimization(
                                 current_debug_log_text = current_reason_text
                         if debug_exp and debug_exp.verdict != "PASS":
                             debug_exp = None
+
+            # --- Drift detection (WS5) ---
+            # Run a dedicated drift-capture experiment (1 repeat, output captured)
+            # only for PASS experiments, to avoid I/O overhead in score runs.
+            drift_target_exp = debug_exp or exp
+            if (
+                drift_target_exp.verdict == "PASS"
+                and baseline_capture_paths
+                and app_drift_thresholds
+                and action
+            ):
+                drift_capture_exp_id = f"{drift_target_exp.run_id}-drift-capture"
+                try:
+                    _drift_cap_exp = executor.execute(
+                        exp_id=drift_capture_exp_id,
+                        job=drift_target_exp.job,
+                        base_job=base_job,
+                        base_run_id=drift_target_exp.run_id,
+                        base_action_id=action.action_id,
+                        action=action,
+                        actions_root=repo_root,
+                        policy=policy,
+                        gates=gates,
+                        profiler=profiler,
+                        verifier=verifier,
+                        artifacts_dir=artifacts_dir,
+                        time_command=time_command,
+                        profiling_cfg=None,
+                        wrappers_cfg=None,
+                        build_cfg=base_build_cfg,
+                        build_packs=build_packs,
+                        adapter_cfg=adapter_cfg,
+                        repeats=1,
+                        runtime_agg="mean",
+                        baseline_exp=baseline_exp,
+                        baseline_exp_for_verify=verify_baseline,
+                        baseline_runtime=baseline_exp.results.runtime_seconds,
+                        prior_samples=None,
+                        trace_events=trace_events,
+                        parent_run_id=drift_target_exp.run_id,
+                        iteration=iteration,
+                        llm_trace=None,
+                        reporter=None,
+                        arg_rules=arg_rules_state,
+                        run_purpose="drift_capture",
+                    )
+                    candidate_capture_paths = _read_capture_paths(
+                        artifacts_dir / "runs" / _drift_cap_exp.run_id
+                    )
+                except Exception as drift_run_exc:
+                    candidate_capture_paths = []
+                    trace_events.append({
+                        "event": "drift_capture_run_error",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "action_id": action.action_id,
+                        "error": str(drift_run_exc),
+                    })
+                drift_report = None
+                if candidate_capture_paths and baseline_capture_paths:
+                    b_path = baseline_capture_paths[0]
+                    c_path = candidate_capture_paths[0]
+                    try:
+                        drift_report = compute_drift(
+                            b_path, c_path, job.app, app_drift_thresholds,
+                        )
+                    except Exception as drift_exc:
+                        trace_events.append({
+                            "event": "drift_check_error",
+                            "agent": "Orchestrator",
+                            "iteration": iteration,
+                            "action_id": action.action_id,
+                            "error": str(drift_exc),
+                        })
+                if drift_report:
+                    trace_events.append({
+                        "event": "drift_check",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "action_id": action.action_id,
+                        "run_id": drift_target_exp.run_id,
+                        "status": drift_report.status,
+                        "summary": drift_report.summary,
+                        "metrics": drift_report.drift_metrics,
+                    })
+                    if reporter:
+                        _drift_status_label = {
+                            "PASS": "drift OK",
+                            "WARN": "drift WARNING",
+                            "FAIL": "drift FAIL",
+                        }.get(drift_report.status, drift_report.status)
+                        reporter._print(
+                            f"Drift check: {_drift_status_label} — {drift_report.summary}"
+                        )
+                    if drift_report.status == "FAIL":
+                        drift_resolved = False
+                        for drift_attempt in range(drift_repair_max_attempts):
+                            trace_events.append({
+                                "event": "drift_repair_attempt",
+                                "agent": "PatchDebugAgent",
+                                "iteration": iteration,
+                                "action_id": action.action_id,
+                                "attempt": drift_attempt + 1,
+                                "drift_summary": drift_report.summary,
+                            })
+                            drift_feedback = (
+                                f"DRIFT DETECTED: {drift_report.summary}\n"
+                                f"Metrics: {drift_report.drift_metrics}\n"
+                                f"Thresholds: {drift_report.thresholds_used}\n"
+                                f"Options: (1) Adjust patch parameters to reduce drift, "
+                                f"(2) If drift is inherent to this approach, abandon patch."
+                            )
+                            current_patch_value = action.parameters.get("patch_path")
+                            current_patch_path = (
+                                Path(current_patch_value)
+                                if isinstance(current_patch_value, str) and current_patch_value
+                                else None
+                            )
+                            if not current_patch_path or not current_patch_path.exists():
+                                break
+                            patch_diff = current_patch_path.read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                            drift_debug_exp_id = f"{exp_id}-drift-repair{drift_attempt + 1}"
+                            drift_debug_dir = (
+                                artifacts_dir / "runs" / drift_target_exp.run_id / "drift_debug"
+                            )
+                            drift_debug_dir.mkdir(parents=True, exist_ok=True)
+                            patch_root_value = action.parameters.get("patch_root")
+                            patch_root_path = Path(patch_root_value) if patch_root_value else None
+                            try:
+                                with GitPatchContext(
+                                    repo_root=repo_root,
+                                    exp_id=drift_debug_exp_id,
+                                    artifacts_dir=drift_debug_dir,
+                                    input_script=Path(job.input_script),
+                                    input_edit=None,
+                                    allowlist=allowlist,
+                                    patch_path=current_patch_path,
+                                    patch_root=patch_root_path,
+                                    worktree_retries=worktree_retry_attempts,
+                                ) as drift_ctx:
+                                    drift_repo_root = drift_ctx.worktree_dir
+                                    drift_snippets = _get_debug_snippets(drift_repo_root)
+                                    drift_proposal = patch_debugger.repair(
+                                        action=action,
+                                        profile=profile_ref,
+                                        patch_rules=patch_rules,
+                                        allowed_files=action_allowed_files,
+                                        code_snippets=drift_snippets,
+                                        repo_root=drift_repo_root,
+                                        patch_diff=patch_diff,
+                                        build_log="",
+                                        feedback=drift_feedback,
+                                    )
+                                    if not drift_proposal or drift_proposal.status == "ABANDON":
+                                        if reporter:
+                                            reporter._print(
+                                                f"Drift repair: agent abandoned patch (attempt {drift_attempt + 1})"
+                                            )
+                                        break
+                                    if drift_proposal.patch_path and Path(drift_proposal.patch_path).exists():
+                                        action.parameters["patch_path"] = drift_proposal.patch_path
+                                        # Re-run experiment with revised patch
+                                        drift_rerun_exp = executor.execute(
+                                            exp_id=drift_debug_exp_id,
+                                            job=job,
+                                            base_job=base_job,
+                                            base_run_id=base_run_id,
+                                            base_action_id=base_action_id,
+                                            action=action,
+                                            actions_root=repo_root,
+                                            policy=policy,
+                                            gates=gates,
+                                            profiler=profiler,
+                                            verifier=verifier,
+                                            artifacts_dir=artifacts_dir,
+                                            time_command=time_command,
+                                            profiling_cfg=profiling_cfg,
+                                            wrappers_cfg=wrappers_cfg,
+                                            build_cfg=base_build_cfg,
+                                            build_packs=build_packs,
+                                            adapter_cfg=adapter_cfg,
+                                            repeats=effective_repeats,
+                                            runtime_agg="mean",
+                                            baseline_exp=baseline_exp,
+                                            baseline_exp_for_verify=verify_baseline,
+                                            baseline_runtime=baseline_exp.results.runtime_seconds,
+                                            prior_samples=None,
+                                            trace_events=trace_events,
+                                            parent_run_id=base_run_id,
+                                            iteration=iteration,
+                                            llm_trace=None,
+                                            reporter=reporter,
+                                            arg_rules=arg_rules_state,
+                                        )
+                                        if drift_rerun_exp.verdict != "PASS":
+                                            continue
+                                        # Re-check drift
+                                        rerun_capture = _read_capture_paths(
+                                            artifacts_dir / "runs" / drift_rerun_exp.run_id
+                                        )
+                                        if rerun_capture:
+                                            drift_report = compute_drift(
+                                                baseline_capture_paths[0],
+                                                rerun_capture[0],
+                                                job.app,
+                                                app_drift_thresholds,
+                                            )
+                                            trace_events.append({
+                                                "event": "drift_recheck",
+                                                "agent": "Orchestrator",
+                                                "iteration": iteration,
+                                                "action_id": action.action_id,
+                                                "attempt": drift_attempt + 1,
+                                                "status": drift_report.status,
+                                                "summary": drift_report.summary,
+                                            })
+                                            if drift_report.status != "FAIL":
+                                                drift_resolved = True
+                                                debug_exp = drift_rerun_exp
+                                                if reporter:
+                                                    reporter._print(
+                                                        f"Drift repair: resolved on attempt {drift_attempt + 1}"
+                                                    )
+                                                break
+                            except Exception as drift_repair_exc:
+                                trace_events.append({
+                                    "event": "drift_repair_error",
+                                    "agent": "Orchestrator",
+                                    "iteration": iteration,
+                                    "action_id": action.action_id,
+                                    "attempt": drift_attempt + 1,
+                                    "error": str(drift_repair_exc),
+                                })
+                                break
+                        if not drift_resolved:
+                            # Mark experiment as failed due to drift
+                            drift_target_exp = debug_exp or exp
+                            drift_target_exp.verdict = "FAIL"
+                            drift_target_exp.reasons = list(drift_target_exp.reasons or [])
+                            drift_target_exp.reasons.append(
+                                f"output drift not resolved after {drift_repair_max_attempts} attempts: "
+                                f"{drift_report.summary}"
+                            )
+                            if debug_exp:
+                                debug_exp = None
+                            exp = drift_target_exp
+                    elif drift_report.status == "WARN":
+                        warn_exp = debug_exp or exp
+                        warn_exp.reasons = list(warn_exp.reasons or [])
+                        warn_exp.reasons.append(
+                            f"WARNING: marginal drift — {drift_report.summary}"
+                        )
+
             memory.record(exp)
-            # Use iteration_baseline for marginal gain (improvement vs state before this action)
-            experience_memory.record_experiment(exp, iteration_baseline_exp)
+            memory_base_exp = _resolve_experiment_base(exp, memory.experiments, baseline_exp)
+            experience_memory.record_experiment(exp, memory_base_exp)
             iteration_experiments.append(exp)
             state.run_count += 1
             if debug_exp:
                 memory.record(debug_exp)
-                experience_memory.record_experiment(debug_exp, iteration_baseline_exp)
+                debug_memory_base = _resolve_experiment_base(debug_exp, memory.experiments, baseline_exp)
+                experience_memory.record_experiment(debug_exp, debug_memory_base)
                 iteration_experiments.append(debug_exp)
                 state.run_count += 1
             final_exp = debug_exp or exp
@@ -9672,6 +11626,38 @@ def run_optimization(
                             }
                         )
                         continue
+            if (
+                chain_within_iteration
+                and final_exp.verdict == "PASS"
+                and base_exp
+                and base_exp.results.runtime_seconds > 0
+            ):
+                chained_gain = (
+                    (base_exp.results.runtime_seconds - final_exp.results.runtime_seconds)
+                    / base_exp.results.runtime_seconds
+                )
+                if chained_gain >= chain_min_improvement_pct:
+                    iteration_chain_base_exp = final_exp
+                    if final_exp.results.runtime_seconds + min_delta_seconds < best_chain_runtime:
+                        best_chain_exp = final_exp
+                        best_chain_runtime = final_exp.results.runtime_seconds
+                        memory.best = final_exp
+                        trace_events.append(
+                            {
+                                "event": "best_chain_update_inline",
+                                "agent": "Orchestrator",
+                                "iteration": iteration,
+                                "run_id": final_exp.run_id,
+                                "action_id": final_exp.action.action_id if final_exp.action else "baseline",
+                                "improvement_pct": (
+                                    (prev_best_time - final_exp.results.runtime_seconds) / prev_best_time
+                                    if prev_best_time > 0
+                                    else 0.0
+                                ),
+                                "base_run_id": base_exp.run_id,
+                                "chain_within_iteration": True,
+                            }
+                        )
             if final_exp.verdict == "FAIL":
                 state.fail_count += 1
                 failure = triage.classify(final_exp, artifacts_dir / "runs" / final_exp.run_id)
@@ -9710,6 +11696,7 @@ def run_optimization(
                 if action_id in source_patch_context_miss_actions:
                     miss_count = int(state.patch_action_context_misses.get(action_id, 0) or 0)
                     if miss_count < context_miss_fail_threshold:
+                        state.blocked_actions.discard(action_id)
                         trace_events.append(
                             {
                                 "event": "deep_analysis_action_deferred",
@@ -9751,6 +11738,12 @@ def run_optimization(
             else:
                 deep_failed_ids.add(da_id)
 
+        # Clean up any leftover chain context worktree from the last action.
+        if _prev_chain_ctx_wt is not None:
+            _cleanup_detached_head_worktree(repo_root, _prev_chain_ctx_wt, _prev_chain_ctx_tmp)
+            _prev_chain_ctx_wt = None
+            _prev_chain_ctx_tmp = None
+
         # --- Post-loop: select non-conflicting improvements and compose ---
         winners = _select_non_conflicting(
             iteration_experiments,
@@ -9759,6 +11752,7 @@ def run_optimization(
             variance_cfg=variance_cfg,
             variance_repeats=variance_repeats,
             baseline_run_id=best_chain_exp.run_id if best_chain_exp else None,
+            repo_root=repo_root,
         )
 
         if len(winners) == 1:
@@ -9823,7 +11817,7 @@ def run_optimization(
                     repeats=max(1, plan.evaluation.candidate_repeats_stage1) if plan else 1,
                     runtime_agg="mean",
                     baseline_exp=baseline_exp,
-                    baseline_exp_for_verify=iteration_baseline_exp,
+                    baseline_exp_for_verify=composite_base,
                     baseline_runtime=baseline_exp.results.runtime_seconds,
                     prior_samples=None,
                     trace_events=trace_events,
@@ -9834,7 +11828,8 @@ def run_optimization(
                     arg_rules=arg_rules_state,
                 )
                 memory.record(composite_exp)
-                experience_memory.record_experiment(composite_exp, iteration_baseline_exp)
+                composite_memory_base = _resolve_experiment_base(composite_exp, memory.experiments, baseline_exp)
+                experience_memory.record_experiment(composite_exp, composite_memory_base)
                 state.run_count += 1
                 _append_run_index(
                     artifacts_dir,
@@ -10125,6 +12120,28 @@ def run_optimization(
         if best_improved:
             prev_best_time = best_chain_exp.results.runtime_seconds
 
+        # --- Patch sub-phase tracking ---
+        if phase == "PATCH" and patch_sub_phase_tracker.enabled:
+            patch_sub_phase_tracker.record_iteration(
+                improved=best_improved,
+                runtime=best_chain_exp.results.runtime_seconds if best_chain_exp else None,
+            )
+            if patch_sub_phase_tracker.should_advance():
+                old_phase = patch_sub_phase_tracker.current_phase_id
+                if patch_sub_phase_tracker.advance():
+                    new_phase = patch_sub_phase_tracker.current_phase_id
+                    trace_events.append({
+                        "event": "patch_sub_phase_advance",
+                        "agent": "Orchestrator",
+                        "iteration": iteration,
+                        "from_phase": old_phase,
+                        "to_phase": new_phase,
+                    })
+                    if reporter:
+                        reporter._print(
+                            f"Sub-phase advance: {old_phase} -> {new_phase}"
+                        )
+
         if scope_levels:
             patch_gain = False
             if source_patch_attempted and iteration_experiments:
@@ -10200,6 +12217,17 @@ def run_optimization(
             else:
                 state.no_improve_iters += 1
 
+        if simple_patch_loop_active and phase == "PATCH":
+            trace_events.append(
+                {
+                    "event": "simple_patch_loop_continue",
+                    "agent": "Orchestrator",
+                    "iteration": iteration,
+                    "reason": "skip reviewer/phase-switch; continue patch iteration",
+                }
+            )
+            continue
+
         tested_actions = {exp.action.action_id for exp in memory.experiments if exp.action}
         refreshed_actions = _prepare_actions(
             base_actions=actions,
@@ -10210,7 +12238,17 @@ def run_optimization(
             job=job,
             fixed_threads=fixed_threads,
         )
-        remaining_candidates = _remaining_candidates_by_family(refreshed_actions, tested_actions)
+        review_actions = _filter_actions_by_targets(refreshed_actions, _phase_targets(phase))
+        if not review_actions:
+            review_actions = list(refreshed_actions)
+        remaining_candidates = _remaining_candidates_by_family(review_actions, tested_actions)
+        if phase == "PATCH":
+            source_remaining = remaining_candidates.get("source_patch", 0)
+            remaining_candidates = (
+                {"source_patch": source_remaining}
+                if source_remaining > 0
+                else {}
+            )
         if state.blocked_families:
             for family in list(state.blocked_families):
                 remaining_candidates.pop(family, None)
@@ -10258,6 +12296,7 @@ def run_optimization(
             "context": {
                 "selection_mode": selection_mode,
                 "phase": phase,
+                "source_patch_only": bool(phase == "PATCH"),
                 "retune_remaining": retune_remaining,
                 "tags": job.tags,
             },
@@ -10271,6 +12310,10 @@ def run_optimization(
                 "strategy_note": last_reflection.strategy_note if last_reflection else "",
                 "direction_hint": last_reflection.direction_hint if last_reflection else "",
             },
+            "patch_sub_phase": (
+                patch_sub_phase_tracker.to_dict()
+                if patch_sub_phase_tracker.enabled else {}
+            ),
         }
         review_decision = reviewer.review(review_payload)
         final_review = review_decision
@@ -10643,6 +12686,81 @@ def _resolve_worktree_path(path_str: str, repo_root: Path) -> str:
     return path_str
 
 
+def _extract_worktree_root_from_path(path_str: str) -> Optional[Path]:
+    if not path_str:
+        return None
+    marker = "/worktrees/"
+    idx = path_str.find(marker)
+    if idx == -1:
+        return None
+    after = path_str[idx + len(marker):]
+    slash = after.find("/")
+    if slash == -1:
+        root_str = path_str
+    else:
+        root_str = path_str[: idx + len(marker) + slash]
+    try:
+        root = Path(root_str)
+    except Exception:
+        return None
+    return root if root.exists() else None
+
+
+def _git_toplevel_for_path(path: Path) -> Optional[Path]:
+    try:
+        probe = path if path.is_dir() else path.parent
+    except Exception:
+        return None
+    if not probe.exists():
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(probe), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    top = (result.stdout or "").strip()
+    if not top:
+        return None
+    root = Path(top)
+    return root if root.exists() else None
+
+
+def _resolve_patch_context_repo_root(
+    repo_root: Path,
+    base_exp: Optional[ExperimentIR],
+    patch_root: Optional[str] = None,
+) -> Path:
+    candidates: List[Path] = []
+    if base_exp and base_exp.job:
+        for raw in (str(base_exp.job.input_script or ""), str(base_exp.job.workdir or "")):
+            if not raw:
+                continue
+            p = Path(raw)
+            if p.exists():
+                candidates.append(p if p.is_dir() else p.parent)
+            wt_root = _extract_worktree_root_from_path(raw)
+            if wt_root is not None:
+                candidates.append(wt_root)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        top = _git_toplevel_for_path(candidate)
+        if not top:
+            continue
+        if patch_root:
+            if (top / patch_root).exists():
+                return top
+            continue
+        return top
+    return repo_root
+
+
 def _normalize_worktree_paths(job_snapshot: "JobIR", repo_root: Path) -> "JobIR":
     """Return a copy of *job_snapshot* with workdir/input_script resolved out
     of stale worktree paths."""
@@ -10701,6 +12819,14 @@ def _run_experiment(
         base_job_snapshot, action, arg_rules=arg_rules
     )
     run_args = _ensure_log_path(run_args, run_dir, app=base_job_snapshot.app)
+    # Output capture for drift detection: only on dedicated "drift_capture" runs.
+    # Normal score/profile runs keep original args (e.g. -o /dev/null) to avoid
+    # I/O overhead that distorts performance measurements.
+    capture_paths: List[str] = []
+    if run_purpose == "drift_capture":
+        run_args, capture_paths = app_ensure_output_capture(
+            base_job_snapshot.app, run_args, run_dir,
+        )
     run_kind = "baseline" if action is None else "experiment"
     run_purpose_norm = (run_purpose or "score").strip().lower()
     if run_purpose_norm == "profile":
@@ -10727,8 +12853,13 @@ def _run_experiment(
     build_cfg_final = _apply_build_config(build_cfg, action, build_packs)
     if _requires_build(action):
         build_cmds = _format_build_commands(build_cfg_final, run_dir, actions_root)
-        lammps_bin = Path(build_cfg_final.get("lammps_bin") or "lmp")
-        run_bin = run_dir / "build" / lammps_bin
+        configured_bin = str(build_cfg_final.get("lammps_bin") or "").strip()
+        app_bin_name = Path(str(base_job_snapshot.app_bin or "")).name
+        if str(base_job_snapshot.app or "").lower() != "lammps" and app_bin_name:
+            configured_bin = app_bin_name
+        elif not configured_bin:
+            configured_bin = app_bin_name or "lmp"
+        run_bin = run_dir / "build" / Path(configured_bin)
     else:
         run_bin = Path(base_job_snapshot.app_bin)
     run_cmd = _format_run_command(
@@ -11168,7 +13299,7 @@ def _run_experiment(
                     baseline_check_dir,
                     time_command,
                     wrapper_command=baseline_wrapper,
-                    repeats=1,
+                    repeats=max(1, int(repeats)),
                 )
                 _append_trace(
                     trace_events,
@@ -11207,9 +13338,31 @@ def _run_experiment(
             result = _build_result_ir(
                 run_output, profile, baseline_runtime, runtime_agg, prior_samples
             )
+            if capture_paths:
+                _write_capture_paths(run_dir, capture_paths)
+            base_runtime_for_verify = None
+            if (
+                baseline_exp_for_verify
+                and baseline_exp_for_verify.results
+                and baseline_exp_for_verify.results.runtime_seconds > 0
+            ):
+                base_runtime_for_verify = float(baseline_exp_for_verify.results.runtime_seconds)
+            if (
+                base_runtime_for_verify
+                and result.runtime_seconds > 0
+                and int(run_output.exit_code) == 0
+            ):
+                result.derived_metrics["speedup_vs_base_run"] = (
+                    base_runtime_for_verify / result.runtime_seconds
+                )
+                result.derived_metrics["improvement_vs_base_pct"] = (
+                    (base_runtime_for_verify - result.runtime_seconds)
+                    / base_runtime_for_verify
+                    * 100.0
+                )
             if baseline_check_output:
                 result.derived_metrics["baseline_check_runtime"] = baseline_check_output.runtime_seconds
-                if result.runtime_seconds:
+                if result.runtime_seconds and int(run_output.exit_code) == 0:
                     result.derived_metrics["speedup_vs_baseline_check"] = (
                         baseline_check_output.runtime_seconds / result.runtime_seconds
                     )
@@ -11791,7 +13944,7 @@ def _build_result_ir(
         derived["runtime_wall_seconds"] = aggregate_wall
         if loop_total:
             derived["runtime_overhead_seconds"] = max(0.0, aggregate_wall - loop_total)
-    if baseline_runtime and total:
+    if baseline_runtime and total and int(run_output.exit_code) == 0:
         derived["speedup_vs_baseline"] = baseline_runtime / total
     if len(samples) >= 2:
         mean = sum(samples) / len(samples)
@@ -12562,6 +14715,22 @@ def _write_repro_script(
 def _write_experiment(run_dir: Path, exp: ExperimentIR) -> None:
     path = run_dir / "experiment.json"
     path.write_text(json.dumps(exp.model_dump(), indent=2), encoding="utf-8")
+
+
+def _write_capture_paths(run_dir: Path, capture_paths: List[str]) -> None:
+    path = run_dir / "capture_paths.json"
+    path.write_text(json.dumps(capture_paths), encoding="utf-8")
+
+
+def _read_capture_paths(run_dir: Path) -> List[str]:
+    path = run_dir / "capture_paths.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return list(data) if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
 
 
 def _read_experiment(path: Path) -> Optional[ExperimentIR]:

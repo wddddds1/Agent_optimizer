@@ -11,6 +11,56 @@ hotspot_globs:
   io:
     - "third_party/bwa/kseq*.h"
     - "third_party/bwa/bwa*.c"
+domain_knowledge:
+  application_type: "sequence alignment"
+  kernel_semantics:
+    - name: "bwt_extend"
+      description: "BWT backward extension for seed finding, core alignment kernel"
+      known_optimizations:
+        - "Cache-friendly BWT occurrence array layout"
+        - "SIMD-accelerated occurrence counting"
+        - "Reducing branch mispredictions in extension loop"
+    - name: "bwt_sa"
+      description: "Suffix array lookup for coordinate conversion"
+      known_optimizations:
+        - "Prefetching SA entries during batch lookups"
+        - "Reducing SA sampling rate vs memory trade-off"
+    - name: "mem_chain"
+      description: "Maximal exact match chaining and filtering"
+      known_optimizations:
+        - "Sorting and merging chain candidates efficiently"
+        - "Early termination for low-quality chains"
+    - name: "smith_waterman"
+      description: "Smith-Waterman dynamic programming for alignment extension"
+      known_optimizations:
+        - "SIMD-vectorized banded alignment (SSE/NEON)"
+        - "Adaptive banding width"
+  common_pitfalls:
+    - "Modifying BWT index format breaks backward compatibility"
+    - "Changing alignment scoring parameters alters results"
+    - "Thread-unsafe modifications to shared kstring buffers"
+  effective_strategies:
+    - category: "memory_path"
+      description: "Prefetch BWT occurrence array entries before use"
+      typical_gain: "5-15%"
+    - category: "vectorization"
+      description: "SIMD-accelerate popcount and occurrence counting"
+      typical_gain: "10-25%"
+    - category: "data_layout"
+      description: "Interleave BWT occurrence counters for cache locality"
+      typical_gain: "5-20%"
+    - category: "algorithmic"
+      description: "Batch seed extension to amortize BWT cache misses"
+      typical_gain: "10-30%"
+
+drift:
+  drift_repair_max_attempts: 2
+  thresholds:
+    mapped_rate_delta_max: 0.001
+    mean_nm_delta_max: 0.5
+    mean_mapq_delta_max: 1.0
+    unmapped_rate_delta_max: 0.002
+
 patch_rules:
   allowed_globs:
     - "third_party/bwa/*.c"
@@ -18,24 +68,25 @@ patch_rules:
   forbidden_patterns:
     - "\\bexit\\s*\\("
     - "\\babort\\s*\\("
-  max_lines_changed: 640
-  max_files_changed: 8
+  max_lines_changed: 1200
+  max_files_changed: 10
   max_snippets: 12
   max_context_chars: 120000
   debug_max_attempts: 2
+  runtime_crash_debug_max_attempts: 4
   scope_levels:
     global:
-      max_lines_changed: 640
-      max_files_changed: 8
+      max_lines_changed: 1200
+      max_files_changed: 10
       max_snippets: 20
       max_context_chars: 180000
     module:
-      max_lines_changed: 420
-      max_files_changed: 6
+      max_lines_changed: 800
+      max_files_changed: 8
       max_snippets: 16
       max_context_chars: 150000
     hotspot:
-      max_lines_changed: 260
-      max_files_changed: 4
+      max_lines_changed: 500
+      max_files_changed: 6
       max_snippets: 12
       max_context_chars: 120000

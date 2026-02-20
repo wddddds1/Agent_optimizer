@@ -1,6 +1,10 @@
 runtime:
   require_exit_code_zero: true
   error_regex: "ERROR|Segmentation fault|SIGSEGV"
+  require_non_regression_applies_to: ["source_patch"]
+  regression_tolerance_pct: 0.002
+  min_improvement_pct_by_applies_to:
+    source_patch: 0.0
 correctness:
   default_mode: "strict"
   allow_skip_for_low_risk_run_config: false
@@ -75,6 +79,20 @@ correctness:
     metric: "TotEng"
     rel_max: 1.0e-4
   output_files: []
+drift_thresholds:
+  default:
+    mode: "hash"
+    warn_on_mismatch: true
+    fail_on_mismatch: false
+  bwa:
+    mapped_rate_delta_max: 0.001
+    mean_nm_delta_max: 0.5
+    mean_mapq_delta_max: 1.0
+    unmapped_rate_delta_max: 0.002
+  lammps:
+    energy_drift_rel_max: 1.0e-4
+    force_drift_rel_max: 1.0e-3
+    temperature_cv_max: 0.05
 variance:
   repeats: 2
   cv_max: 0.03

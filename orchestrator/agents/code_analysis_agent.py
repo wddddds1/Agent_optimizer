@@ -8,7 +8,6 @@ reference implementations, check compiler reports, and examine assembly.
 from __future__ import annotations
 
 import json
-import math
 import re
 from datetime import datetime, timezone
 import hashlib
@@ -47,6 +46,9 @@ from skills.agent_tools import CodeOptimizationTools
 
 def _build_system_prompt(
     patch_families: Optional[Dict[str, Any]] = None,
+    algorithm_preanalysis: Optional[Dict[str, Any]] = None,
+    domain_knowledge: Optional[Dict[str, Any]] = None,
+    bottleneck_classification: Optional[Dict[str, Any]] = None,
 ) -> str:
     families_section = ""
     if patch_families:
@@ -78,25 +80,100 @@ def _build_system_prompt(
                 + "\n".join(lines)
             )
 
+    # Bottleneck classification section
+    bottleneck_section = ""
+    if bottleneck_classification and isinstance(bottleneck_classification, dict):
+        bn_type = bottleneck_classification.get("bottleneck_type", "mixed")
+        bn_ipc = bottleneck_classification.get("ipc", 0)
+        effective = bottleneck_classification.get("effective_directions", [])
+        ineffective = bottleneck_classification.get("ineffective_directions", [])
+        rationale = bottleneck_classification.get("rationale", "")
+        bn_parts: List[str] = [
+            f"\n\n## Bottleneck Classification: {bn_type}",
+            f"IPC: {bn_ipc:.2f}" if bn_ipc else "",
+            f"Analysis: {rationale}" if rationale else "",
+        ]
+        if effective:
+            bn_parts.append(f"Prioritize: {', '.join(effective)}")
+        if ineffective:
+            bn_parts.append(f"Deprioritize (likely ineffective): {', '.join(ineffective)}")
+        bottleneck_section = "\n".join(p for p in bn_parts if p)
+
+    # Algorithm-level pre-analysis insights
+    algo_section = ""
+    if algorithm_preanalysis and isinstance(algorithm_preanalysis, dict):
+        algo_parts: List[str] = ["\n\n## Algorithm-Level Insights (from pre-analysis)"]
+        opps = algorithm_preanalysis.get("algorithm_opportunities", [])
+        if opps:
+            algo_parts.append("Pre-identified algorithm-level opportunities:")
+            for opp in opps[:6]:
+                if isinstance(opp, dict):
+                    title = opp.get("title", "")
+                    rationale = opp.get("rationale", "")
+                    impact = opp.get("estimated_impact", "")
+                    algo_parts.append(f"  - {title} [{impact}]: {rationale}")
+        ds_obs = algorithm_preanalysis.get("data_structure_observations", "")
+        if ds_obs:
+            algo_parts.append(f"Data structure observations: {ds_obs}")
+        comm = algorithm_preanalysis.get("communication_pattern", "")
+        if comm:
+            algo_parts.append(f"Communication pattern: {comm}")
+        if len(algo_parts) > 1:
+            algo_section = "\n".join(algo_parts)
+
+    # Domain knowledge section
+    domain_section = ""
+    if domain_knowledge and isinstance(domain_knowledge, dict):
+        dk_parts: List[str] = ["\n\n## Domain Knowledge"]
+        app_type = domain_knowledge.get("application_type", "")
+        if app_type:
+            dk_parts.append(f"Application type: {app_type}")
+        kernels = domain_knowledge.get("kernel_semantics", [])
+        if kernels:
+            dk_parts.append("Key kernels:")
+            for k in kernels[:5]:
+                if isinstance(k, dict):
+                    name = k.get("name", "")
+                    desc = k.get("description", "")
+                    dk_parts.append(f"  - {name}: {desc}")
+                    for opt in (k.get("known_optimizations") or [])[:3]:
+                        dk_parts.append(f"    * {opt}")
+        strategies = domain_knowledge.get("effective_strategies", [])
+        if strategies:
+            dk_parts.append("Known effective strategies:")
+            for s in strategies[:4]:
+                if isinstance(s, dict):
+                    cat = s.get("category", "")
+                    desc = s.get("description", "")
+                    gain = s.get("typical_gain", "")
+                    dk_parts.append(f"  - [{cat}] {desc} (typical: {gain})")
+        pitfalls = domain_knowledge.get("common_pitfalls", [])
+        if pitfalls:
+            dk_parts.append("Common pitfalls to avoid:")
+            for p in pitfalls[:4]:
+                dk_parts.append(f"  - {p}")
+        if len(dk_parts) > 1:
+            domain_section = "\n".join(dk_parts)
+
     return f"""\
 You are an HPC deep-analysis agent.
 Goal: discover high-impact source-level optimization opportunities on real hotspots.
 
 Rules:
-1. Focus macro-first: data_layout, memory_path, vectorization, algorithmic.
+1. Prioritize macro mechanisms first: data_layout, memory_path, vectorization, algorithmic.
 2. Only keep opportunities with concrete evidence and clear compiler gap.
-3. Avoid generic micro-opts unless no macro path is actionable.
+3. Avoid generic micro-opts unless macro paths are weak or exhausted.
 4. If context/profile is insufficient, return explicit status and missing items.
-5. If status=OK, output 8-12 opportunities when feasible; at least 6.
-6. At least 4 opportunities must be macro mechanisms (data_layout/memory_path/vectorization/algorithmic).
-7. Favor structural transforms (data layout, memory traffic shaping, vector path redesign, algorithm path changes), not only loop micro-tweaks.
-{families_section}
+5. If status=OK, output 8-12 opportunities when feasible; prefer quality over fixed quota.
+6. Favor structural transforms (data layout, memory traffic shaping, vector path redesign, algorithm path changes), not only loop micro-tweaks.
+{families_section}{bottleneck_section}{algo_section}{domain_section}
 
 Tool workflow (compact):
 - get_profile -> read_file/get_file_outline/get_callers on top hotspots
 - get_type_definition/get_type_layout on hot-path data
 - get_reference_implementation + grep for comparable optimized patterns
-- get_compiler_opt_report + get_assembly + get_compile_flags to verify compiler gap
+- get_compiler_opt_report + get_structured_compiler_analysis to verify compiler gap
+- get_assembly + get_compile_flags for detailed analysis
 - search_experience to avoid repeating known failures
 
 Output:
@@ -153,6 +230,7 @@ _ANALYSIS_TOOL_NAMES = {
     "get_assembly",
     # Compiler Analysis
     "get_compiler_opt_report",
+    "get_structured_compiler_analysis",
     # Knowledge
     "get_reference_implementation",
     "search_experience",
@@ -226,6 +304,9 @@ class DeepCodeAnalysisAgent:
         backend_variant: Optional[str] = None,
         input_script_path: Optional[str] = None,
         supplemental_context: Optional[Dict[str, str]] = None,
+        algorithm_preanalysis: Optional[Dict[str, Any]] = None,
+        domain_knowledge: Optional[Dict[str, Any]] = None,
+        bottleneck_classification: Optional[Dict[str, Any]] = None,
     ) -> OpportunityGraphResult:
         run = self._run_analysis_session(
             profile=profile,
@@ -236,6 +317,9 @@ class DeepCodeAnalysisAgent:
             backend_variant=backend_variant,
             input_script_path=input_script_path,
             supplemental_context=supplemental_context,
+            algorithm_preanalysis=algorithm_preanalysis,
+            domain_knowledge=domain_knowledge,
+            bottleneck_classification=bottleneck_classification,
         )
         self.last_discovery_run = run
         analysis = run.analysis
@@ -327,12 +411,21 @@ class DeepCodeAnalysisAgent:
                 budget_penalty *= 1.2
 
         # Default policy favors deeper opportunities by reducing pure cost penalty
-        # and reserving quota for macro/algorithmic mechanisms.
+        # and applying soft mechanism priorities (not hard quotas).
         cost_penalty_power = max(0.3, min(1.0, float(policy.get("cost_penalty_power", 0.65) or 0.65)))
         cost_penalty_weight = max(0.1, min(1.0, float(policy.get("cost_penalty_weight", 0.7) or 0.7)))
-        macro_quota_ratio = max(0.0, min(1.0, float(policy.get("macro_quota_ratio", 0.6) or 0.6)))
-        macro_quota_min = max(0, int(policy.get("macro_quota_min", 2) or 0))
-        algorithmic_quota_min = max(0, int(policy.get("algorithmic_quota_min", 1) or 0))
+        macro_priority_bonus = max(0.0, min(1.5, float(policy.get("macro_priority_bonus", 0.28) or 0.28)))
+        algorithmic_priority_bonus = max(
+            0.0, min(1.5, float(policy.get("algorithmic_priority_bonus", 0.14) or 0.14))
+        )
+        micro_penalty = max(0.0, min(1.0, float(policy.get("micro_penalty", 0.12) or 0.12)))
+        untested_bonus = max(0.0, min(0.5, float(policy.get("untested_bonus", 0.06) or 0.06)))
+        retested_penalty = max(0.0, min(0.5, float(policy.get("retested_penalty", 0.05) or 0.05)))
+        macro_guard_top_n = max(0, int(policy.get("macro_guard_top_n", 2) or 2))
+        macro_guard_min = max(0, int(policy.get("macro_guard_min", 2) or 2))
+        macro_guard_max_gap = max(
+            0.0, min(1.0, float(policy.get("macro_guard_max_relative_gap", 0.5) or 0.5))
+        )
 
         scored: List[SelectedOpportunity] = []
         dropped: List[Dict[str, object]] = []
@@ -367,8 +460,20 @@ class DeepCodeAnalysisAgent:
                 * composability_score
                 / max(implementation_cost, 1.0e-6)
             )
+            mechanism_bonus = 0.0
+            if node.mechanism in MACRO_MECHANISMS:
+                mechanism_bonus += macro_priority_bonus
+            if node.mechanism == OpportunityMechanism.ALGORITHMIC:
+                mechanism_bonus += algorithmic_priority_bonus
+            if node.mechanism == OpportunityMechanism.MICRO_OPT:
+                mechanism_bonus -= micro_penalty
+            if node.opportunity_id not in tested_ids:
+                mechanism_bonus += untested_bonus
+            else:
+                mechanism_bonus -= retested_penalty
+            weighted_objective = objective * max(0.05, 1.0 + mechanism_bonus)
             value_density = expected_speedup / max(effective_cost, 1.0e-6)
-            node.score = objective
+            node.score = weighted_objective
             node.value_density = value_density
             scored.append(
                 SelectedOpportunity(
@@ -377,7 +482,7 @@ class DeepCodeAnalysisAgent:
                     success_prob=float(node.success_prob),
                     composability=composability_score,
                     implementation_cost=effective_cost,
-                    objective_score=objective,
+                    objective_score=weighted_objective,
                     value_density=value_density,
                 )
             )
@@ -390,50 +495,42 @@ class DeepCodeAnalysisAgent:
             )
         )
         target_k = max(0, int(k or 0))
-        selected: List[SelectedOpportunity] = []
-        selected_ids: set[str] = set()
-
-        def _append_from(pool: List[SelectedOpportunity], limit: int) -> None:
-            if limit <= 0:
-                return
-            added = 0
-            for item in pool:
-                op_id = item.opportunity.opportunity_id
-                if op_id in selected_ids:
-                    continue
-                selected.append(item)
-                selected_ids.add(op_id)
-                added += 1
-                if added >= limit:
-                    break
-
-        macro_pool = [item for item in scored if item.opportunity.mechanism in MACRO_MECHANISMS]
-        algorithmic_pool = [
-            item for item in scored if item.opportunity.mechanism == OpportunityMechanism.ALGORITHMIC
-        ]
-        macro_preferred = [i for i in macro_pool if i.opportunity.opportunity_id not in tested_ids] + [
-            i for i in macro_pool if i.opportunity.opportunity_id in tested_ids
-        ]
-        algorithmic_preferred = [
-            i for i in algorithmic_pool if i.opportunity.opportunity_id not in tested_ids
-        ] + [i for i in algorithmic_pool if i.opportunity.opportunity_id in tested_ids]
-
-        macro_quota_target = min(
-            len(macro_pool),
-            target_k,
-            max(macro_quota_min, int(math.ceil(target_k * macro_quota_ratio))) if target_k > 0 else 0,
-        )
-        algorithmic_quota_target = min(algorithmic_quota_min, target_k, len(algorithmic_pool))
-
-        _append_from(algorithmic_preferred, algorithmic_quota_target)
-        selected_macro_count = sum(
-            1 for item in selected if item.opportunity.mechanism in MACRO_MECHANISMS
-        )
-        _append_from(macro_preferred, max(0, macro_quota_target - selected_macro_count))
-        _append_from(scored, max(0, target_k - len(selected)))
-        selected = selected[:target_k]
-
-        macro_rule_applied = bool(macro_quota_target > 0 or algorithmic_quota_target > 0)
+        selected: List[SelectedOpportunity] = list(scored[:target_k])
+        macro_rule_applied = False
+        if target_k > 0 and macro_guard_top_n > 0 and selected:
+            top_n = min(target_k, macro_guard_top_n, len(selected))
+            macro_pool = [item for item in scored if item.opportunity.mechanism in MACRO_MECHANISMS]
+            selected_ids = {item.opportunity.opportunity_id for item in selected}
+            selected_top_macro = [
+                item for item in selected[:top_n]
+                if item.opportunity.mechanism in MACRO_MECHANISMS
+            ]
+            target_macro = min(macro_guard_min, top_n, len(macro_pool))
+            needed = max(0, target_macro - len(selected_top_macro))
+            if needed > 0:
+                insert_pool = [
+                    item for item in macro_pool
+                    if item.opportunity.opportunity_id not in selected_ids
+                ]
+                for candidate in insert_pool:
+                    if needed <= 0:
+                        break
+                    replace_idx = -1
+                    for idx in range(top_n - 1, -1, -1):
+                        if selected[idx].opportunity.mechanism not in MACRO_MECHANISMS:
+                            replace_idx = idx
+                            break
+                    if replace_idx < 0:
+                        break
+                    replaced = selected[replace_idx]
+                    denom = max(abs(replaced.objective_score), 1.0e-9)
+                    rel_gap = max(0.0, (replaced.objective_score - candidate.objective_score) / denom)
+                    if rel_gap <= macro_guard_max_gap:
+                        selected_ids.discard(replaced.opportunity.opportunity_id)
+                        selected_ids.add(candidate.opportunity.opportunity_id)
+                        selected[replace_idx] = candidate
+                        needed -= 1
+                        macro_rule_applied = True
 
         return SelectedOpportunities(
             selected=selected,
@@ -441,7 +538,7 @@ class DeepCodeAnalysisAgent:
             macro_rule_applied=macro_rule_applied,
             ranking_rationale=(
                 "score = expected_speedup * success_prob * composability / effective_cost, "
-                "with macro+algorithmic quotas"
+                "with soft mechanism priorities and optional macro guard"
             ),
         )
 
@@ -455,12 +552,20 @@ class DeepCodeAnalysisAgent:
         backend_variant: Optional[str] = None,
         input_script_path: Optional[str] = None,
         supplemental_context: Optional[Dict[str, str]] = None,
+        algorithm_preanalysis: Optional[Dict[str, Any]] = None,
+        domain_knowledge: Optional[Dict[str, Any]] = None,
+        bottleneck_classification: Optional[Dict[str, Any]] = None,
     ) -> DeepAnalysisResult:
         self.tools.set_profile_data(profile)
         if input_script_path:
             self.tools.set_benchmark_input(input_script_path)
 
-        system_prompt = _build_system_prompt(patch_families)
+        system_prompt = _build_system_prompt(
+            patch_families,
+            algorithm_preanalysis=algorithm_preanalysis,
+            domain_knowledge=domain_knowledge,
+            bottleneck_classification=bottleneck_classification,
+        )
         session = self.llm_client.create_session(system_prompt)
 
         analysis_tools = self._get_analysis_tools()
@@ -529,7 +634,7 @@ class DeepCodeAnalysisAgent:
             "",
             "Explore hotspot code and produce a ranked list of actionable source-level opportunities.",
             "Work efficiently: keep tool calls focused on hottest functions and strongest evidence.",
-            "When actionable, provide at least 6 opportunities (target 8-12), with macro-first coverage.",
+            "When actionable, provide at least 6 opportunities (target 8-12), with macro-priority coverage.",
             "",
             "## Baseline Profile",
             "```json",
@@ -554,6 +659,16 @@ class DeepCodeAnalysisAgent:
                 "```json",
                 json.dumps(tau_hotspots[:12], indent=2),
                 "```",
+            ])
+        portrait = profile_payload.get("bottleneck_portrait")
+        if isinstance(portrait, dict) and portrait:
+            parts.extend([
+                "",
+                "## Stage Bottleneck Portrait (per-round)",
+                "```json",
+                json.dumps(portrait, indent=2),
+                "```",
+                "Derive structural goals for the next patch round from this portrait, not from fixed templates.",
             ])
 
         parts.extend([
@@ -696,7 +811,9 @@ class DeepCodeAnalysisAgent:
                 }
                 evidence_ids.append(eid)
 
-            gain = self._impact_to_gain(opp.estimated_impact, opp.confidence)
+            gain = self._impact_to_gain(
+                opp.estimated_impact, opp.confidence, hotspot.share
+            )
             mechanism = self._to_mechanism(opp.category, opp.mechanism, opp.family_hint)
             success_prob = max(0.05, min(0.95, float(opp.confidence)))
             implementation_cost = float(self._complexity_to_cost(opp.implementation_complexity))
@@ -830,7 +947,9 @@ class DeepCodeAnalysisAgent:
             return OpportunityMechanism.ALLOCATION
         return OpportunityMechanism.MICRO_OPT
 
-    def _impact_to_gain(self, impact: str, confidence: float) -> Dict[str, float]:
+    def _impact_to_gain(
+        self, impact: str, confidence: float, hotspot_share: float = 1.0
+    ) -> Dict[str, float]:
         table = {
             "high": (0.18, 0.35),
             "medium": (0.08, 0.18),
@@ -838,9 +957,17 @@ class DeepCodeAnalysisAgent:
         }
         p50, p90 = table.get(str(impact or "").lower(), (0.06, 0.14))
         scale = max(0.6, min(1.2, 0.6 + float(confidence)))
+        p50 = p50 * scale
+        p90 = p90 * scale
+        # Amdahl's Law: gain is bounded by the hotspot's share of total
+        # runtime.  A "high" impact on a 1% hotspot yields ~1% max gain,
+        # not the 18% that the raw table suggests.
+        if 0 < hotspot_share < 1.0:
+            p50 = min(p50, hotspot_share)
+            p90 = min(p90, hotspot_share)
         return {
-            "p50": round(p50 * scale, 4),
-            "p90": round(p90 * scale, 4),
+            "p50": round(p50, 4),
+            "p90": round(p90, 4),
         }
 
     def _complexity_to_cost(self, complexity: str) -> float:

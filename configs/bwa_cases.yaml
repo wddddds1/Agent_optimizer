@@ -16,6 +16,23 @@ cases:
       source_dir: "third_party/bwa"
       app_bin: "bwa"
       build_args: ["-j", "4"]
+  bwa_chr1_large:
+    app: bwa
+    workdir: "examples/bwa/bwa_human_chr1"
+    app_bin: "third_party/bwa/bwa"
+    input_script: ""
+    run_args: ["mem", "-t", "1", "-o", "/dev/null", "chr1.fa", "reads_1m.fq"]
+    env: {}
+    budgets:
+      max_iters: 10
+      max_runs: 60
+      max_wall_seconds: 28800
+    tags: ["bwa", "alignment", "chr1", "large", "server"]
+    build:
+      build_system: "make"
+      source_dir: "third_party/bwa"
+      app_bin: "bwa"
+      build_args: ["-j", "64"]
   bwa_ecoli:
     app: bwa
     workdir: "examples/bwa/bwa_ecoli_real"

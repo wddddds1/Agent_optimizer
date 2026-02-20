@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import base64
+import difflib
 import re
 from typing import Dict, List, Optional
 
@@ -269,7 +270,7 @@ class CodePatchAgent:
             result = apply_structured_edits(repo_root, edit_proposal.edits, allowed_files)
         except StructuredEditError as exc:
             message = str(exc)
-            adjusted = _try_disambiguate_edits(
+            adjusted = try_disambiguate_edits(
                 edit_proposal.edits, code_snippets, repo_root, message
             )
             if adjusted:
@@ -287,6 +288,34 @@ class CodePatchAgent:
                 return patch_proposal
         patch_proposal.patch_diff = result.patch_diff
         patch_proposal.touched_files = result.touched_files
+
+        # AST post-validation: check structural correctness
+        try:
+            from skills.code_structure import is_available as _ts_avail, validate_patch_structure
+            if _ts_avail():
+                ast_warnings: List[str] = []
+                for tf in result.touched_files:
+                    full_path = repo_root / tf
+                    if not full_path.is_file():
+                        continue
+                    patched_text = full_path.read_text(encoding="utf-8", errors="replace")
+                    validation = validate_patch_structure(str(full_path), patched_text)
+                    if not validation.valid:
+                        ast_warnings.extend(
+                            [f"[AST] {tf}: {e}" for e in validation.errors]
+                        )
+                    ast_warnings.extend(
+                        [f"[AST warning] {tf}: {w}" for w in validation.warnings]
+                    )
+                if ast_warnings:
+                    patch_proposal.rationale = (
+                        (patch_proposal.rationale or "")
+                        + "\n\nAST validation notes:\n"
+                        + "\n".join(ast_warnings[:5])
+                    )
+        except Exception:
+            pass  # AST validation is best-effort
+
         return patch_proposal
 
 
@@ -295,7 +324,7 @@ def _load_prompt(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _try_disambiguate_edits(
+def try_disambiguate_edits(
     edits: List[PatchEdit],
     code_snippets: List[Dict[str, object]],
     repo_root: Path,
@@ -331,17 +360,43 @@ def _try_disambiguate_edits(
         if lines[i : i + len(anchor_lines)] == anchor_lines:
             matches.append(i)
     if not matches:
+        trimmed_anchor_lines = [line.rstrip() for line in anchor_lines]
+        for i in range(len(lines) - len(trimmed_anchor_lines) + 1):
+            candidate = [line.rstrip() for line in lines[i : i + len(trimmed_anchor_lines)]]
+            if candidate == trimmed_anchor_lines:
+                matches.append(i)
+    if not matches and label == "old_text":
+        block_len = max(1, len(anchor_lines))
+        needle = "\n".join(anchor_lines)
+        best_idx = None
+        best_score = 0.0
+        for i in range(len(lines) - block_len + 1):
+            candidate_text = "\n".join(lines[i : i + block_len])
+            score = difflib.SequenceMatcher(None, needle, candidate_text).ratio()
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        if best_idx is not None and best_score >= 0.88:
+            matches.append(best_idx)
+    if not matches:
         return False
     preferred = None
     if snippet_ranges:
-        for idx in matches:
-            if any(start <= idx <= end for start, end in snippet_ranges):
-                preferred = idx
-                break
+        def _distance_to_ranges(idx: int) -> int:
+            best = 10**9
+            for start, end in snippet_ranges:
+                if start <= idx <= end:
+                    return 0
+                if idx < start:
+                    best = min(best, start - idx)
+                else:
+                    best = min(best, idx - end)
+            return best
+        preferred = min(matches, key=_distance_to_ranges)
     if preferred is None:
         preferred = matches[0]
     full_text = "\n".join(lines)
-    for extra in range(1, 5):
+    for extra in range(1, 41):
         start = max(0, preferred - extra)
         end = min(len(lines), preferred + len(anchor_lines) + extra)
         candidate = "\n".join(lines[start:end])
@@ -351,5 +406,12 @@ def _try_disambiguate_edits(
                     edit.anchor = candidate
                 if label == "old_text" and edit.old_text == anchor:
                     edit.old_text = candidate
+                    if edit.anchor and edit.anchor not in candidate:
+                        first_line = next(
+                            (line for line in candidate.splitlines() if line.strip()),
+                            "",
+                        )
+                        if first_line:
+                            edit.anchor = first_line
             return True
     return False

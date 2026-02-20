@@ -31,6 +31,8 @@ class AgenticCodePatchAgent:
         max_tool_calls_per_turn: int = 5,
         max_invalid_tool_calls_total: int = 5,
         max_invalid_tool_calls_per_tool: int = 2,
+        request_timeout_sec: float = 120.0,
+        api_timeout_retries: int = 2,
     ) -> None:
         self.repo_root = repo_root
         self.enabled = enabled
@@ -51,6 +53,8 @@ class AgenticCodePatchAgent:
             max_tool_calls_per_turn=max_tool_calls_per_turn,
             max_invalid_tool_calls_total=max_invalid_tool_calls_total,
             max_invalid_tool_calls_per_tool=max_invalid_tool_calls_per_tool,
+            request_timeout_sec=request_timeout_sec,
+            api_timeout_retries=api_timeout_retries,
         )
 
         self.agent = CodeOptimizerAgent(config, repo_root, build_dir)
@@ -240,11 +244,38 @@ class AgenticCodePatchAgent:
         # Extract touched files from patch diff
         touched_files = self._extract_touched_files(result.patch_diff)
 
+        # AST post-validation: check structural correctness before returning
+        ast_warnings: List[str] = []
+        try:
+            from skills.code_structure import is_available as _ts_avail, validate_patch_structure
+            if _ts_avail() and touched_files:
+                for tf in touched_files:
+                    full_path = self.repo_root / tf
+                    if not full_path.is_file():
+                        continue
+                    # Apply patch to get patched content for validation
+                    patched_content = self._simulate_patch(full_path, result.patch_diff)
+                    if patched_content is not None:
+                        validation = validate_patch_structure(str(full_path), patched_content)
+                        if not validation.valid:
+                            ast_warnings.extend(
+                                [f"[AST] {tf}: {e}" for e in validation.errors]
+                            )
+                        ast_warnings.extend(
+                            [f"[AST warning] {tf}: {w}" for w in validation.warnings]
+                        )
+        except Exception:
+            pass  # AST validation is best-effort
+
+        rationale = result.rationale or ""
+        if ast_warnings:
+            rationale += "\n\nAST validation notes:\n" + "\n".join(ast_warnings[:5])
+
         return PatchProposal(
             status="OK",
             patch_diff=result.patch_diff,
             touched_files=touched_files,
-            rationale=result.rationale,
+            rationale=rationale,
             assumptions=[],
             confidence=result.confidence,
             missing_fields=[],
@@ -272,6 +303,29 @@ class AgenticCodePatchAgent:
             log_path.write_text(json.dumps(log_data, indent=2, default=str), encoding="utf-8")
         except Exception:
             pass  # Best-effort — don't fail the pipeline for logging
+
+    def _simulate_patch(self, file_path: Path, patch_diff: str) -> Optional[str]:
+        """Apply a unified diff to file content in memory for AST validation.
+
+        Returns the patched file content, or None if simulation fails.
+        """
+        try:
+            import subprocess
+            original = file_path.read_text(encoding="utf-8", errors="replace")
+            # Use subprocess with `patch --dry-run` to simulate
+            proc = subprocess.run(
+                ["patch", "--dry-run", "-p1", "-o", "-"],
+                input=patch_diff,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=str(self.repo_root),
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+        except Exception:
+            pass
+        return None
 
     def _extract_touched_files(self, patch_diff: str) -> List[str]:
         """Extract file paths from a unified diff."""
@@ -304,6 +358,8 @@ def create_agentic_code_patch_agent(
             - max_tool_calls_per_turn: Maximum tool calls per turn (default 5)
             - max_invalid_tool_calls_total: Max invalid tool calls before hard fail
             - max_invalid_tool_calls_per_tool: Max consecutive invalid calls per tool
+            - request_timeout_sec: Per-request timeout in seconds (default 120)
+            - api_timeout_retries: Extra retries for retryable timeout/network errors
 
     Returns:
         Configured AgenticCodePatchAgent
@@ -321,4 +377,6 @@ def create_agentic_code_patch_agent(
         max_tool_calls_per_turn=int(config.get("max_tool_calls_per_turn", 5)),
         max_invalid_tool_calls_total=int(config.get("max_invalid_tool_calls_total", 5)),
         max_invalid_tool_calls_per_tool=int(config.get("max_invalid_tool_calls_per_tool", 2)),
+        request_timeout_sec=float(config.get("request_timeout_sec", 120.0)),
+        api_timeout_retries=int(config.get("api_timeout_retries", 2)),
     )

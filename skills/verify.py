@@ -25,6 +25,16 @@ class VerifyResult:
     correctness_metrics: Dict[str, object]
 
 
+@dataclass
+class DriftReport:
+    """Structured report for output correctness drift detection."""
+    status: str  # "PASS", "WARN", "FAIL"
+    drift_metrics: Dict[str, object]  # app-specific metrics
+    summary: str  # human-readable summary for LLM feedback
+    details: Dict[str, object]  # full comparison data
+    thresholds_used: Dict[str, object]  # what thresholds triggered WARN/FAIL
+
+
 def verify_run(
     job: JobIR,
     action: Optional[ActionIR],
@@ -317,18 +327,74 @@ def verify_run(
 
     # Runtime regression guard: fail if >2x slower than baseline.
     regression_limit = float(runtime_cfg.get("max_regression_factor", 2.0))
-    if (
-        not is_baseline
-        and baseline_exp
-        and baseline_exp.results
-        and baseline_exp.results.runtime_seconds > 0
-        and result.runtime_seconds > 0
-    ):
-        factor = result.runtime_seconds / baseline_exp.results.runtime_seconds
-        if factor > regression_limit:
-            reasons.append(
-                f"runtime regression: {factor:.1f}x slower than baseline"
+    if not is_baseline and result.runtime_seconds > 0:
+        baseline_runtime = None
+        baseline_source = "base_run"
+        baseline_check_runtime = result.derived_metrics.get("baseline_check_runtime")
+        try:
+            baseline_check_runtime = float(baseline_check_runtime)
+        except (TypeError, ValueError):
+            baseline_check_runtime = None
+        if baseline_check_runtime is not None and baseline_check_runtime > 0:
+            baseline_runtime = baseline_check_runtime
+            baseline_source = "baseline_check"
+        elif (
+            baseline_exp
+            and baseline_exp.results
+            and baseline_exp.results.runtime_seconds > 0
+        ):
+            baseline_runtime = float(baseline_exp.results.runtime_seconds)
+        if baseline_runtime is not None and baseline_runtime > 0:
+            runtime = float(result.runtime_seconds)
+            factor = runtime / baseline_runtime
+            improvement = (baseline_runtime - runtime) / baseline_runtime
+            correctness_metrics["runtime_vs_base"] = {
+                "source": baseline_source,
+                "baseline_runtime_seconds": baseline_runtime,
+                "runtime_seconds": runtime,
+                "speedup_vs_base": (baseline_runtime / runtime) if runtime > 0 else 0.0,
+                "improvement_pct": improvement * 100.0,
+            }
+            if factor > regression_limit:
+                reasons.append(
+                    f"runtime regression: {factor:.1f}x slower than baseline"
+                )
+            non_regression_default = bool(runtime_cfg.get("require_non_regression", False))
+            non_regression_targets = runtime_cfg.get("require_non_regression_applies_to", [])
+            non_regression_target_set = {
+                str(item).strip() for item in non_regression_targets if str(item).strip()
+            }
+            min_improvement_default = float(runtime_cfg.get("min_improvement_pct", 0.0) or 0.0)
+            min_improvement_map = (
+                runtime_cfg.get("min_improvement_pct_by_applies_to", {})
+                if isinstance(runtime_cfg.get("min_improvement_pct_by_applies_to", {}), dict)
+                else {}
             )
+            tolerated_regression_pct = float(runtime_cfg.get("regression_tolerance_pct", 0.0) or 0.0)
+            applies_to = set(action.applies_to or []) if action else set()
+            require_non_regression = non_regression_default or bool(applies_to & non_regression_target_set)
+            required_improvement_pct = min_improvement_default
+            for target, raw in min_improvement_map.items():
+                target_name = str(target).strip()
+                if target_name and target_name in applies_to:
+                    try:
+                        required_improvement_pct = max(required_improvement_pct, float(raw))
+                    except (TypeError, ValueError):
+                        continue
+            if is_final_validation:
+                # Validation reruns should verify stability/correctness against the same
+                # base, not require a second incremental gain over that base.
+                required_improvement_pct = 0.0
+            if require_non_regression and improvement < -max(0.0, tolerated_regression_pct):
+                reasons.append(
+                    "runtime regression vs base "
+                    f"({improvement * 100.0:.3f}% < -{tolerated_regression_pct * 100.0:.3f}%)"
+                )
+            if required_improvement_pct > 0 and improvement < required_improvement_pct:
+                reasons.append(
+                    "runtime improvement below threshold "
+                    f"({improvement * 100.0:.3f}% < {required_improvement_pct * 100.0:.3f}%)"
+                )
 
     verdict = "PASS" if not reasons else "FAIL"
     return VerifyResult(verdict=verdict, reasons=reasons, correctness_metrics=correctness_metrics)
@@ -405,7 +471,10 @@ def _signature_intentionally_suppressed(job: JobIR) -> bool:
     app = str(getattr(job, "app", "") or "").strip().lower()
     run_args = [str(arg) for arg in (getattr(job, "run_args", []) or [])]
     for idx, token in enumerate(run_args):
-        if token == "-o" and idx + 1 < len(run_args) and run_args[idx + 1] == "/dev/null":
+        if token == "-o" and idx + 1 < len(run_args):
+            # BWA routes SAM output to a file (or /dev/null) — stdout won't
+            # contain alignment data, so the generic signature is meaningless.
+            # Correctness is handled by the drift detection system instead.
             return app == "bwa"
     return False
 
@@ -762,3 +831,24 @@ def _sha256_path(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Drift detection — generic dispatcher
+# ---------------------------------------------------------------------------
+
+def compute_drift(
+    baseline_path: str,
+    candidate_path: str,
+    app: str,
+    thresholds: Dict[str, object],
+) -> DriftReport:
+    """Compute output drift between baseline and candidate runs.
+
+    Dispatches to app-specific drift checkers.  Falls back to binary hash
+    comparison for unknown applications.
+    """
+    from skills.applications import get_drift_checker
+
+    checker = get_drift_checker(app)
+    return checker(baseline_path, candidate_path, thresholds)

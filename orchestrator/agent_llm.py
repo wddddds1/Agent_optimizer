@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -68,6 +69,23 @@ def _promote_default_temperature(payload: Dict[str, Any]) -> bool:
         payload["temperature"] = 1
         return True
     return False
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    retry_markers = (
+        "timeout",
+        "timed out",
+        "connection",
+        "temporarily unavailable",
+        "service unavailable",
+        "rate limit",
+        "429",
+        "502",
+        "503",
+        "504",
+    )
+    return any(marker in text for marker in retry_markers)
 
 
 @dataclass
@@ -136,6 +154,8 @@ class AgentConfig:
     max_invalid_tool_calls_total: int = 5
     max_invalid_tool_calls_per_tool: int = 2
     strict_availability: bool = True
+    request_timeout_sec: float = 120.0
+    api_timeout_retries: int = 2
 
 
 @dataclass
@@ -215,6 +235,8 @@ class AgentLLMClient:
         self.client = None
         self._prefer_max_completion_tokens = False
         self._prefer_default_temperature = False
+        self._request_timeout_sec = max(0.0, float(config.request_timeout_sec or 0.0))
+        self._api_timeout_retries = max(0, int(config.api_timeout_retries or 0))
 
         if not config.enabled:
             return
@@ -231,18 +253,22 @@ class AgentLLMClient:
             api_key=api_key,
             base_url=config.base_url,
             max_retries=0,
+            timeout=(self._request_timeout_sec if self._request_timeout_sec > 0 else None),
         )
 
     def _chat_create(self, **kwargs: Any) -> Any:
         if not self.client:
             raise RuntimeError("Agent LLM client not initialized")
         req = dict(kwargs)
+        if self._request_timeout_sec > 0 and "timeout" not in req:
+            req["timeout"] = self._request_timeout_sec
         if self._prefer_max_completion_tokens:
             _promote_max_completion_tokens(req)
         if self._prefer_default_temperature:
             _promote_default_temperature(req)
         last_exc: Optional[Exception] = None
-        for _ in range(3):
+        attempts = 3 + self._api_timeout_retries
+        for attempt in range(attempts):
             try:
                 return self.client.chat.completions.create(**req)
             except Exception as exc:
@@ -258,8 +284,12 @@ class AgentLLMClient:
                     if _promote_default_temperature(req):
                         self._prefer_default_temperature = True
                         changed = True
-                if not changed:
-                    raise
+                if changed:
+                    continue
+                if _is_retryable_llm_error(exc) and attempt < attempts - 1:
+                    time.sleep(1.0 + 0.5 * attempt)
+                    continue
+                raise
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("unreachable")

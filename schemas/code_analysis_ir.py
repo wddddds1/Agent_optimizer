@@ -110,6 +110,9 @@ class DeepCodeAnalysisResult(StrictBaseModel):
     recommended_sequence: List[str] = Field(default_factory=list)
     strategy_rationale: str = ""
 
+    # Algorithm pre-analysis (populated before deep analysis)
+    algorithm_preanalysis: Optional[dict] = None
+
     # Meta
     total_files_explored: int = 0
     total_functions_analyzed: int = 0

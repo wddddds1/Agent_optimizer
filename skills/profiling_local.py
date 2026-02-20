@@ -16,6 +16,7 @@ from skills.metrics_parse import (
     parse_xctrace_report,
     parse_xctrace_time_profile_xml,
 )
+from skills.profile_payload import build_bottleneck_portrait
 from skills.run_local import RunOutput, build_launch_cmd, run_job
 
 
@@ -109,10 +110,20 @@ def profile_job(
                 notes = [n for n in notes if n != tau_empty_note]
             notes.append(f"xctrace_report={xctrace_report}")
 
-    if not tau_hotspots:
+    profiling_attempted = bool(profiling_cfg) or bool(wrapper_command)
+    if not tau_hotspots and profiling_attempted:
         notes.append(
-            "no function hotspots available; decisions rely on wall-clock/system metrics"
+            "no function hotspots available after profiling; decisions rely on wall-clock/system metrics"
         )
+
+    report_stub = ProfileReport(
+        timing_breakdown=timing_breakdown,
+        system_metrics=system_metrics,
+        notes=notes,
+        log_path=run_output.log_path,
+        tau_hotspots=tau_hotspots,
+    )
+    portrait = build_bottleneck_portrait(report_stub)
 
     report = ProfileReport(
         timing_breakdown=timing_breakdown,
@@ -120,6 +131,7 @@ def profile_job(
         notes=notes,
         log_path=run_output.log_path,
         tau_hotspots=tau_hotspots,
+        bottleneck_portrait=portrait,
     )
     return run_output, report
 

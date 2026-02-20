@@ -113,6 +113,10 @@ class ExperienceMemory:
     def record_experiment(self, exp: ExperimentIR, baseline_exp: ExperimentIR) -> None:
         if not self.config.enabled or exp.action is None:
             return
+        action_id = str(exp.action.action_id or "")
+        run_id = str(exp.run_id or "")
+        if action_id.startswith("profile_probe.") or run_id.endswith("-profile"):
+            return
         baseline_runtime = _safe_float(baseline_exp.results.runtime_seconds)
         runtime = _safe_float(exp.results.runtime_seconds)
         if baseline_runtime <= 0 or runtime <= 0:

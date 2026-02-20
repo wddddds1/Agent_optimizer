@@ -33,6 +33,18 @@ class PlannerAgent:
             analysis.allowed_families = [
                 fam for fam, count in availability.items() if count > 0
             ]
+
+        # Apply patch sub-phase family filtering when active
+        sub_phase = (context or {}).get("patch_sub_phase", {})
+        if isinstance(sub_phase, dict) and sub_phase.get("enabled"):
+            sub_phase_families = sub_phase.get("allowed_families")
+            if isinstance(sub_phase_families, list) and sub_phase_families:
+                # Restrict to sub-phase families + always keep source_patch
+                analysis.allowed_families = [
+                    fam for fam in analysis.allowed_families
+                    if fam in sub_phase_families or fam == "source_patch"
+                ]
+
         llm_plan = self._try_llm(
             iteration_id, analysis, budgets, history, availability, cost_model, context
         )

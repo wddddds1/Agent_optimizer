@@ -58,3 +58,35 @@ def test_select_topk_from_graph_prefers_macro_when_available(tmp_path) -> None:
 
     assert mechanisms[0] in {"vectorization", "algorithmic", "data_layout", "memory_path"}
     assert mechanisms[1] in {"vectorization", "algorithmic", "data_layout", "memory_path"}
+
+
+def test_select_topk_soft_guard_does_not_force_macro_when_gap_is_large(tmp_path) -> None:
+    agent = DeepCodeAnalysisAgent(
+        config=AgentConfig(enabled=False),
+        repo_root=tmp_path,
+        build_dir=tmp_path,
+        experience_db=None,
+    )
+    graph = OpportunityGraph(
+        graph_id="g",
+        opportunities=[
+            _node("micro_fast", OpportunityMechanism.MICRO_OPT, p50=0.9, cost=2.0),
+            _node("vec_small", OpportunityMechanism.VECTORIZATION, p50=0.08, cost=2.0),
+            _node("algo_small", OpportunityMechanism.ALGORITHMIC, p50=0.05, cost=2.0),
+        ],
+        evidence_catalog={},
+    )
+
+    selected = agent.select_topk_from_graph(
+        graph,
+        k=1,
+        budget={},
+        experience_hints=[],
+        selection_policy={
+            "macro_guard_top_n": 1,
+            "macro_guard_min": 1,
+            "macro_guard_max_relative_gap": 0.2,
+        },
+    )
+    assert selected.selected
+    assert selected.selected[0].opportunity.opportunity_id == "micro_fast"

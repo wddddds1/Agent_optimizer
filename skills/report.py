@@ -8,6 +8,14 @@ from typing import Dict, List, Optional, Tuple
 from schemas.experiment_ir import ExperimentIR
 
 
+def _is_profile_probe_exp(exp: ExperimentIR) -> bool:
+    if not exp or not exp.action:
+        return False
+    action_id = str(exp.action.action_id or "")
+    run_id = str(exp.run_id or "")
+    return action_id.startswith("profile_probe.") or run_id.endswith("-profile")
+
+
 def build_summary_table(experiments: List[ExperimentIR]) -> str:
     header = ["run_id", "action_id", "runtime_s", "verdict"]
     rows = [header]
@@ -48,7 +56,11 @@ def _build_attempts_table(experiments: List[ExperimentIR]) -> List[Dict[str, obj
     rows: List[Dict[str, object]] = []
     for exp in experiments:
         action_id = exp.action.action_id if exp.action else "baseline"
-        speedup = exp.results.derived_metrics.get("speedup_vs_baseline")
+        speedup = (
+            exp.results.derived_metrics.get("speedup_vs_base_run")
+            or exp.results.derived_metrics.get("speedup_vs_baseline_check")
+            or exp.results.derived_metrics.get("speedup_vs_baseline")
+        )
         rows.append(
             {
                 "run_id": exp.run_id,
@@ -82,6 +94,8 @@ def _collect_effective_actions(
     exp_map = {exp.run_id: exp for exp in experiments}
     rows: List[Dict[str, object]] = []
     for exp in experiments:
+        if _is_profile_probe_exp(exp):
+            continue
         if exp.action is None or exp.verdict != "PASS":
             continue
         base_exp = exp_map.get(exp.base_run_id) if exp.base_run_id else None
@@ -95,7 +109,11 @@ def _collect_effective_actions(
         improvement = (base_runtime - exp.results.runtime_seconds) / base_runtime
         if improvement < min_improvement_pct:
             continue
-        speedup = exp.results.derived_metrics.get("speedup_vs_baseline")
+        speedup = (
+            exp.results.derived_metrics.get("speedup_vs_base_run")
+            or exp.results.derived_metrics.get("speedup_vs_baseline_check")
+            or exp.results.derived_metrics.get("speedup_vs_baseline")
+        )
         detail = _llm_detail_for_run(llm_summary, exp.run_id)
         rows.append(
             {
@@ -1176,6 +1194,8 @@ def _best_by_applies_to(
 ) -> Optional[ExperimentIR]:
     best = None
     for exp in experiments:
+        if _is_profile_probe_exp(exp):
+            continue
         if exp.verdict != "PASS" or not exp.action:
             continue
         if target not in (exp.action.applies_to or []):

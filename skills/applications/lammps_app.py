@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from schemas.action_ir import ActionIR
 from schemas.job_ir import JobIR
@@ -166,6 +167,136 @@ def requires_structured_correctness() -> bool:
 
 def supports_agentic_correctness() -> bool:
     return True
+
+
+def ensure_output_capture(
+    run_args: List[str],
+    run_dir: Path,
+) -> Tuple[List[str], List[str]]:
+    """LAMMPS output is already captured in stdout.log — no args change needed."""
+    log_path = run_dir / "log.lammps"
+    stdout_path = run_dir / "stdout.log"
+    capture_paths = []
+    # Prefer log.lammps (thermo data); fall back to stdout.log
+    if "-log" in run_args:
+        idx = run_args.index("-log")
+        if idx + 1 < len(run_args):
+            capture_paths.append(run_args[idx + 1])
+    if not capture_paths:
+        capture_paths.append(str(log_path))
+    capture_paths.append(str(stdout_path))
+    return list(run_args), capture_paths
+
+
+def compute_drift(
+    baseline_path: str,
+    candidate_path: str,
+    thresholds: Dict[str, object],
+) -> "DriftReport":
+    """Compute LAMMPS output drift via thermo series comparison."""
+    from skills.verify import DriftReport
+    from skills.metrics_parse import parse_thermo_series
+
+    bp = Path(baseline_path)
+    cp = Path(candidate_path)
+    if not bp.exists() or not cp.exists():
+        missing = []
+        if not bp.exists():
+            missing.append(f"baseline: {baseline_path}")
+        if not cp.exists():
+            missing.append(f"candidate: {candidate_path}")
+        return DriftReport(
+            status="WARN",
+            drift_metrics={},
+            summary=f"Log file(s) missing: {', '.join(missing)}",
+            details={"missing": missing},
+            thresholds_used=thresholds,
+        )
+
+    base_text = bp.read_text(encoding="utf-8", errors="replace")
+    cand_text = cp.read_text(encoding="utf-8", errors="replace")
+    base_series = parse_thermo_series(base_text, max_rows=0)
+    cand_series = parse_thermo_series(cand_text, max_rows=0)
+
+    if not base_series or not cand_series:
+        return DriftReport(
+            status="WARN",
+            drift_metrics={},
+            summary="Thermo series unavailable for drift comparison",
+            details={},
+            thresholds_used=thresholds,
+        )
+
+    metrics: Dict[str, object] = {}
+    reasons: List[str] = []
+
+    # Energy drift: compare TotEng relative drift
+    energy_key = "TotEng"
+    energy_limit = float(thresholds.get("energy_drift_rel_max", 1.0e-4))
+    for key in (energy_key, "PotEng", "KinEng"):
+        base_vals = base_series.get(key, [])
+        cand_vals = cand_series.get(key, [])
+        if len(base_vals) < 2 or len(cand_vals) < 2:
+            continue
+        base_drift = _rel_drift(base_vals)
+        cand_drift = _rel_drift(cand_vals)
+        delta = abs(cand_drift - base_drift)
+        metrics[f"{key}_drift_delta"] = delta
+        metrics[f"{key}_baseline_drift"] = base_drift
+        metrics[f"{key}_candidate_drift"] = cand_drift
+        if key == energy_key and delta > energy_limit:
+            reasons.append(f"{key}_drift_delta={delta:.2e} > {energy_limit:.2e}")
+
+    # Temperature stability: coefficient of variation
+    temp_cv_max = float(thresholds.get("temperature_cv_max", 0.05))
+    temp_vals = cand_series.get("Temp", [])
+    if len(temp_vals) >= 2:
+        t_mean = sum(temp_vals) / len(temp_vals)
+        if t_mean > 0:
+            t_var = sum((v - t_mean) ** 2 for v in temp_vals) / len(temp_vals)
+            t_cv = math.sqrt(t_var) / t_mean
+            metrics["temperature_cv"] = t_cv
+            if t_cv > temp_cv_max:
+                reasons.append(f"temperature_cv={t_cv:.4f} > {temp_cv_max}")
+
+    # Force drift (if Press data available as proxy)
+    force_limit = float(thresholds.get("force_drift_rel_max", 1.0e-3))
+    base_press = base_series.get("Press", [])
+    cand_press = cand_series.get("Press", [])
+    if len(base_press) >= 2 and len(cand_press) >= 2:
+        count = min(len(base_press), len(cand_press))
+        diffs = [abs(cand_press[-count + i] - base_press[-count + i]) for i in range(count)]
+        base_mag = max(max(abs(v) for v in base_press[-count:]), 1.0e-12)
+        max_rel = max(diffs) / base_mag
+        metrics["press_drift_rel"] = max_rel
+        if max_rel > force_limit:
+            reasons.append(f"press_drift_rel={max_rel:.2e} > {force_limit:.2e}")
+
+    if reasons:
+        status = "FAIL"
+        summary = "LAMMPS drift: " + "; ".join(reasons)
+    else:
+        status = "PASS"
+        summary = "LAMMPS output within drift thresholds"
+
+    return DriftReport(
+        status=status,
+        drift_metrics=metrics,
+        summary=summary,
+        details={
+            "baseline_keys": list(base_series.keys()),
+            "candidate_keys": list(cand_series.keys()),
+        },
+        thresholds_used=thresholds,
+    )
+
+
+def _rel_drift(values: List[float]) -> float:
+    """Relative drift: (last - first) / |first|."""
+    if len(values) < 2:
+        return 0.0
+    denom = abs(values[0]) if abs(values[0]) > 1.0e-12 else 1.0
+    return (values[-1] - values[0]) / denom
 
 
 def ensure_log_path(run_args: List[str], run_dir: Path) -> List[str]:

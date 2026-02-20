@@ -75,7 +75,10 @@ class PatchPlannerAgent:
                     raise LLMUnavailableError("PatchPlannerAgent returned invalid PatchPlan JSON")
                 return None
         if result.status != "OK" and self.llm_client.config.strict_availability:
-            raise LLMUnavailableError(f"PatchPlannerAgent returned non-OK status: {result.status}")
+            if result.status not in {"NEED_MORE_CONTEXT", "NO_ACTIONABLE"}:
+                raise LLMUnavailableError(
+                    f"PatchPlannerAgent returned non-OK status: {result.status}"
+                )
         return result
 
     def plan_from_opportunity_selection(

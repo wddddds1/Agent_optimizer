@@ -173,6 +173,8 @@ def _resolved_agent_llm_cfg(base_llm_cfg: dict, block_cfg: dict) -> dict:
         "model": str(block_cfg.get("model") or base_llm_cfg.get("model", "")),
         "temperature": float(base_llm_cfg.get("temperature", 0.0)),
         "max_tokens": int(base_llm_cfg.get("max_tokens", 64)),
+        "request_timeout_sec": float(base_llm_cfg.get("request_timeout_sec", 60.0)),
+        "api_timeout_retries": int(base_llm_cfg.get("api_timeout_retries", 2)),
         "strict_availability": bool(
             block_cfg.get(
                 "strict_availability",
@@ -227,6 +229,8 @@ def _run_llm_preflight(targets: List[Tuple[str, dict]]) -> None:
             model=str(cfg.get("model", "deepseek-chat")),
             temperature=0.0,
             max_tokens=8,
+            request_timeout_sec=float(cfg.get("request_timeout_sec", 60.0)),
+            api_timeout_retries=int(cfg.get("api_timeout_retries", 2)),
             strict_availability=bool(cfg.get("strict_availability", True)),
         )
         client = LLMClient(probe_cfg)
@@ -552,6 +556,8 @@ def main() -> None:
         model=llm_cfg_raw.get("model", "deepseek-chat"),
         temperature=float(llm_cfg_raw.get("temperature", 0.0)),
         max_tokens=int(llm_cfg_raw.get("max_tokens", 512)),
+        request_timeout_sec=float(llm_cfg_raw.get("request_timeout_sec", 60.0)),
+        api_timeout_retries=int(llm_cfg_raw.get("api_timeout_retries", 2)),
         strict_availability=bool(llm_cfg_raw.get("strict_availability", True)),
     )
     llm_client = LLMClient(llm_config)

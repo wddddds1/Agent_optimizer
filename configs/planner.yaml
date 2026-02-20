@@ -7,6 +7,11 @@ defaults:
   chain_min_improvement_pct: 0.0
   profile_each_iteration: true
   profile_probe_repeats: 1
+  profile_probe_on_best_change_only: true
+  chain_within_iteration: true
+  simple_patch_loop:
+    enabled: true
+    max_candidates_per_iteration: 5
   evaluation:
     baseline_repeats: 1
     candidate_repeats_stage0: 1
@@ -93,15 +98,19 @@ defaults:
     case_match_boost: 1.3
     backend_mismatch_penalty: 0.7
   memory_replay:
-    enabled: true
+    enabled: false
     max_actions: 6
     min_gain_pct: 1.0
+    check_on_clean_head: true
+  strict_patch_generation: false
   # Agentic code patching: multi-turn LLM with tool use for better code understanding
   agentic_code_patch:
     enabled: false
     api_key_env: "DEEPSEEK_API_KEY"
     base_url: "https://api.deepseek.com"
     model: "deepseek-chat"
+    request_timeout_sec: 120
+    api_timeout_retries: 2
     max_turns: 25
     max_tool_calls_per_turn: 5
   orchestrator_agent:
@@ -109,6 +118,8 @@ defaults:
     api_key_env: "DEEPSEEK_API_KEY"
     base_url: "https://api.deepseek.com"
     model: "deepseek-chat"
+    request_timeout_sec: 120
+    api_timeout_retries: 2
     temperature: 0.3
     max_tokens: 4096
     max_turns: 30
@@ -121,9 +132,11 @@ defaults:
       api_key_env: "DEEPSEEK_API_KEY"
       base_url: "https://api.deepseek.com"
       model: "deepseek-chat"
+      request_timeout_sec: 0
+      api_timeout_retries: 2
       temperature: 0.3
-      max_turns: 30
-      max_tool_calls_per_turn: 5
+      max_turns: 12
+      max_tool_calls_per_turn: 3
       max_candidates: 15
     phase1_cache:
       enabled: true
@@ -135,9 +148,14 @@ defaults:
       strict_required: false
       top_k: 8
       max_context_retry: 1
+      discovery_timeout_sec: 0
+      refresh_discovery_timeout_sec: 0
+      refresh_each_iteration: true
       api_key_env: "DEEPSEEK_API_KEY"
       base_url: "https://api.deepseek.com"
       model: "deepseek-chat"
+      request_timeout_sec: 120
+      api_timeout_retries: 2
       temperature: 0.3
       max_tokens: 4096
       max_turns: 30
@@ -145,12 +163,48 @@ defaults:
       selection_policy:
         cost_penalty_power: 0.65
         cost_penalty_weight: 0.7
-        macro_quota_ratio: 0.6
-        macro_quota_min: 2
-        algorithmic_quota_min: 1
+        macro_priority_bonus: 0.28
+        algorithmic_priority_bonus: 0.14
+        micro_penalty: 0.12
+        untested_bonus: 0.06
+        retested_penalty: 0.05
+        macro_guard_top_n: 2
+        macro_guard_min: 2
+        macro_guard_max_relative_gap: 0.5
     code_optimization:
       enabled: true
       max_iterations: 5
+  patch_sub_phases:
+    enabled: true
+    phases:
+      - id: "ALGO"
+        label: "Algorithm/Semantic"
+        max_iters: 5
+        no_improve_patience: 2
+        allowed_families:
+          - "algorithmic"
+          - "data_layout"
+          - "communication_pattern"
+      - id: "DATAFLOW"
+        label: "Data Flow/Access"
+        max_iters: 5
+        no_improve_patience: 2
+        allowed_families:
+          - "memory_path"
+          - "cache_blocking"
+          - "vectorization"
+          - "data_reuse"
+      - id: "MICRO"
+        label: "Instruction/Loop-Level"
+        max_iters: null  # uses remaining budget
+        no_improve_patience: 2
+        allowed_families:
+          - "loop_fusion"
+          - "loop_interchange"
+          - "branch_opt"
+          - "strength_reduction"
+          - "compiler_assist"
+          - "novel"
   batch_selection:
     enabled: true
     enable_for_opportunity_graph: true
@@ -252,7 +306,7 @@ profiles:
       case_match_boost: 1.4
       backend_mismatch_penalty: 0.7
     memory_replay:
-      enabled: true
+      enabled: false
       max_actions: 6
       min_gain_pct: 1.0
     agentic_code_patch:

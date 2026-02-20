@@ -45,7 +45,58 @@ def parse_lammps_timing(log_text: str) -> Dict[str, float]:
     return breakdown
 
 
+def _parse_time_output_gnu(time_text: str) -> Dict[str, float]:
+    """Parse GNU /usr/bin/time -v output (Linux)."""
+    metrics: Dict[str, float] = {}
+    for line in time_text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        m = re.match(r"(.+?):\s+(.+)$", line)
+        if not m:
+            continue
+        label = m.group(1).strip().lower()
+        raw = m.group(2).strip()
+        # Wall clock — format "h:mm:ss" or "m:ss.ss"
+        wc = re.match(r"(?:(\d+):)?(\d+):([0-9.]+)", raw)
+        if label.startswith("elapsed (wall clock)") and wc:
+            h = int(wc.group(1) or 0)
+            mins = int(wc.group(2))
+            secs = float(wc.group(3))
+            metrics["time_real_sec"] = h * 3600 + mins * 60 + secs
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if label.startswith("user time"):
+            metrics["time_user_sec"] = value
+        elif label.startswith("system time"):
+            metrics["time_sys_sec"] = value
+        elif label.startswith("maximum resident set size"):
+            # GNU time reports kbytes on Linux
+            metrics["rss_mb"] = value / 1024.0
+        elif label.startswith("major (requiring i/o) page faults"):
+            metrics["page_faults"] = value
+        elif label.startswith("file system inputs"):
+            metrics["block_in"] = value
+        elif label.startswith("file system outputs"):
+            metrics["block_out"] = value
+        elif label.startswith("voluntary context switches"):
+            metrics["voluntary_ctx_switches"] = value
+        elif label.startswith("involuntary context switches"):
+            metrics["involuntary_ctx_switches"] = value
+    if "block_in" in metrics or "block_out" in metrics:
+        metrics["io_blocks"] = metrics.get("block_in", 0.0) + metrics.get("block_out", 0.0)
+        metrics["io_bytes"] = metrics["io_blocks"] * 512.0
+    return metrics
+
+
 def parse_time_output(time_text: str) -> Dict[str, float]:
+    # Detect GNU time -v format (Linux) by looking for its distinctive labels
+    if "Maximum resident set size (kbytes)" in time_text or "Elapsed (wall clock)" in time_text:
+        return _parse_time_output_gnu(time_text)
+    # macOS /usr/bin/time -l format
     metrics: Dict[str, float] = {}
     for line in time_text.splitlines():
         line = line.strip()

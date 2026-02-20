@@ -111,6 +111,7 @@ class CodeOptimizationTools:
         self._patch_created_this_session: bool = False
         self._last_build_errors: Optional[str] = None
         self._benchmark_input: Optional[str] = None  # Path to benchmark input script
+        self._last_structured_remarks: Optional[Dict[str, Any]] = None
         self._shell_tool = ShellTool(cwd=repo_root)
 
     def reset_session_state(self) -> None:
@@ -173,6 +174,7 @@ class CodeOptimizationTools:
 
             # === Compiler Analysis ===
             self._tool_get_compiler_opt_report(),
+            self._tool_get_structured_compiler_analysis(),
 
             # === Knowledge ===
             self._tool_get_reference_implementation(),
@@ -1542,6 +1544,15 @@ ACCESS PATTERN for tagint:
                     parts.append(f"\n## Other remarks:")
                     other = [l for l in opt_lines if l not in vectorized + missed]
                     parts.extend(other[:15])
+
+                # Store structured remarks for later retrieval
+                try:
+                    from skills.compiler_remark_parser import parse_and_aggregate
+                    structured = parse_and_aggregate(report)
+                    self._last_structured_remarks = structured.to_dict()
+                except Exception:
+                    pass
+
                 return "\n".join(parts)
 
             return None  # No useful remarks, fall through to guidance message
@@ -1662,12 +1673,44 @@ ACCESS PATTERN for tagint:
                 parts.append(f"\n## Other remarks ({len(other)} items):")
                 parts.extend(other[:20])
 
+            # Store structured remarks for later retrieval
+            try:
+                from skills.compiler_remark_parser import parse_and_aggregate
+                structured = parse_and_aggregate(report)
+                self._last_structured_remarks = structured.to_dict()
+            except Exception:
+                pass
+
             return "\n".join(parts)
 
         except subprocess.TimeoutExpired:
             return "Error: Compilation timed out"
         except Exception as e:
             return f"Error: {e}"
+
+    def _tool_get_structured_compiler_analysis(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="get_structured_compiler_analysis",
+            description=(
+                "Return structured, categorized compiler optimization feedback as JSON. "
+                "Must call get_compiler_opt_report first to populate the data. "
+                "Returns per-function summaries with vectorized/missed loops, "
+                "reasons for missed optimizations, and compiler gap analysis."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+            },
+            handler=self._handle_structured_compiler_analysis,
+        )
+
+    def _handle_structured_compiler_analysis(self) -> str:
+        if not self._last_structured_remarks:
+            return (
+                "No structured compiler analysis available. "
+                "Call get_compiler_opt_report on a source file first."
+            )
+        return json.dumps(self._last_structured_remarks, indent=2)
 
     def _tool_get_last_build_errors(self) -> ToolDefinition:
         return ToolDefinition(

@@ -86,6 +86,7 @@ def _apply_edit_to_text(text: str, edit: PatchEdit, path: str) -> str:
             edit.old_text,
             "" if edit.op == "delete" else edit.new_text,
             path,
+            anchor=anchor,
         )
     if edit.op in {"insert_before", "insert_after"}:
         if not edit.new_text:
@@ -186,7 +187,27 @@ def _map_norm_to_orig(original: str, normalized: str, norm_pos: int) -> int:
     return oi
 
 
-def _replace_block(text: str, old_text: str, new_text: str, path: str) -> str:
+def _replace_block(
+    text: str,
+    old_text: str,
+    new_text: str,
+    path: str,
+    anchor: str = "",
+) -> str:
+    exact = [m.start() for m in re.finditer(re.escape(old_text), text)]
+    if len(exact) == 1:
+        idx = exact[0]
+        return text[:idx] + new_text + text[idx + len(old_text):]
+    if len(exact) > 1 and anchor.strip():
+        anchor_pos = [m.start() for m in re.finditer(re.escape(anchor), text)]
+        if anchor_pos:
+            candidates = [
+                idx for idx in exact
+                if any(idx <= pos < idx + len(old_text) for pos in anchor_pos)
+            ]
+            if len(candidates) == 1:
+                idx = candidates[0]
+                return text[:idx] + new_text + text[idx + len(old_text):]
     idx, length = _fuzzy_find(text, old_text, path, label="old_text")
     return text[:idx] + new_text + text[idx + length:]
 

@@ -10,6 +10,7 @@ from schemas.action_ir import ActionIR
 from schemas.patch_edit_ir import PatchEditProposal
 from schemas.patch_proposal_ir import PatchProposal
 from schemas.profile_report import ProfileReport
+from orchestrator.agents.code_patch import try_disambiguate_edits
 from skills.patch_edit import StructuredEditError, apply_structured_edits
 from skills.profile_payload import build_profile_payload
 
@@ -101,9 +102,23 @@ class PatchDebugAgent:
         try:
             result = apply_structured_edits(repo_root, edit_proposal.edits, allowed_files)
         except StructuredEditError as exc:
-            patch_proposal.status = "NEED_MORE_CONTEXT"
-            patch_proposal.missing_fields = [f"edit_apply_failed: {exc}"]
-            return patch_proposal
+            message = str(exc)
+            adjusted = try_disambiguate_edits(
+                edit_proposal.edits, code_snippets, repo_root, message
+            )
+            if adjusted:
+                try:
+                    result = apply_structured_edits(
+                        repo_root, edit_proposal.edits, allowed_files
+                    )
+                except StructuredEditError as exc2:
+                    patch_proposal.status = "NEED_MORE_CONTEXT"
+                    patch_proposal.missing_fields = [f"edit_apply_failed: {exc2}"]
+                    return patch_proposal
+            else:
+                patch_proposal.status = "NEED_MORE_CONTEXT"
+                patch_proposal.missing_fields = [f"edit_apply_failed: {message}"]
+                return patch_proposal
         patch_proposal.patch_diff = result.patch_diff
         patch_proposal.touched_files = result.touched_files
         return patch_proposal
