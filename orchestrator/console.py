@@ -46,6 +46,18 @@ def _format_gain_pct_from_ratio(speedup_ratio: Optional[float]) -> str:
     return f"{(ratio - 1.0) * 100.0:+.2f}%"
 
 
+def _format_gain_pct_value(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not math.isfinite(v):
+        return "n/a"
+    return f"{v:+.2f}%"
+
+
 @dataclass
 class ConsoleUI:
     enabled: bool = True
@@ -352,15 +364,26 @@ class ConsoleUI:
         baseline_gain_str = _format_gain_pct_from_ratio(speedup)
 
         runtime = exp.results.runtime_seconds
-        speedup_vs_current_best = None
-        if (
-            passed
-            and self.current_best_runtime is not None
-            and self.current_best_runtime > 0
-            and runtime > 0
-        ):
-            speedup_vs_current_best = self.current_best_runtime / runtime
-        current_best_gain_str = _format_gain_pct_from_ratio(speedup_vs_current_best)
+        current_best_gain = None
+        raw_improvement = exp.results.derived_metrics.get("improvement_vs_base_pct")
+        if passed:
+            try:
+                if raw_improvement is not None:
+                    current_best_gain = float(raw_improvement)
+            except (TypeError, ValueError):
+                current_best_gain = None
+        if current_best_gain is None:
+            speedup_vs_current_best = None
+            if (
+                passed
+                and self.current_best_runtime is not None
+                and self.current_best_runtime > 0
+                and runtime > 0
+            ):
+                speedup_vs_current_best = self.current_best_runtime / runtime
+            current_best_gain_str = _format_gain_pct_from_ratio(speedup_vs_current_best)
+        else:
+            current_best_gain_str = _format_gain_pct_value(current_best_gain)
         variance_cv = _extract_variance_cv(exp)
         correctness = exp.results.correctness_metrics.get("correctness_skipped_reason")
         lines = [
@@ -376,10 +399,6 @@ class ConsoleUI:
         if exp.reasons:
             lines.append(f"原因: {', '.join(exp.reasons)}")
         self._agent("VerifierAgent", lines)
-        if passed and runtime > 0 and (
-            self.current_best_runtime is None or runtime < self.current_best_runtime
-        ):
-            self.current_best_runtime = runtime
 
     def iteration_summary(
         self,

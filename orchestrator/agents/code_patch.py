@@ -14,6 +14,7 @@ from schemas.action_ir import ActionIR
 from schemas.patch_edit_ir import PatchEdit, PatchEditProposal
 from schemas.patch_proposal_ir import PatchProposal
 from schemas.profile_report import ProfileReport
+from skills.applications import validate_patch_edits as app_validate_patch_edits
 from skills.patch_edit import StructuredEditError, apply_structured_edits
 from skills.profile_payload import build_profile_payload
 
@@ -35,6 +36,7 @@ class CodePatchAgent:
         backend_variant: Optional[str] = None,
         reference_template: Optional[Dict[str, str]] = None,
         navigation_hints: Optional[List[Dict[str, object]]] = None,
+        app: Optional[str] = None,
     ) -> Optional[PatchProposal]:
         if not self.llm_client or not self.llm_client.config.enabled:
             return None
@@ -115,157 +117,30 @@ class CodePatchAgent:
                     short_anchor = True
                     break
         if short_anchor:
-            patch_proposal.status = "NEED_MORE_CONTEXT"
-            patch_proposal.missing_fields = [
-                "anchor too short/ambiguous; include 2-3 exact lines around the target "
-                "to make it unique in the file"
-            ]
-            return patch_proposal
+            # Do not fail fast on short anchors. Try applying edits first and rely on
+            # structured-edit disambiguation/retry to recover concrete anchors from
+            # current source. This avoids dropping otherwise valid patches too early.
+            assumptions = list(patch_proposal.assumptions or [])
+            assumptions.append(
+                "anchor_was_short; will attempt apply/disambiguation before requesting more context"
+            )
+            patch_proposal.assumptions = assumptions
         patch_family = None
         if action.parameters:
             patch_family = action.parameters.get("patch_family")
-        if patch_family == "param_table_pack":
-            added_text = "\n".join(edit.new_text or "" for edit in edit_proposal.edits)
-            has_malloc = "malloc" in added_text or "free" in added_text
-            has_include = "#include <cstdlib>" in added_text or "#include <stdlib.h>" in added_text
-            if has_malloc and not has_include:
-                include_anchor = None
-                include_file = None
-                for snippet in code_snippets or []:
-                    snippet_text = snippet.get("snippet") or ""
-                    for line in snippet_text.splitlines():
-                        if line.strip().startswith("#include"):
-                            include_anchor = line
-                            include_file = snippet.get("path")
-                            break
-                    if include_anchor:
-                        break
-                if include_anchor and include_file:
-                    edit_proposal.edits.insert(
-                        0,
-                        PatchEdit(
-                            file=include_file,
-                            op="insert_before",
-                            anchor=include_anchor,
-                            new_text="#include <cstdlib>\n",
-                        ),
-                    )
-                    added_text = "#include <cstdlib>\n" + added_text
-                    has_include = True
-            if has_malloc and not has_include:
-                patch_proposal.status = "NEED_MORE_CONTEXT"
-                patch_proposal.missing_fields = [
-                    "param_table_pack requires adding `#include <cstdlib>` "
-                    "and using std::malloc/std::free"
-                ]
-                return patch_proposal
-            if has_malloc and "std::malloc" not in added_text and "std::free" not in added_text:
-                patch_proposal.status = "NEED_MORE_CONTEXT"
-                patch_proposal.missing_fields = [
-                    "param_table_pack must use std::malloc/std::free (not raw malloc/free) with <cstdlib>"
-                ]
-                return patch_proposal
-            # Ensure allocation happens BEFORE the outer loop, not inside it.
-            needs_outer_anchor = any(
-                "tabsix" in (edit.new_text or "") or "fast_alpha_t" in (edit.new_text or "")
-                for edit in edit_proposal.edits
+        # App-specific structural validation (delegated to plugin)
+        if app:
+            validation_result = app_validate_patch_edits(
+                app,
+                edit_proposal,
+                patch_family=patch_family,
+                uses_dbl3=uses_dbl3,
+                code_snippets=code_snippets,
             )
-            if needs_outer_anchor:
-                anchor_ctx = "\n".join(
-                    (edit.anchor or "") + "\n" + (edit.old_text or "")
-                    for edit in edit_proposal.edits
-                )
-                if "for (int ii" not in anchor_ctx and "for (ii" not in anchor_ctx:
-                    patch_proposal.status = "NEED_MORE_CONTEXT"
-                    patch_proposal.missing_fields = [
-                        "param_table_pack must insert allocation BEFORE the outer `for (ii ...)` loop; "
-                        "use an anchor that includes the loop header"
-                    ]
-                    return patch_proposal
-            if "free(" in added_text:
-                anchor_ctx = "\n".join(
-                    (edit.anchor or "") + "\n" + (edit.old_text or "")
-                    for edit in edit_proposal.edits
-                )
-                if "f[i].z" not in anchor_ctx and "fztmp" not in anchor_ctx:
-                    patch_proposal.status = "NEED_MORE_CONTEXT"
-                    patch_proposal.missing_fields = [
-                        "param_table_pack must place free(tabsix) AFTER the outer loop; "
-                        "anchor near `f[i].z += fztmp;`"
-                    ]
-                    return patch_proposal
-        if patch_family == "special_pair_split":
-            has_replace_block = any(
-                edit.op == "replace"
-                and edit.old_text
-                and "factor_lj = special_lj" in edit.old_text
-                for edit in edit_proposal.edits
-            )
-            if not has_replace_block:
-                patch_proposal.status = "NEED_MORE_CONTEXT"
-                patch_proposal.missing_fields = [
-                    "special_pair_split must REPLACE the original block starting at "
-                    "`factor_lj = special_lj[sbmask(j)];` to avoid duplicate loops"
-                ]
+            if validation_result:
+                patch_proposal.status = validation_result["status"]
+                patch_proposal.missing_fields = validation_result["missing_fields"]
                 return patch_proposal
-            for edit in edit_proposal.edits:
-                if edit.op != "replace" or not edit.old_text:
-                    continue
-                if "factor_lj = special_lj" in edit.old_text:
-                    if "delx = xtmp - x[j].x" not in edit.old_text or "if (rsq <" not in edit.old_text:
-                        patch_proposal.status = "NEED_MORE_CONTEXT"
-                        patch_proposal.missing_fields = [
-                            "special_pair_split replacement must include the full original inner-loop body "
-                            "(delx/dely/delz, rsq, and the rsq<cutsq block) to avoid leaving duplicate code"
-                        ]
-                        return patch_proposal
-            added_text = "\n".join(edit.new_text or "" for edit in edit_proposal.edits)
-            if "x[j][" in added_text or "x[i][" in added_text:
-                patch_proposal.status = "NEED_MORE_CONTEXT"
-                patch_proposal.missing_fields = [
-                    "special_pair_split must use dbl3_t access (x[j].x/x[j].y/x[j].z), "
-                    "not x[j][0] indexing"
-                ]
-                return patch_proposal
-        if patch_family in {"cache_local_pointers", "cache_local_pointers_multi"}:
-            # Generic structural check: patch must both declare a cached
-            # local variable AND replace at least one original access.
-            has_cache_decl = any(
-                re.search(
-                    r"(?:const\s+)?(?:auto|double|int|float)\s*[*&]?\s*\w+\s*=",
-                    edit.new_text or "",
-                )
-                for edit in edit_proposal.edits
-                if edit.op in ("insert_before", "insert_after")
-            )
-            has_use_replacement = any(
-                edit.op == "replace" and edit.old_text and edit.new_text
-                and edit.new_text != edit.old_text
-                for edit in edit_proposal.edits
-            )
-            if not has_cache_decl or not has_use_replacement:
-                patch_proposal.status = "NEED_MORE_CONTEXT"
-                patch_proposal.missing_fields = [
-                    "cache_local_pointers requires both a local cache declaration "
-                    "AND replacement of original array accesses"
-                ]
-                return patch_proposal
-            # dbl3_t backend check: reject `double *xi = x[i]` pattern
-            # (should use `const auto &xi = x[i]` for dbl3_t arrays)
-            if uses_dbl3:
-                added_text = "\n".join(
-                    edit.new_text or "" for edit in edit_proposal.edits
-                )
-                if re.search(
-                    r"\bconst?\s+double\s*\*+\s*\w+\s*=\s*\w+\[",
-                    added_text,
-                ):
-                    patch_proposal.status = "NEED_MORE_CONTEXT"
-                    patch_proposal.missing_fields = [
-                        "OMP backend uses dbl3_t; cache arrays as refs "
-                        "(e.g., `const auto &xj = x[j];`), not double*"
-                    ]
-                    return patch_proposal
         try:
             result = apply_structured_edits(repo_root, edit_proposal.edits, allowed_files)
         except StructuredEditError as exc:
@@ -378,6 +253,17 @@ def try_disambiguate_edits(
                 best_idx = i
         if best_idx is not None and best_score >= 0.88:
             matches.append(best_idx)
+    # Final fallback for old_text_not_found:
+    # use the edit's anchor to localize search and recover a near-by block.
+    if not matches and label == "old_text":
+        recovered = _recover_old_text_by_anchor(
+            edits=edits,
+            path=path,
+            old_text=anchor,
+            file_lines=lines,
+        )
+        if recovered:
+            return True
     if not matches:
         return False
     preferred = None
@@ -414,4 +300,76 @@ def try_disambiguate_edits(
                         if first_line:
                             edit.anchor = first_line
             return True
+    return False
+
+
+def _recover_old_text_by_anchor(
+    edits: List[PatchEdit],
+    path: str,
+    old_text: str,
+    file_lines: List[str],
+) -> bool:
+    old_lines = [line for line in old_text.splitlines() if line.strip()]
+    if not old_lines:
+        return False
+    old_norm = "\n".join(line.strip() for line in old_lines)
+    old_len = len(old_lines)
+    text = "\n".join(file_lines)
+
+    def _find_line_sequence(seq_lines: List[str]) -> List[int]:
+        if not seq_lines:
+            return []
+        stripped = [line.rstrip() for line in file_lines]
+        needle = [line.rstrip() for line in seq_lines]
+        hits: List[int] = []
+        for i in range(len(stripped) - len(needle) + 1):
+            if stripped[i : i + len(needle)] == needle:
+                hits.append(i)
+        return hits
+
+    for edit in edits:
+        if edit.file != path or edit.old_text != old_text:
+            continue
+        anchor_text = (edit.anchor or "").strip()
+        if not anchor_text:
+            continue
+        anchor_lines = [line for line in anchor_text.splitlines() if line.strip()]
+        if not anchor_lines:
+            continue
+        anchor_hits = _find_line_sequence(anchor_lines)
+        if len(anchor_hits) != 1:
+            continue
+        anchor_start = anchor_hits[0]
+        # Search windows near the anchor with slightly variable span.
+        best_block = ""
+        best_score = 0.0
+        for delta in range(-4, 7):
+            span = max(1, old_len + delta)
+            for shift in range(-6, 7):
+                start = max(0, anchor_start + shift)
+                end = min(len(file_lines), start + span)
+                if end <= start:
+                    continue
+                block_lines = file_lines[start:end]
+                block = "\n".join(block_lines)
+                norm = "\n".join(line.strip() for line in block_lines if line.strip())
+                if not norm:
+                    continue
+                score = difflib.SequenceMatcher(None, old_norm, norm).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_block = block
+        # Conservative threshold: enough to recover minor drift without
+        # applying unrelated edits.
+        if best_block and best_score >= 0.62:
+            if len(re.findall(re.escape(best_block), text)) == 1:
+                edit.old_text = best_block
+                if edit.anchor and edit.anchor not in best_block:
+                    first_line = next(
+                        (line for line in best_block.splitlines() if line.strip()),
+                        "",
+                    )
+                    if first_line:
+                        edit.anchor = first_line
+                return True
     return False

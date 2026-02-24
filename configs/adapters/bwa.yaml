@@ -55,6 +55,7 @@ domain_knowledge:
 
 drift:
   drift_repair_max_attempts: 2
+  drift_repair_min_improvement_pct: 1.0
   thresholds:
     mapped_rate_delta_max: 0.001
     mean_nm_delta_max: 0.5
@@ -72,7 +73,7 @@ patch_rules:
   max_files_changed: 10
   max_snippets: 12
   max_context_chars: 120000
-  debug_max_attempts: 2
+  debug_max_attempts: 4
   runtime_crash_debug_max_attempts: 4
   scope_levels:
     global:

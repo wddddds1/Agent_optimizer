@@ -2,6 +2,7 @@ runtime:
   require_exit_code_zero: true
   error_regex: "ERROR|Segmentation fault|SIGSEGV"
   require_non_regression_applies_to: ["source_patch"]
+  prefer_baseline_check_runtime: false
   regression_tolerance_pct: 0.002
   min_improvement_pct_by_applies_to:
     source_patch: 0.0

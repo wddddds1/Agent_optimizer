@@ -6,7 +6,7 @@ You are IdeaAgent.
 
 输入
 - job: app/case_id/tags
-- input_summary: 输入脚本关键配置（pair_style/kspace_style/neighbor/thermo/comm_modify/newton 等）
+- input_summary: 输入配置摘要（应用特定的关键参数）
 - profile: timing_breakdown + system_metrics
 - profile_features: ratios + bottleneck_tags
 - hotspot_map: 可能热点文件/模块

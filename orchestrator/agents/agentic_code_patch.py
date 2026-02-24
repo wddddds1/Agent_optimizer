@@ -31,12 +31,13 @@ class AgenticCodePatchAgent:
         max_tool_calls_per_turn: int = 5,
         max_invalid_tool_calls_total: int = 5,
         max_invalid_tool_calls_per_tool: int = 2,
-        request_timeout_sec: float = 120.0,
+        request_timeout_sec: float = 0.0,
         api_timeout_retries: int = 2,
     ) -> None:
         self.repo_root = repo_root
         self.enabled = enabled
         self.last_trace: Optional[Dict[str, Any]] = None
+        self._request_timeout_sec = max(0.0, float(request_timeout_sec or 0.0))
 
         if not enabled:
             self.agent = None
@@ -53,7 +54,7 @@ class AgenticCodePatchAgent:
             max_tool_calls_per_turn=max_tool_calls_per_turn,
             max_invalid_tool_calls_total=max_invalid_tool_calls_total,
             max_invalid_tool_calls_per_tool=max_invalid_tool_calls_per_tool,
-            request_timeout_sec=request_timeout_sec,
+            request_timeout_sec=self._request_timeout_sec,
             api_timeout_retries=api_timeout_retries,
         )
 
@@ -118,6 +119,7 @@ class AgenticCodePatchAgent:
         backend_variant: Optional[str] = None,
         reference_template: Optional[Dict[str, str]] = None,
         navigation_hints: Optional[List[Dict[str, object]]] = None,
+        app: Optional[str] = None,
     ) -> Optional[PatchProposal]:
         """Generate a patch proposal using the agentic approach.
 
@@ -318,7 +320,7 @@ class AgenticCodePatchAgent:
                 input=patch_diff,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=(self._request_timeout_sec if self._request_timeout_sec > 0 else None),
                 cwd=str(self.repo_root),
             )
             if proc.returncode == 0 and proc.stdout:
@@ -358,7 +360,7 @@ def create_agentic_code_patch_agent(
             - max_tool_calls_per_turn: Maximum tool calls per turn (default 5)
             - max_invalid_tool_calls_total: Max invalid tool calls before hard fail
             - max_invalid_tool_calls_per_tool: Max consecutive invalid calls per tool
-            - request_timeout_sec: Per-request timeout in seconds (default 120)
+            - request_timeout_sec: Per-request timeout in seconds (default 0; disabled)
             - api_timeout_retries: Extra retries for retryable timeout/network errors
 
     Returns:
@@ -377,6 +379,6 @@ def create_agentic_code_patch_agent(
         max_tool_calls_per_turn=int(config.get("max_tool_calls_per_turn", 5)),
         max_invalid_tool_calls_total=int(config.get("max_invalid_tool_calls_total", 5)),
         max_invalid_tool_calls_per_tool=int(config.get("max_invalid_tool_calls_per_tool", 2)),
-        request_timeout_sec=float(config.get("request_timeout_sec", 120.0)),
+        request_timeout_sec=float(config.get("request_timeout_sec", 0.0)),
         api_timeout_retries=int(config.get("api_timeout_retries", 2)),
     )

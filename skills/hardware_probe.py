@@ -163,7 +163,7 @@ def _probe_mpi_runtime() -> Dict[str, object]:
                     [path, "--version"],
                     capture_output=True,
                     text=True,
-                    timeout=5,
+                    timeout=None,
                 )
                 version_text = (result.stdout + result.stderr).strip().split("\n")[0]
             except Exception:
@@ -195,12 +195,12 @@ def check_binary_mpi_support(binary_path: str) -> bool:
         if system == "Darwin":
             result = subprocess.run(
                 ["otool", "-L", str(binary)],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=None,
             )
         else:
             result = subprocess.run(
                 ["ldd", str(binary)],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=None,
             )
         output = result.stdout.lower()
         mpi_markers = ["libmpi", "libpmpi", "libmpich", "libmsmpi"]

@@ -11,6 +11,9 @@ from typing import Any, Dict, List, Optional
 from orchestrator.agent_llm import ToolDefinition
 from skills.shell_tool import ShellTool
 
+_TOOL_TIMEOUT_RAW = float(os.environ.get("AGENT_TOOL_TIMEOUT_SEC", "0") or 0)
+TOOL_TIMEOUT_SEC: Optional[float] = _TOOL_TIMEOUT_RAW if _TOOL_TIMEOUT_RAW > 0 else None
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers for compiler optimization reports
@@ -282,7 +285,10 @@ class CodeOptimizationTools:
     ) -> str:
         search_path = self.repo_root / path if path else self.repo_root
 
-        cmd = ["grep", "-rn", f"-C{context_lines}", "-E", pattern]
+        cmd = ["grep", "-rn", f"-C{context_lines}", "-E",
+               "--exclude-dir=artifacts", "--exclude-dir=.git",
+               "--exclude-dir=build", "--exclude-dir=__pycache__",
+               pattern]
         if file_pattern:
             cmd.extend(["--include", file_pattern])
         cmd.append(str(search_path))
@@ -292,7 +298,7 @@ class CodeOptimizationTools:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=TOOL_TIMEOUT_SEC,
                 cwd=self.repo_root,
             )
             output = result.stdout.strip()
@@ -321,7 +327,7 @@ class CodeOptimizationTools:
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "File name pattern, e.g., 'pair_*.cpp' or '*_omp.cpp'"
+                        "description": "File name pattern, e.g., '*.cpp' or 'main_*.c'"
                     },
                     "path": {
                         "type": "string",
@@ -341,7 +347,14 @@ class CodeOptimizationTools:
         search_path = self.repo_root / path if path else self.repo_root
 
         try:
-            matches = list(search_path.rglob(pattern))
+            # Exclude artifacts, .git, and build directories to avoid noise
+            _EXCLUDE_DIRS = {"artifacts", ".git", "build", "__pycache__"}
+            matches = [
+                m for m in search_path.rglob(pattern)
+                if not _EXCLUDE_DIRS.intersection(
+                    m.relative_to(self.repo_root).parts
+                )
+            ]
             if not matches:
                 return f"No files found matching: {pattern}"
 
@@ -432,7 +445,7 @@ class CodeOptimizationTools:
                 "properties": {
                     "type_name": {
                         "type": "string",
-                        "description": "Name of the type to find, e.g., 'dbl3_t', 'PairLJCut'"
+                        "description": "Name of the type to find, e.g., 'my_struct_t', 'SolverClass'"
                     }
                 },
                 "required": ["type_name"]
@@ -441,35 +454,32 @@ class CodeOptimizationTools:
         )
 
     def _handle_get_type_definition(self, type_name: str) -> str:
-        # Search for type definition
+        # Search for type definition — multiple patterns for C/C++ styles
         patterns = [
-            f"(struct|class|typedef|using)\\s+{type_name}\\b",
+            f"(struct|class|typedef|using|enum)\\s+{type_name}\\b",
             f"#define\\s+{type_name}\\b",
+            # C-style: typedef struct { ... } type_name;
+            f"\\}}\\s*{type_name}\\s*;",
         ]
 
-        for pattern in patterns:
-            result = self._handle_grep(pattern, file_pattern="*.h", context_lines=10)
-            if "No matches found" not in result and "Error" not in result:
-                return f"Definition of {type_name}:\n\n{result}"
-
-        # Also check cpp files
-        for pattern in patterns:
-            result = self._handle_grep(pattern, file_pattern="*.cpp", context_lines=10)
-            if "No matches found" not in result and "Error" not in result:
-                return f"Definition of {type_name}:\n\n{result}"
+        for ext in ("*.h", "*.hpp", "*.cpp", "*.c"):
+            for pattern in patterns:
+                result = self._handle_grep(pattern, file_pattern=ext, context_lines=10)
+                if "No matches found" not in result and "Error" not in result:
+                    return f"Definition of {type_name}:\n\n{result}"
 
         return f"Could not find definition of type: {type_name}"
 
     def _tool_get_type_layout(self) -> ToolDefinition:
         return ToolDefinition(
             name="get_type_layout",
-            description="Get the memory layout of a struct/class including field offsets and sizes. Critical for understanding data access patterns like dbl3_t.",
+            description="Get the memory layout of a struct/class including field offsets and sizes. Critical for understanding data access patterns.",
             parameters={
                 "type": "object",
                 "properties": {
                     "type_name": {
                         "type": "string",
-                        "description": "Name of the type, e.g., 'dbl3_t', 'Atom'"
+                        "description": "Name of the type to inspect"
                     }
                 },
                 "required": ["type_name"]
@@ -487,28 +497,6 @@ class CodeOptimizationTools:
         # Extract struct/class body to show fields
         result = [f"Type layout for {type_name}:\n"]
         result.append(type_def)
-
-        # Add usage hints for common types
-        known_layouts = {
-            "dbl3_t": """
-ACCESS PATTERN for dbl3_t (OpenMP coordinate type):
-  - This is a struct with fields: x, y, z (NOT an array!)
-  - CORRECT:   x[j].x, x[j].y, x[j].z
-  - WRONG:     x[j][0], x[j][1], x[j][2]
-  - WRONG:     x[3*j], x[3*j+1], x[3*j+2]
-""",
-            "flt_t": """
-ACCESS PATTERN for flt_t:
-  - Alias for float in LAMMPS single-precision builds
-""",
-            "tagint": """
-ACCESS PATTERN for tagint:
-  - 32 or 64-bit integer depending on LAMMPS_BIGBIG compile flag
-""",
-        }
-
-        if type_name in known_layouts:
-            result.append(known_layouts[type_name])
 
         return "\n".join(result)
 
@@ -636,7 +624,7 @@ ACCESS PATTERN for tagint:
                 "properties": {
                     "macro_name": {
                         "type": "string",
-                        "description": "Name of the macro, e.g., 'NEIGHMASK', 'sbmask'"
+                        "description": "Name of the macro to find"
                     }
                 },
                 "required": ["macro_name"]
@@ -707,12 +695,10 @@ ACCESS PATTERN for tagint:
                 patterns = [
                     r"CMAKE_CXX_FLAGS:STRING=(.*)",
                     r"CMAKE_CXX_FLAGS_RELEASE:STRING=(.*)",
+                    r"CMAKE_C_FLAGS:STRING=(.*)",
                     r"CMAKE_C_COMPILER:FILEPATH=(.*)",
                     r"CMAKE_CXX_COMPILER:FILEPATH=(.*)",
                     r"OpenMP_CXX_FLAGS:STRING=(.*)",
-                    r"PKG_OPENMP:BOOL=(.*)",
-                    r"PKG_OPT:BOOL=(.*)",
-                    r"PKG_INTEL:BOOL=(.*)",
                 ]
                 result.append("\nCMake configuration:")
                 for pattern in patterns:
@@ -730,13 +716,13 @@ ACCESS PATTERN for tagint:
     def _tool_get_build_target_files(self) -> ToolDefinition:
         return ToolDefinition(
             name="get_build_target_files",
-            description="Get the source files that are compiled into the current build target. Helps identify which backend files are used (OMP/OPT/INTEL).",
+            description="Get the source files that are compiled into the current build target.",
             parameters={
                 "type": "object",
                 "properties": {
                     "filter_pattern": {
                         "type": "string",
-                        "description": "Filter files by pattern, e.g., 'pair_' to show only pair style files"
+                        "description": "Filter files by pattern substring"
                     }
                 }
             },
@@ -786,65 +772,66 @@ ACCESS PATTERN for tagint:
     def _tool_resolve_backend(self) -> ToolDefinition:
         return ToolDefinition(
             name="resolve_backend",
-            description="Determine which implementation file is actually used for a pair style given the build configuration.",
+            description="Determine which implementation variant of a source file is used given the build configuration.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "pair_style": {
+                    "source_name": {
                         "type": "string",
-                        "description": "Pair style name, e.g., 'lj/cut', 'lj/cut/omp'"
+                        "description": "Base name of the source file or module to resolve"
                     }
                 },
-                "required": ["pair_style"]
+                "required": ["source_name"]
             },
             handler=self._handle_resolve_backend,
         )
 
-    def _handle_resolve_backend(self, pair_style: str) -> str:
-        # Convert pair style name to file name pattern
-        # lj/cut -> pair_lj_cut, lj/cut/omp -> pair_lj_cut_omp
-        base_name = "pair_" + pair_style.replace("/", "_")
+    def _handle_resolve_backend(self, source_name: str) -> str:
+        base_name = source_name.replace("/", "_")
 
-        result = [f"Resolving backend for pair style: {pair_style}\n"]
+        result = [f"Resolving backend for: {source_name}\n"]
 
-        # Check what packages are enabled
+        # Check CMake configuration if available
         cmake_cache = self.build_dir / "CMakeCache.txt"
-        enabled_packages = []
         if cmake_cache.exists():
-            cache = cmake_cache.read_text()
-            for pkg in ["OPENMP", "OPT", "INTEL", "GPU", "KOKKOS"]:
-                if re.search(f"PKG_{pkg}:BOOL=ON", cache):
-                    enabled_packages.append(pkg)
-            result.append(f"Enabled packages: {', '.join(enabled_packages) or 'none'}")
+            try:
+                cache = cmake_cache.read_text()
+                # Extract any BOOL options that are ON
+                enabled = re.findall(r"(\w+):BOOL=ON", cache)
+                if enabled:
+                    result.append(f"Enabled CMake options: {', '.join(enabled[:20])}")
+            except Exception:
+                pass
 
         # Find all matching source files
         candidates = []
-        for pattern in [f"{base_name}.cpp", f"{base_name}_*.cpp"]:
-            found = list(self.repo_root.rglob(f"src/**/{pattern}"))
+        for pattern in [f"*{base_name}*.cpp", f"*{base_name}*.c"]:
+            found = [
+                m for m in self.repo_root.rglob(f"src/**/{pattern}")
+                if "artifacts" not in m.parts and ".git" not in m.parts
+            ]
             candidates.extend(found)
 
-        result.append(f"\nCandidate files found:")
-        for f in candidates:
-            rel = f.relative_to(self.repo_root)
-            # Determine which package it belongs to
-            pkg = "base"
-            for p in ["OPENMP", "OPT", "INTEL", "GPU", "KOKKOS"]:
-                if p in str(rel):
-                    pkg = p
-                    break
-
-            status = "✓ ACTIVE" if pkg == "base" or pkg in enabled_packages else "✗ disabled"
-            result.append(f"  {rel} [{pkg}] {status}")
+        if candidates:
+            result.append(f"\nCandidate files found:")
+            for f in candidates[:20]:
+                rel = f.relative_to(self.repo_root)
+                result.append(f"  {rel}")
+        else:
+            result.append(f"\nNo source files matching '{base_name}' found in src/")
 
         # Check compile_commands.json to see what's actually compiled
         compile_cmds = self.build_dir / "compile_commands.json"
         if compile_cmds.exists():
-            cmds = json.loads(compile_cmds.read_text())
-            compiled = [e["file"] for e in cmds if base_name in e.get("file", "")]
-            if compiled:
-                result.append(f"\nActually compiled:")
-                for f in compiled:
-                    result.append(f"  {f}")
+            try:
+                cmds = json.loads(compile_cmds.read_text())
+                compiled = [e["file"] for e in cmds if base_name in e.get("file", "")]
+                if compiled:
+                    result.append(f"\nActually compiled:")
+                    for f in compiled[:20]:
+                        result.append(f"  {f}")
+            except Exception:
+                pass
 
         return "\n".join(result)
 
@@ -899,10 +886,13 @@ ACCESS PATTERN for tagint:
         if object_file:
             exe_path = self.repo_root / object_file
         else:
-            # Try to find lmp executable
-            candidates = list(self.build_dir.rglob("lmp"))
+            # Try to find any executable in build directory
+            candidates = [
+                f for f in self.build_dir.iterdir()
+                if f.is_file() and os.access(f, os.X_OK)
+            ] if self.build_dir.exists() else []
             if not candidates:
-                return "Error: Could not find executable. Specify object_file."
+                return "Error: Could not find executable in build directory. Specify object_file."
             exe_path = candidates[0]
 
         if not exe_path.exists():
@@ -914,7 +904,7 @@ ACCESS PATTERN for tagint:
                 ["objdump", "-d", "-C", str(exe_path)],
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=TOOL_TIMEOUT_SEC,
             )
 
             output = result.stdout
@@ -1176,7 +1166,7 @@ ACCESS PATTERN for tagint:
                 capture_output=True,
                 text=True,
                 cwd=self.repo_root,
-                timeout=30,
+                timeout=TOOL_TIMEOUT_SEC,
             )
 
             if result.returncode == 0:
@@ -1221,7 +1211,7 @@ ACCESS PATTERN for tagint:
                 build_cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=TOOL_TIMEOUT_SEC,
                 cwd=self.repo_root,
             )
 
@@ -1331,7 +1321,7 @@ ACCESS PATTERN for tagint:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=120 if with_opt_report else 60,
+                timeout=TOOL_TIMEOUT_SEC,
                 cwd=cmd_entry.get("directory", str(self.repo_root)),
             )
 
@@ -1400,7 +1390,7 @@ ACCESS PATTERN for tagint:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120 if with_opt_report else 60,
+                timeout=TOOL_TIMEOUT_SEC,
                 cwd=str(self.repo_root),
             )
         except subprocess.TimeoutExpired:
@@ -1479,33 +1469,38 @@ ACCESS PATTERN for tagint:
     ) -> Optional[str]:
         """Try to generate optimization report without compile_commands.json.
 
-        Uses a basic clang command with typical LAMMPS flags. Returns None if
+        Uses a basic clang command with generic flags. Returns None if
         this approach fails too.
         """
-        # Try a basic clang compile with common LAMMPS-like flags
         try:
             # Detect if we have clang available
             result = subprocess.run(
                 ["clang++", "--version"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=TOOL_TIMEOUT_SEC,
             )
             if result.returncode != 0:
                 return None
 
-            # Construct a minimal compile command
-            include_dirs = [
-                str(self.repo_root / "src"),
-                str(self.repo_root / "src" / "OPENMP"),
-                str(self.repo_root / "src" / "KSPACE"),
-            ]
+            # Construct a minimal compile command — auto-discover include dirs
+            include_dirs = [str(self.repo_root / "src")]
+            # Add any subdirectories under src/ that exist
+            src_dir = self.repo_root / "src"
+            if src_dir.is_dir():
+                for sub in src_dir.iterdir():
+                    if sub.is_dir() and not sub.name.startswith("."):
+                        include_dirs.append(str(sub))
             include_flags = " ".join(f"-I{d}" for d in include_dirs if Path(d).exists())
 
+            # Use the file extension to pick C or C++ compiler
+            ext = full_path.suffix
+            compiler = "clang" if ext == ".c" else "clang++"
+            std_flag = "-std=c11" if ext == ".c" else "-std=c++11"
+
             cmd = (
-                f"clang++ -std=c++11 -O3 -march=native -fopenmp "
+                f"{compiler} {std_flag} -O3 -march=native "
                 f"{include_flags} "
-                f"-DLAMMPS_OMP -DLAMMPS_MEMALIGN=64 "
                 f"-Rpass=.* -Rpass-missed=.* -Rpass-analysis=.* "
                 f"-fsyntax-only {full_path}"
             )
@@ -1515,7 +1510,7 @@ ACCESS PATTERN for tagint:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=TOOL_TIMEOUT_SEC,
                 cwd=str(self.repo_root),
             )
 
@@ -1624,7 +1619,7 @@ ACCESS PATTERN for tagint:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=TOOL_TIMEOUT_SEC,
                 cwd=cmd_entry.get("directory", str(self.repo_root)),
             )
 
@@ -1781,36 +1776,26 @@ ACCESS PATTERN for tagint:
         # Limit steps for quick validation
         steps = min(steps, 200)
 
-        # Find lmp executable
-        exe_candidates = list(self.build_dir.rglob("lmp"))
-        if not exe_candidates:
-            return "Error: lmp executable not found in build directory"
-        lmp_exe = exe_candidates[0]
+        # Find executable in build directory
+        exe_path = None
+        if self.build_dir.exists():
+            for f in self.build_dir.iterdir():
+                if f.is_file() and os.access(f, os.X_OK):
+                    exe_path = f
+                    break
+        if not exe_path:
+            return "Error: No executable found in build directory"
 
         # Find input script
         input_script = self._benchmark_input
         if not input_script:
-            # Try to find a default input in examples
-            example_inputs = list(self.repo_root.glob("examples/**/in.*"))
-            if example_inputs:
-                input_script = str(example_inputs[0])
-            else:
-                return "Error: No benchmark input script configured. Set _benchmark_input."
+            return "Error: No benchmark input script configured. Set _benchmark_input."
 
         if not Path(input_script).exists():
             return f"Error: Input script not found: {input_script}"
 
         try:
-            import tempfile
             import time
-
-            # Create a modified input that runs fewer steps
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.in', delete=False) as f:
-                original = Path(input_script).read_text()
-                # Replace run command with shorter run
-                modified = re.sub(r'run\s+\d+', f'run {steps}', original)
-                f.write(modified)
-                temp_input = f.name
 
             env = {
                 **subprocess.os.environ,
@@ -1820,55 +1805,31 @@ ACCESS PATTERN for tagint:
             # Run with timing
             start_time = time.time()
             result = subprocess.run(
-                [str(lmp_exe), "-in", temp_input],
+                [str(exe_path)],
+                stdin=open(input_script) if Path(input_script).exists() else None,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=TOOL_TIMEOUT_SEC,
                 cwd=Path(input_script).parent,
                 env=env,
             )
             elapsed = time.time() - start_time
 
-            # Clean up
-            Path(temp_input).unlink(missing_ok=True)
-
             if result.returncode != 0:
-                return f"✗ Benchmark failed:\n{result.stderr[:1000]}"
+                return f"Benchmark failed (exit {result.returncode}):\n{result.stderr[:1000]}"
 
-            # Parse LAMMPS output for timing
-            output = result.stdout
-            timing_match = re.search(r"Loop time of ([\d.]+)", output)
-            loop_time = float(timing_match.group(1)) if timing_match else elapsed
+            return f"""Benchmark completed ({threads} threads):
 
-            # Extract performance metrics
-            perf_match = re.search(r"([\d.]+) timesteps/s", output)
-            timesteps_per_sec = float(perf_match.group(1)) if perf_match else steps / loop_time
+Wall time: {elapsed:.3f} s
 
-            # Extract timing breakdown
-            breakdown = {}
-            for line in output.split("\n"):
-                if "|" in line and "%" in line:
-                    parts = line.split("|")
-                    if len(parts) >= 3:
-                        name = parts[0].strip()
-                        try:
-                            pct = float(parts[2].strip().replace("%", ""))
-                            breakdown[name] = pct
-                        except ValueError:
-                            pass
-
-            return f"""✓ Benchmark completed ({steps} steps, {threads} threads):
-
-Wall time:     {elapsed:.3f} s
-Loop time:     {loop_time:.3f} s
-Performance:   {timesteps_per_sec:.2f} timesteps/s
-
-Timing breakdown:
-{json.dumps(breakdown, indent=2) if breakdown else '(not available)'}
+stdout (last 500 chars):
+{result.stdout[-500:] if result.stdout else '(empty)'}
 """
 
         except subprocess.TimeoutExpired:
-            return "Error: Benchmark timed out (>120s)"
+            if TOOL_TIMEOUT_SEC:
+                return f"Error: Benchmark timed out (>{TOOL_TIMEOUT_SEC:.0f}s)"
+            return "Error: Benchmark timed out"
         except Exception as e:
             return f"Error running benchmark: {e}"
 
@@ -1879,13 +1840,13 @@ Timing breakdown:
     def _tool_get_reference_implementation(self) -> ToolDefinition:
         return ToolDefinition(
             name="get_reference_implementation",
-            description="Find optimized reference implementations of similar functionality. For example, find the OPT version of a pair style.",
+            description="Find optimized or alternative implementations of similar functionality by searching for variant files.",
             parameters={
                 "type": "object",
                 "properties": {
                     "function_name": {
                         "type": "string",
-                        "description": "Name of the function or class to find references for"
+                        "description": "Name of the function or module to find references for"
                     }
                 },
                 "required": ["function_name"]
@@ -1894,26 +1855,31 @@ Timing breakdown:
         )
 
     def _handle_get_reference_implementation(self, function_name: str) -> str:
-        # Look for OPT versions
-        base_name = function_name.replace("_omp", "").replace("OMP", "")
+        base_name = function_name
 
-        # Search in OPT directory
-        opt_files = self._handle_find_files(f"*{base_name}*", "src/OPT")
-        if "No files found" not in opt_files:
-            result = f"Found OPT implementations:\n{opt_files}\n\n"
-            # Read first file
-            first_file = opt_files.split("\n")[0]
-            if first_file:
-                content = self._handle_read_file(first_file)
-                result += f"Content of {first_file}:\n{content}"
+        # Search for files with similar names across the source tree
+        found = self._handle_find_files(f"*{base_name}*")
+        if "No files found" not in found:
+            files = [f for f in found.split("\n") if f.strip()]
+            result = f"Found related implementations:\n{found}\n\n"
+            # Read first file if there's a match
+            if files:
+                first_file = files[0].strip()
+                if first_file:
+                    content = self._handle_read_file(first_file)
+                    result += f"Content of {first_file}:\n{content}"
             return result
 
-        # Try INTEL versions
-        intel_files = self._handle_find_files(f"*{base_name}*", "src/INTEL")
-        if "No files found" not in intel_files:
-            return f"Found INTEL implementations:\n{intel_files}"
+        # Also search by grep for the function definition
+        grep_result = self._handle_grep(
+            f"(def|void|int|double|static)\\s+.*{base_name}",
+            file_pattern="*.c*",
+            context_lines=3,
+        )
+        if "No matches found" not in grep_result:
+            return f"Found references to {function_name}:\n{grep_result}"
 
-        return f"No optimized reference found for: {function_name}"
+        return f"No reference implementation found for: {function_name}"
 
     def _tool_search_experience(self) -> ToolDefinition:
         return ToolDefinition(

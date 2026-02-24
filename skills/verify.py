@@ -330,20 +330,27 @@ def verify_run(
     if not is_baseline and result.runtime_seconds > 0:
         baseline_runtime = None
         baseline_source = "base_run"
+        prefer_baseline_check_runtime = bool(
+            runtime_cfg.get("prefer_baseline_check_runtime", False)
+        )
         baseline_check_runtime = result.derived_metrics.get("baseline_check_runtime")
         try:
             baseline_check_runtime = float(baseline_check_runtime)
         except (TypeError, ValueError):
             baseline_check_runtime = None
-        if baseline_check_runtime is not None and baseline_check_runtime > 0:
-            baseline_runtime = baseline_check_runtime
-            baseline_source = "baseline_check"
-        elif (
+        if (
             baseline_exp
             and baseline_exp.results
             and baseline_exp.results.runtime_seconds > 0
         ):
             baseline_runtime = float(baseline_exp.results.runtime_seconds)
+        if (
+            baseline_check_runtime is not None
+            and baseline_check_runtime > 0
+            and (prefer_baseline_check_runtime or baseline_runtime is None)
+        ):
+            baseline_runtime = baseline_check_runtime
+            baseline_source = "baseline_check"
         if baseline_runtime is not None and baseline_runtime > 0:
             runtime = float(result.runtime_seconds)
             factor = runtime / baseline_runtime

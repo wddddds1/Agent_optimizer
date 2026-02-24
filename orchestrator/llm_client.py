@@ -4,7 +4,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import openai
 
@@ -22,7 +22,7 @@ class LLMConfig:
     temperature: float
     max_tokens: int
     strict_availability: bool = True
-    request_timeout_sec: float = 60.0
+    request_timeout_sec: float = 0.0
     api_timeout_retries: int = 2
 
 
@@ -280,7 +280,7 @@ class LLMClient:
             return None
         message = prompt.rstrip() + "\n\nPayload:\n" + json.dumps(payload, ensure_ascii=False)
 
-        def _request_once(user_content: str) -> str:
+        def _request_once(user_content: str) -> Tuple[str, Optional[str]]:
             attempts = 3
             last_exc: Optional[Exception] = None
             for attempt in range(attempts):
@@ -294,7 +294,10 @@ class LLMClient:
                             {"role": "user", "content": user_content},
                         ],
                     )
-                    return (response.choices[0].message.content or "").strip()
+                    choice = response.choices[0]
+                    content = (choice.message.content or "").strip()
+                    finish_reason = getattr(choice, "finish_reason", None)
+                    return content, str(finish_reason) if finish_reason is not None else None
                 except Exception as exc:
                     last_exc = exc
                     if not _is_retryable_llm_error(exc) or attempt >= attempts - 1:
@@ -305,7 +308,7 @@ class LLMClient:
             raise RuntimeError("LLM request failed without exception details")
 
         try:
-            content = _request_once(message)
+            content, finish_reason = _request_once(message)
         except Exception as exc:
             if self.config.strict_availability:
                 hint = _chat_api_compat_hint(exc, self.config.model)
@@ -322,10 +325,11 @@ class LLMClient:
                 "Return exactly ONE valid JSON object now. No markdown fences.\n"
                 "Keep the same schema requested by the prompt.\n\n"
                 f"Original request:\n{message}\n\n"
-                f"Previous invalid response (for reference):\n{content[:1200]}"
+                f"Previous invalid response (finish_reason={finish_reason or 'unknown'}):\n"
+                f"{content[:1200]}"
             )
             try:
-                retry_content = _request_once(retry_prompt)
+                retry_content, _ = _request_once(retry_prompt)
             except Exception as exc:
                 hint = _chat_api_compat_hint(exc, self.config.model)
                 raise LLMUnavailableError(f"LLM request_json retry failed: {hint}") from exc
@@ -343,18 +347,172 @@ class LLMClient:
 
 
 def _safe_json_loads(content: str) -> Optional[object]:
+    text = (content or "").strip()
+    if not text:
+        return None
+    # Common case: fenced JSON.
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    parsed = _json_load_with_fallback(text)
+    if parsed is not None:
+        return parsed
+
+    snippet = _extract_balanced_object(text)
+    if snippet:
+        parsed = _json_load_with_fallback(snippet)
+        if parsed is not None:
+            return parsed
+
+    # Fallback for truncated/malformed provider output:
+    # try to recover a syntactically valid object from the first JSON object.
+    repaired = _repair_truncated_json_object(text)
+    if repaired is not None:
+        return repaired
+    return None
+
+
+def _json_load_with_fallback(text: str) -> Optional[object]:
     try:
-        return json.loads(content)
+        return json.loads(text)
     except json.JSONDecodeError:
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
-        snippet = content[start : end + 1]
-        try:
-            return json.loads(snippet)
-        except json.JSONDecodeError:
-            return None
+        pass
+    # Some providers occasionally emit raw tabs/newlines inside strings.
+    try:
+        return json.loads(text, strict=False)
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_balanced_object(text: str) -> Optional[str]:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    return None
+
+
+def _repair_truncated_json_object(text: str) -> Optional[object]:
+    start = text.find("{")
+    if start < 0:
+        return None
+    fragment = text[start:].strip()
+    if not fragment:
+        return None
+    # Bound pathological payloads.
+    if len(fragment) > 200_000:
+        fragment = fragment[:200_000]
+
+    # Try direct auto-close first.
+    candidate = _auto_close_json_fragment(fragment)
+    parsed = _json_load_with_fallback(candidate)
+    if parsed is not None:
+        return parsed
+
+    # If still invalid, progressively trim to a safe structural cut-point.
+    for _ in range(160):
+        cut = _last_json_cutpoint(fragment)
+        if cut is None or cut <= 1:
+            break
+        fragment = fragment[:cut].rstrip()
+        if not fragment:
+            break
+        candidate = _auto_close_json_fragment(fragment)
+        parsed = _json_load_with_fallback(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _auto_close_json_fragment(fragment: str) -> str:
+    stack: List[str] = []
+    in_string = False
+    escape = False
+    for ch in fragment:
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            stack.append("}")
+            continue
+        if ch == "[":
+            stack.append("]")
+            continue
+        if ch in {"}", "]"}:
+            if stack and stack[-1] == ch:
+                stack.pop()
+            continue
+    out = fragment
+    if in_string:
+        out += '"'
+    while stack:
+        out += stack.pop()
+    return out
+
+
+def _last_json_cutpoint(fragment: str) -> Optional[int]:
+    in_string = False
+    escape = False
+    best: Optional[int] = None
+    for idx, ch in enumerate(fragment):
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        # Prefer comma/colon cut to drop incomplete trailing pair.
+        if ch in {",", ":"}:
+            best = idx
+        elif ch in {"}", "]"}:
+            best = idx + 1
+    return best
 
 
 def _is_retryable_llm_error(exc: Exception) -> bool:

@@ -96,6 +96,11 @@ class PatchPlannerAgent:
                 family_hint=node.family_hint,
                 patch_families=patch_families or {},
             )
+            anchor_hint = ""
+            if isinstance(node.meta, dict):
+                anchor_hint = str(node.meta.get("anchor_hint") or "").strip()
+            if not self._looks_like_code_anchor(anchor_hint):
+                anchor_hint = ""
             action_id = f"graph.source_patch.{node.mechanism.value}.{node.opportunity_id}"
             if action_id in existing:
                 action_id = f"{action_id}.alt"
@@ -112,12 +117,17 @@ class PatchPlannerAgent:
                     "opportunity_id": node.opportunity_id,
                     "deep_analysis_id": node.opportunity_id,
                     "target_file": node.hotspot.file,
-                    "target_anchor": node.hotspot.function,
+                    "target_anchor": anchor_hint,
                     "target_line_range": node.hotspot.line_range,
                     "target_files": list(node.target_files or [node.hotspot.file]),
                     "target_functions": list(node.target_functions or [node.hotspot.function]),
                     "hypothesis": node.hypothesis,
                     "evidence_ids": list(node.evidence_ids),
+                    "code_context": (
+                        str(node.meta.get("code_context") or "")[:1200]
+                        if isinstance(node.meta, dict)
+                        else ""
+                    ),
                     "validation_plan": node.validation_plan.model_dump(),
                     "expected_gain_p50": node.expected_gain.p50,
                     "expected_gain_p90": node.expected_gain.p90,
@@ -137,6 +147,31 @@ class PatchPlannerAgent:
             "actions": [a.model_dump() for a in actions],
         }
         return actions
+
+    def _looks_like_code_anchor(self, text: str) -> bool:
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        lower = raw.lower()
+        if any(
+            phrase in lower
+            for phrase in (
+                "line ",
+                "lines ",
+                "function",
+                "called by",
+                "profile",
+                "hotspot",
+                "similar to",
+                "specifically",
+            )
+        ):
+            if not any(token in raw for token in (";", "{", "}", "->", " = ", "if (", "for (", "while (", "return ")):
+                return False
+        return any(
+            token in raw
+            for token in (";", "{", "}", "->", " = ", "if (", "for (", "while (", "return ", "(")
+        )
 
     def _resolve_family(
         self,

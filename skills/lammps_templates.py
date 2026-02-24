@@ -330,6 +330,47 @@ def get_template(
     return family_templates.get(backend) or family_templates.get("serial")
 
 
+LAMMPS_PATCH_INSTRUCTIONS: Dict[str, str] = {
+    "param_table_pack": (
+        "需要 3 步 edits:\n"
+        "1. insert_before 外循环前: 定义 fast_alpha_t struct + 分配和填充 tabsix 数组\n"
+        "2. replace 内循环中: 将分散的系数数组访问替换为 tabsixi[jtype].cutsq/.lj1 等\n"
+        "3. insert_after 外循环后: free(tabsix)\n"
+        "backend_hint='omp_dbl3' 时: itype/jtype 需 -1 转 0-based（LAMMPS type 从 1 开始）\n"
+        "必须 #include <cstdlib> 并使用 std::malloc/std::free\n"
+        "std::free(tabsix) 必须在 eval() 函数内，外层 for 循环之后、函数闭合 } 之前"
+    ),
+    "special_pair_split": (
+        "需要 1 步 replace edit:\n"
+        "1. 将整个内循环体替换为 if(sbindex==0){fast_path}else{slow_path} 结构\n"
+        "快速路径: 不做 j &= NEIGHMASK，不做 factor_lj 乘法\n"
+        "慢速路径: 保持原始逻辑（含 factor_lj 和 NEIGHMASK）\n"
+        "EFLAG/EVFLAG 分支在两个路径中都需要保留\n"
+        "OpenMP 后端使用 dbl3_t: 访问 x[j].x/y/z（不是 x[j][0]）"
+    ),
+    "flat_coeff_lookup": (
+        "二维系数数组扁平化为一维\n"
+        "通常与 param_table_pack 组合（tabsix 已经是 flat 的）\n"
+        "如果单独使用: 在外循环前分配 flat 数组，内循环中用 [itype*ntypes+jtype] 索引"
+    ),
+    "neighbor_prefetch": (
+        "在内循环头部插入 software prefetch\n"
+        "只需 1 步 insert_after edit:\n"
+        "1. 在 j = jlist[jj]; 行前插入 prefetch 代码\n"
+        "prefetch 距离通常为 4: __builtin_prefetch(&x[jlist[jj+4] & NEIGHMASK], 0, 1)"
+    ),
+    "cache_local_pointers": (
+        "缓存高频数组访问为局部变量\n"
+        "用 insert_after 在赋值行后添加缓存声明\n"
+        "用 replace 将原始间接访问替换为缓存变量\n"
+        "backend_hint='omp_dbl3' 时：x/f 用引用 const auto &xj = x[j];"
+    ),
+    "loop_fission": (
+        "仅用于拆分 EFLAG/VFLAG 诊断分支，不复制核心力计算"
+    ),
+}
+
+
 def get_template_context(
     patch_family: str,
     backend: Optional[str] = None,
@@ -338,7 +379,7 @@ def get_template_context(
     """Return template + full OPT reference for injection into CodePatch context.
 
     Returns a dict with keys: reference_file, description, before, after,
-    full_reference (complete OPT source code).
+    full_reference (complete OPT source code), instructions.
     """
     bk = "omp_dbl3" if backend == "openmp_backend" else "serial"
     tmpl = get_template(patch_family, bk)
@@ -350,6 +391,7 @@ def get_template_context(
         "before": tmpl.get("before", ""),
         "after": tmpl.get("after", ""),
         "full_reference": "",
+        "instructions": LAMMPS_PATCH_INSTRUCTIONS.get(patch_family, ""),
     }
     if repo_root:
         result["full_reference"] = _read_opt_reference(repo_root)

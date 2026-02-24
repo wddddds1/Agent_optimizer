@@ -80,6 +80,44 @@ def ensure_log_path(app: str, run_args: List[str], run_dir: Path) -> List[str]:
     return list(run_args)
 
 
+def get_template_context(
+    app: str,
+    patch_family: str,
+    backend: Optional[str] = None,
+    repo_root=None,
+) -> Optional[Dict]:
+    """Return app-specific template context for a patch family, or None."""
+    module = _load_app_module(app)
+    if module is not None and hasattr(module, "get_template_context"):
+        return module.get_template_context(
+            patch_family, backend=backend, repo_root=repo_root
+        )
+    return None
+
+
+def validate_patch_edits(
+    app: str,
+    edit_proposal,
+    patch_family: Optional[str] = None,
+    uses_dbl3: bool = False,
+    code_snippets: Optional[List[Dict[str, object]]] = None,
+) -> Optional[Dict]:
+    """Run app-specific validation on an edit proposal.
+
+    Returns None if validation passes, or a dict with 'status' and
+    'missing_fields' keys if validation fails.
+    """
+    module = _load_app_module(app)
+    if module is not None and hasattr(module, "validate_patch_edits"):
+        return module.validate_patch_edits(
+            edit_proposal,
+            patch_family=patch_family,
+            uses_dbl3=uses_dbl3,
+            code_snippets=code_snippets,
+        )
+    return None
+
+
 def get_domain_knowledge(adapter_cfg: Optional[Dict] = None) -> Dict:
     """Extract domain knowledge from adapter config.
 
@@ -195,8 +233,10 @@ __all__ = [
     "ensure_output_capture",
     "get_domain_knowledge",
     "get_drift_checker",
+    "get_template_context",
     "input_edit_allowlist",
     "parse_timing_breakdown",
     "requires_structured_correctness",
     "supports_agentic_correctness",
+    "validate_patch_edits",
 ]

@@ -28,6 +28,24 @@ def _compact_git_token(raw: str, max_len: int = 72) -> str:
     return f"{slug}-{digest}"
 
 
+def _repo_rel_from_worktree_path(path_str: str) -> Optional[Path]:
+    marker = "/worktrees/"
+    search_upto = len(path_str)
+    while True:
+        idx = path_str.rfind(marker, 0, search_upto)
+        if idx == -1:
+            return None
+        after = path_str[idx + len(marker) :]
+        slash = after.find("/")
+        if slash == -1:
+            search_upto = idx
+            continue
+        rel_str = after[slash + 1 :].lstrip("/")
+        if rel_str:
+            return Path(rel_str)
+        search_upto = idx
+
+
 class GitPatchContext(AbstractContextManager):
     def __init__(
         self,
@@ -280,27 +298,17 @@ class GitPatchContext(AbstractContextManager):
     def map_to_worktree(self, path: Path) -> Path:
         resolved = path.resolve()
         repo_resolved = self.repo_root.resolve()
+        path_str = str(resolved)
+        rel = _repo_rel_from_worktree_path(path_str)
+        if rel is not None:
+            return (self.worktree_dir / rel).resolve()
         try:
             rel = resolved.relative_to(repo_resolved)
         except ValueError:
             # Path is not under repo_root — likely inside a previous worktree.
             # Strip the worktree prefix to recover the repo-relative path.
-            path_str = str(resolved)
-            repo_str = str(repo_resolved)
-            wt_marker = "/worktrees/"
-            idx = path_str.find(wt_marker)
-            if idx != -1:
-                # Path looks like <prefix>/worktrees/<run_id>/<repo_relative>
-                after_marker = path_str[idx + len(wt_marker):]
-                # Skip the run_id component
-                slash = after_marker.find("/")
-                if slash != -1:
-                    rel = Path(after_marker[slash + 1:])
-                else:
-                    raise ValueError(
-                        f"Cannot resolve {resolved} relative to {repo_resolved}"
-                    )
-            else:
+            rel = _repo_rel_from_worktree_path(path_str)
+            if rel is None:
                 raise ValueError(
                     f"Cannot resolve {resolved} relative to {repo_resolved}"
                 )

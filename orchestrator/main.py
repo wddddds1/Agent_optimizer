@@ -173,7 +173,7 @@ def _resolved_agent_llm_cfg(base_llm_cfg: dict, block_cfg: dict) -> dict:
         "model": str(block_cfg.get("model") or base_llm_cfg.get("model", "")),
         "temperature": float(base_llm_cfg.get("temperature", 0.0)),
         "max_tokens": int(base_llm_cfg.get("max_tokens", 64)),
-        "request_timeout_sec": float(base_llm_cfg.get("request_timeout_sec", 60.0)),
+        "request_timeout_sec": float(base_llm_cfg.get("request_timeout_sec", 0.0)),
         "api_timeout_retries": int(base_llm_cfg.get("api_timeout_retries", 2)),
         "strict_availability": bool(
             block_cfg.get(
@@ -229,7 +229,7 @@ def _run_llm_preflight(targets: List[Tuple[str, dict]]) -> None:
             model=str(cfg.get("model", "deepseek-chat")),
             temperature=0.0,
             max_tokens=8,
-            request_timeout_sec=float(cfg.get("request_timeout_sec", 60.0)),
+            request_timeout_sec=float(cfg.get("request_timeout_sec", 0.0)),
             api_timeout_retries=int(cfg.get("api_timeout_retries", 2)),
             strict_availability=bool(cfg.get("strict_availability", True)),
         )
@@ -396,6 +396,32 @@ def main() -> None:
         default=None,
         help="Override API key env var name for all agents in this run",
     )
+    parser.add_argument(
+        "--drift-verify-mode",
+        choices=["inline", "separate"],
+        default="inline",
+        help=(
+            "Drift verification mode: inline = capture output in score runs "
+            "and verify without extra replay; separate = run dedicated "
+            "*-drift-capture replays."
+        ),
+    )
+    parser.add_argument(
+        "--split-drift-test",
+        choices=["on", "off"],
+        default="off",
+        help=(
+            "Split drift mode: on = score runs keep app's no-IO output (e.g. /dev/null), "
+            "single repeat, and only run drift capture when runtime gain exceeds threshold; "
+            "off = score runs capture output inline for drift (still single repeat)."
+        ),
+    )
+    parser.add_argument(
+        "--split-drift-threshold-pct",
+        type=float,
+        default=1.0,
+        help="Minimum runtime improvement percentage required before drift check in split mode on (default: 1.0).",
+    )
     args = parser.parse_args()
 
     config_dir = Path(args.config_dir)
@@ -556,7 +582,7 @@ def main() -> None:
         model=llm_cfg_raw.get("model", "deepseek-chat"),
         temperature=float(llm_cfg_raw.get("temperature", 0.0)),
         max_tokens=int(llm_cfg_raw.get("max_tokens", 512)),
-        request_timeout_sec=float(llm_cfg_raw.get("request_timeout_sec", 60.0)),
+        request_timeout_sec=float(llm_cfg_raw.get("request_timeout_sec", 0.0)),
         api_timeout_retries=int(llm_cfg_raw.get("api_timeout_retries", 2)),
         strict_availability=bool(llm_cfg_raw.get("strict_availability", True)),
     )
@@ -721,6 +747,9 @@ def main() -> None:
         resume_state=resume_state,
         fixed_threads=args.fixed_threads,
         skip_baseline=skip_baseline,
+        drift_verify_mode=args.drift_verify_mode,
+        split_drift_test=args.split_drift_test,
+        split_drift_threshold_pct=float(args.split_drift_threshold_pct),
     )
 
     print(result["summary_table"])

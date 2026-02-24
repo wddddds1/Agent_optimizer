@@ -54,8 +54,8 @@ ALLOWED_READ_PREFIXES = [
 # Maximum output size (64KB)
 MAX_OUTPUT_SIZE = 65536
 
-# Default timeout (30 seconds)
-DEFAULT_TIMEOUT = 30
+# Default timeout (0 = disabled)
+DEFAULT_TIMEOUT = 0
 
 
 class ShellToolError(Exception):
@@ -75,10 +75,10 @@ class ShellTool:
 
         Args:
             cwd: Working directory for command execution.
-            timeout: Command timeout in seconds.
+            timeout: Command timeout in seconds (0 disables timeout).
         """
         self.cwd = cwd
-        self.timeout = timeout
+        self.timeout = max(0, int(timeout))
 
     def get_tool_definition(self) -> ToolDefinition:
         """Return the tool definition for registration with an LLM agent."""
@@ -141,7 +141,7 @@ class ShellTool:
                 tokens,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=(self.timeout if self.timeout > 0 else None),
                 cwd=self.cwd,
             )
 
@@ -163,7 +163,9 @@ class ShellTool:
             return output if output else "(no output)"
 
         except subprocess.TimeoutExpired:
-            return f"Error: Command timed out after {self.timeout} seconds"
+            if self.timeout > 0:
+                return f"Error: Command timed out after {self.timeout} seconds"
+            return "Error: Command timed out"
         except FileNotFoundError:
             return f"Error: Command not found: {tokens[0]}"
         except PermissionError:

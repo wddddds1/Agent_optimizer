@@ -28,23 +28,22 @@ def ensure_output_capture(
     run_args: List[str],
     run_dir: Path,
 ) -> Tuple[List[str], List[str]]:
-    """Rewrite ``-o /dev/null`` to ``-o {run_dir}/output.sam`` for drift detection."""
+    """Route BWA output to ``{run_dir}/output.sam`` for drift detection.
+
+    Always retarget ``-o`` to the current run directory to avoid inheriting
+    stale output paths from baseline/base runs.
+    """
     args = list(run_args)
     capture_path = str(run_dir / "output.sam")
     for idx, token in enumerate(args):
-        if token == "-o" and idx + 1 < len(args) and args[idx + 1] == "/dev/null":
+        if token == "-o" and idx + 1 < len(args):
             args[idx + 1] = capture_path
             return args, [capture_path]
-    # No -o /dev/null found — output may already go to a file or stdout.
-    # Add explicit -o so we always have a capture file.
+    # No explicit -o found — add one so we always have a capture file.
     if "-o" not in args:
         args.extend(["-o", capture_path])
         return args, [capture_path]
-    # -o points somewhere else; use that path as the capture path.
-    for idx, token in enumerate(args):
-        if token == "-o" and idx + 1 < len(args):
-            return args, [args[idx + 1]]
-    return args, []
+    return args, [capture_path]
 
 
 # ---------------------------------------------------------------------------

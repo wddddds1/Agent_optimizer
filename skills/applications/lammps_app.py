@@ -8,7 +8,229 @@ from schemas.action_ir import ActionIR
 from schemas.job_ir import JobIR
 from skills.metrics_parse import parse_lammps_timing
 
+import re
+
+
 _DEFAULT_MPI_LAUNCHER = "mpirun"
+
+
+# ---------------------------------------------------------------------------
+# Template context delegation
+# ---------------------------------------------------------------------------
+
+def get_template_context(
+    patch_family: str,
+    backend: Optional[str] = None,
+    repo_root=None,
+) -> Optional[Dict]:
+    """Delegate to skills.lammps_templates for LAMMPS-specific templates."""
+    from skills.lammps_templates import (
+        get_template_context as _lammps_get_template_ctx,
+    )
+
+    return _lammps_get_template_ctx(
+        patch_family, backend=backend, repo_root=root_path(repo_root)
+    )
+
+
+def root_path(repo_root) -> Optional[Path]:
+    if repo_root is None:
+        return None
+    return Path(repo_root) if not isinstance(repo_root, Path) else repo_root
+
+
+# ---------------------------------------------------------------------------
+# Patch validation (moved from orchestrator/agents/code_patch.py)
+# ---------------------------------------------------------------------------
+
+def validate_patch_edits(
+    edit_proposal,
+    patch_family: Optional[str] = None,
+    uses_dbl3: bool = False,
+    code_snippets: Optional[List[Dict]] = None,
+) -> Optional[Dict]:
+    """LAMMPS-specific structural validation of edit proposals.
+
+    Returns None if validation passes, or a dict with 'status' and
+    'missing_fields' if validation fails.
+    """
+    if patch_family == "param_table_pack":
+        result = _validate_param_table_pack(edit_proposal, code_snippets)
+        if result:
+            return result
+
+    if patch_family == "special_pair_split":
+        result = _validate_special_pair_split(edit_proposal, uses_dbl3)
+        if result:
+            return result
+
+    if patch_family in {"cache_local_pointers", "cache_local_pointers_multi"}:
+        result = _validate_cache_local_pointers(edit_proposal, uses_dbl3)
+        if result:
+            return result
+
+    return None
+
+
+def _validate_param_table_pack(edit_proposal, code_snippets) -> Optional[Dict]:
+    added_text = "\n".join(edit.new_text or "" for edit in edit_proposal.edits)
+    has_malloc = "malloc" in added_text or "free" in added_text
+    has_include = "#include <cstdlib>" in added_text or "#include <stdlib.h>" in added_text
+
+    if has_malloc and not has_include:
+        # Try to auto-fix by inserting #include <cstdlib>
+        from schemas.patch_edit_ir import PatchEdit
+
+        include_anchor = None
+        include_file = None
+        for snippet in code_snippets or []:
+            snippet_text = snippet.get("snippet") or ""
+            for line in snippet_text.splitlines():
+                if line.strip().startswith("#include"):
+                    include_anchor = line
+                    include_file = snippet.get("path")
+                    break
+            if include_anchor:
+                break
+        if include_anchor and include_file:
+            edit_proposal.edits.insert(
+                0,
+                PatchEdit(
+                    file=include_file,
+                    op="insert_before",
+                    anchor=include_anchor,
+                    new_text="#include <cstdlib>\n",
+                ),
+            )
+            added_text = "#include <cstdlib>\n" + added_text
+            has_include = True
+
+    if has_malloc and not has_include:
+        return {
+            "status": "NEED_MORE_CONTEXT",
+            "missing_fields": [
+                "param_table_pack requires adding `#include <cstdlib>` "
+                "and using std::malloc/std::free"
+            ],
+        }
+    if has_malloc and "std::malloc" not in added_text and "std::free" not in added_text:
+        return {
+            "status": "NEED_MORE_CONTEXT",
+            "missing_fields": [
+                "param_table_pack must use std::malloc/std::free (not raw malloc/free) with <cstdlib>"
+            ],
+        }
+    # Ensure allocation happens BEFORE the outer loop
+    needs_outer_anchor = any(
+        "tabsix" in (edit.new_text or "") or "fast_alpha_t" in (edit.new_text or "")
+        for edit in edit_proposal.edits
+    )
+    if needs_outer_anchor:
+        anchor_ctx = "\n".join(
+            (edit.anchor or "") + "\n" + (edit.old_text or "")
+            for edit in edit_proposal.edits
+        )
+        if "for (int ii" not in anchor_ctx and "for (ii" not in anchor_ctx:
+            return {
+                "status": "NEED_MORE_CONTEXT",
+                "missing_fields": [
+                    "param_table_pack must insert allocation BEFORE the outer `for (ii ...)` loop; "
+                    "use an anchor that includes the loop header"
+                ],
+            }
+    if "free(" in added_text:
+        anchor_ctx = "\n".join(
+            (edit.anchor or "") + "\n" + (edit.old_text or "")
+            for edit in edit_proposal.edits
+        )
+        if "f[i].z" not in anchor_ctx and "fztmp" not in anchor_ctx:
+            return {
+                "status": "NEED_MORE_CONTEXT",
+                "missing_fields": [
+                    "param_table_pack must place free(tabsix) AFTER the outer loop; "
+                    "anchor near `f[i].z += fztmp;`"
+                ],
+            }
+    return None
+
+
+def _validate_special_pair_split(edit_proposal, uses_dbl3: bool) -> Optional[Dict]:
+    has_replace_block = any(
+        edit.op == "replace"
+        and edit.old_text
+        and "factor_lj = special_lj" in edit.old_text
+        for edit in edit_proposal.edits
+    )
+    if not has_replace_block:
+        return {
+            "status": "NEED_MORE_CONTEXT",
+            "missing_fields": [
+                "special_pair_split must REPLACE the original block starting at "
+                "`factor_lj = special_lj[sbmask(j)];` to avoid duplicate loops"
+            ],
+        }
+    for edit in edit_proposal.edits:
+        if edit.op != "replace" or not edit.old_text:
+            continue
+        if "factor_lj = special_lj" in edit.old_text:
+            if "delx = xtmp - x[j].x" not in edit.old_text or "if (rsq <" not in edit.old_text:
+                return {
+                    "status": "NEED_MORE_CONTEXT",
+                    "missing_fields": [
+                        "special_pair_split replacement must include the full original inner-loop body "
+                        "(delx/dely/delz, rsq, and the rsq<cutsq block) to avoid leaving duplicate code"
+                    ],
+                }
+    added_text = "\n".join(edit.new_text or "" for edit in edit_proposal.edits)
+    if "x[j][" in added_text or "x[i][" in added_text:
+        return {
+            "status": "NEED_MORE_CONTEXT",
+            "missing_fields": [
+                "special_pair_split must use dbl3_t access (x[j].x/x[j].y/x[j].z), "
+                "not x[j][0] indexing"
+            ],
+        }
+    return None
+
+
+def _validate_cache_local_pointers(edit_proposal, uses_dbl3: bool) -> Optional[Dict]:
+    has_cache_decl = any(
+        re.search(
+            r"(?:const\s+)?(?:auto|double|int|float)\s*[*&]?\s*\w+\s*=",
+            edit.new_text or "",
+        )
+        for edit in edit_proposal.edits
+        if edit.op in ("insert_before", "insert_after")
+    )
+    has_use_replacement = any(
+        edit.op == "replace" and edit.old_text and edit.new_text
+        and edit.new_text != edit.old_text
+        for edit in edit_proposal.edits
+    )
+    if not has_cache_decl or not has_use_replacement:
+        return {
+            "status": "NEED_MORE_CONTEXT",
+            "missing_fields": [
+                "cache_local_pointers requires both a local cache declaration "
+                "AND replacement of original array accesses"
+            ],
+        }
+    if uses_dbl3:
+        added_text = "\n".join(
+            edit.new_text or "" for edit in edit_proposal.edits
+        )
+        if re.search(
+            r"\bconst?\s+double\s*\*+\s*\w+\s*=\s*\w+\[",
+            added_text,
+        ):
+            return {
+                "status": "NEED_MORE_CONTEXT",
+                "missing_fields": [
+                    "OMP backend uses dbl3_t; cache arrays as refs "
+                    "(e.g., `const auto &xj = x[j];`), not double*"
+                ],
+            }
+    return None
 
 
 def apply_adapter(action: ActionIR, job: JobIR, adapter_cfg: Dict[str, object] | None = None) -> ActionIR:

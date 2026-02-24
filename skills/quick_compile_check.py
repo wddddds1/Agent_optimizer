@@ -6,11 +6,15 @@ before the expensive full CMake build.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+_QUICK_CHECK_TIMEOUT_RAW = float(os.environ.get("QUICK_CHECK_TIMEOUT_SEC", "0") or 0)
+_QUICK_CHECK_TIMEOUT = _QUICK_CHECK_TIMEOUT_RAW if _QUICK_CHECK_TIMEOUT_RAW > 0 else None
 
 
 def quick_compile_check(
@@ -58,7 +62,7 @@ def quick_compile_check(
             capture_output=True,
             text=True,
             cwd=str(repo_root),
-            timeout=10,
+            timeout=_QUICK_CHECK_TIMEOUT,
         )
         if apply.returncode != 0:
             # If git apply fails, fall through – the full build will catch it.
@@ -77,7 +81,7 @@ def quick_compile_check(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=_QUICK_CHECK_TIMEOUT,
             )
             if result.returncode != 0:
                 errors.append(f"{fpath.name}:\n{result.stderr.strip()}")

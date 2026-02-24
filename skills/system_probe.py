@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 def _run(cmd: List[str]) -> str:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=None)
     except Exception:
         return ""
     if result.returncode != 0:

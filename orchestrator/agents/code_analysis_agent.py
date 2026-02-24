@@ -97,6 +97,29 @@ def _build_system_prompt(
             bn_parts.append(f"Prioritize: {', '.join(effective)}")
         if ineffective:
             bn_parts.append(f"Deprioritize (likely ineffective): {', '.join(ineffective)}")
+        # Provide concrete analysis strategy based on bottleneck type
+        if bn_type == "compute" or (bn_ipc and float(bn_ipc) >= 2.0):
+            bn_parts.append(
+                "\nCOMPUTE-BOUND STRATEGY (high IPC — CPU is busy, not waiting for memory):\n"
+                "The code is already executing efficiently at the instruction level. "
+                "Structural transforms (SIMD, data layout, prefetch) will have LIMITED impact.\n"
+                "HIGHEST IMPACT: Algorithmic changes that eliminate unnecessary work entirely:\n"
+                "  - Early termination: Can the loop exit before scanning all elements? "
+                "Study loop exit conditions and ask: under what mathematical condition is further iteration unnecessary?\n"
+                "  - Bound tightening: Can we narrow the search space using known constraints? "
+                "Look for variables that set upper bounds, intervals, or thresholds.\n"
+                "  - Redundant work elimination: Is the function called with overlapping inputs? "
+                "Can results from a previous call be reused?\n"
+                "  - Adaptive algorithms: Can the code detect easy vs hard cases and take a fast path for common inputs?\n"
+                "IMPORTANT: Read the hot function's LOGIC carefully. Understand what the ALGORITHM computes, "
+                "not just its structure. The best optimization makes the code DO LESS WORK."
+            )
+        elif bn_type == "memory" or (bn_ipc and float(bn_ipc) < 1.5):
+            bn_parts.append(
+                "\nMEMORY-BOUND STRATEGY (low IPC — CPU stalls on cache misses):\n"
+                "Prioritize: data layout changes (SoA, packing), memory access pattern improvements, "
+                "prefetching, and reducing memory traffic."
+            )
         bottleneck_section = "\n".join(p for p in bn_parts if p)
 
     # Algorithm-level pre-analysis insights
@@ -160,21 +183,35 @@ You are an HPC deep-analysis agent.
 Goal: discover high-impact source-level optimization opportunities on real hotspots.
 
 Rules:
-1. Prioritize macro mechanisms first: data_layout, memory_path, vectorization, algorithmic.
-2. Only keep opportunities with concrete evidence and clear compiler gap.
-3. Avoid generic micro-opts unless macro paths are weak or exhausted.
-4. If context/profile is insufficient, return explicit status and missing items.
+1. ALGORITHMIC ANALYSIS FIRST: Before proposing any structural transform, deeply understand
+   what each hot function COMPUTES. Read the code logic, not just its shape. Ask:
+   - What does each loop iteration accomplish? Under what condition could it exit early?
+   - Are all iterations necessary, or do some produce results that are never used?
+   - Is there a mathematical bound, interval, or threshold that could eliminate work?
+   - Could common-case inputs take a faster path?
+2. Require at least 2-3 opportunities with mechanism=algorithmic (early termination,
+   redundant work elimination, bound tightening, adaptive fast-paths).
+   These typically have 5-50x higher impact than SIMD or data layout changes.
+3. Only keep opportunities with concrete evidence and clear compiler gap.
+4. Avoid generic micro-opts unless algorithmic and macro paths are weak or exhausted.
 5. If status=OK, output 8-12 opportunities when feasible; prefer quality over fixed quota.
-6. Favor structural transforms (data layout, memory traffic shaping, vector path redesign, algorithm path changes), not only loop micro-tweaks.
+6. For structural transforms (data layout, SIMD, prefetch): only propose when the
+   opportunity is clearly memory-bound or vectorization-bound, not compute-bound.
+   Be conservative with risk — data structure changes often cause crashes.
 {families_section}{bottleneck_section}{algo_section}{domain_section}
 
-Tool workflow (compact):
-- get_profile -> read_file/get_file_outline/get_callers on top hotspots
-- get_type_definition/get_type_layout on hot-path data
-- get_reference_implementation + grep for comparable optimized patterns
-- get_compiler_opt_report + get_structured_compiler_analysis to verify compiler gap
-- get_assembly + get_compile_flags for detailed analysis
-- search_experience to avoid repeating known failures
+Tool workflow (adapt to what is available):
+1. Start with read_file / get_file_outline on top hotspot functions (profile data is already provided above)
+2. Study the ALGORITHM: read loop bodies, exit conditions, caller context. Understand the
+   mathematical semantics — what invariant does this loop maintain? What bounds apply?
+3. get_type_definition / get_type_layout on hot-path data structures
+4. grep for callers, related patterns, and alternative implementations
+5. get_compiler_opt_report / get_compile_flags — only if build directory exists; skip if "not found"
+6. get_assembly — only if executable is available; skip if "not found"
+7. search_experience to avoid repeating known failures
+8. get_reference_implementation for comparable optimized patterns
+
+If a tool returns "not found", "not available", or "error", move on immediately — do not retry with similar arguments.
 
 Output:
 - Return ONE valid JSON object only (no markdown), with keys:
@@ -185,6 +222,7 @@ Output:
   diagnosis, mechanism, compiler_gap, evidence, code_context,
   estimated_impact, confidence, risk_level.
 - For each opportunity include one falsifiable performance hypothesis in `diagnosis`.
+- recommended_sequence MUST list algorithmic opportunities before structural ones.
 """
 
 
@@ -304,6 +342,7 @@ class DeepCodeAnalysisAgent:
         backend_variant: Optional[str] = None,
         input_script_path: Optional[str] = None,
         supplemental_context: Optional[Dict[str, str]] = None,
+        round_feedback: Optional[Dict[str, Any]] = None,
         algorithm_preanalysis: Optional[Dict[str, Any]] = None,
         domain_knowledge: Optional[Dict[str, Any]] = None,
         bottleneck_classification: Optional[Dict[str, Any]] = None,
@@ -317,6 +356,7 @@ class DeepCodeAnalysisAgent:
             backend_variant=backend_variant,
             input_script_path=input_script_path,
             supplemental_context=supplemental_context,
+            round_feedback=round_feedback,
             algorithm_preanalysis=algorithm_preanalysis,
             domain_knowledge=domain_knowledge,
             bottleneck_classification=bottleneck_classification,
@@ -416,7 +456,7 @@ class DeepCodeAnalysisAgent:
         cost_penalty_weight = max(0.1, min(1.0, float(policy.get("cost_penalty_weight", 0.7) or 0.7)))
         macro_priority_bonus = max(0.0, min(1.5, float(policy.get("macro_priority_bonus", 0.28) or 0.28)))
         algorithmic_priority_bonus = max(
-            0.0, min(1.5, float(policy.get("algorithmic_priority_bonus", 0.14) or 0.14))
+            0.0, min(1.5, float(policy.get("algorithmic_priority_bonus", 0.45) or 0.45))
         )
         micro_penalty = max(0.0, min(1.0, float(policy.get("micro_penalty", 0.12) or 0.12)))
         untested_bonus = max(0.0, min(0.5, float(policy.get("untested_bonus", 0.06) or 0.06)))
@@ -465,6 +505,10 @@ class DeepCodeAnalysisAgent:
                 mechanism_bonus += macro_priority_bonus
             if node.mechanism == OpportunityMechanism.ALGORITHMIC:
                 mechanism_bonus += algorithmic_priority_bonus
+            # Penalise high-risk structural transforms (data layout, SoA) that
+            # frequently cause crashes (segfaults) without proportional gain.
+            if node.mechanism == OpportunityMechanism.DATA_LAYOUT and raw_cost >= 3.0:
+                mechanism_bonus -= 0.20
             if node.mechanism == OpportunityMechanism.MICRO_OPT:
                 mechanism_bonus -= micro_penalty
             if node.opportunity_id not in tested_ids:
@@ -552,6 +596,7 @@ class DeepCodeAnalysisAgent:
         backend_variant: Optional[str] = None,
         input_script_path: Optional[str] = None,
         supplemental_context: Optional[Dict[str, str]] = None,
+        round_feedback: Optional[Dict[str, Any]] = None,
         algorithm_preanalysis: Optional[Dict[str, Any]] = None,
         domain_knowledge: Optional[Dict[str, Any]] = None,
         bottleneck_classification: Optional[Dict[str, Any]] = None,
@@ -578,6 +623,7 @@ class DeepCodeAnalysisAgent:
             experience_hints=experience_hints or [],
             backend_variant=backend_variant,
             supplemental_context=supplemental_context or {},
+            round_feedback=round_feedback or {},
         )
 
         try:
@@ -625,6 +671,7 @@ class DeepCodeAnalysisAgent:
         experience_hints: List[Dict[str, Any]],
         backend_variant: Optional[str],
         supplemental_context: Dict[str, str],
+        round_feedback: Dict[str, Any],
     ) -> str:
         profile_payload = self._compact_profile_payload(profile)
         caps_payload = self._compact_system_caps(system_caps)
@@ -712,14 +759,38 @@ class DeepCodeAnalysisAgent:
                     ]
                 )
 
+        if round_feedback:
+            parts.extend(
+                [
+                    "",
+                    "## Previous-Round Feedback (增量深挖约束)",
+                    "Avoid repeating infeasible actions and prioritize unresolved hotspots.",
+                    "```json",
+                    json.dumps(round_feedback, indent=2),
+                    "```",
+                ]
+            )
+
         parts.extend([
             "",
             "## Begin Analysis",
-            "Start with `get_profile`, then inspect top hotspot function(s) first.",
+            "Profile data is already provided above. Start by inspecting top hotspot function(s) with `read_file`.",
+            "",
+            "## Critical: Algorithmic Analysis Required",
+            "For each top hotspot function, you MUST analyze:",
+            "1. Loop exit conditions — can the loop terminate earlier under certain conditions?",
+            "2. Caller context — how is this function invoked? Are there parameters that bound the work?",
+            "3. Redundant computation — does the function recompute values available from prior calls?",
+            "4. Common-case fast paths — is there a frequent input pattern that could skip most work?",
+            "Do NOT skip this analysis and jump straight to SIMD/data-layout proposals.",
+            "Algorithmic optimizations (adding one early-exit condition) routinely yield 10-50% speedup,",
+            "while SIMD/data-layout changes typically yield 2-5% and carry high crash risk.",
             "",
             "## Final Output Constraints",
             "Final answer must be ONE compact JSON object only (no markdown fences).",
             "Keep `reference_code` and evidence snippets concise; avoid dumping long code blocks.",
+            "Include at least 2-3 opportunities with mechanism='algorithmic'.",
+            "Do not repeat opportunities listed in Previous-Round Feedback failed/skipped ids unless you provide a concrete, changed implementation path.",
         ])
         return "\n".join(parts)
 
@@ -818,6 +889,7 @@ class DeepCodeAnalysisAgent:
             success_prob = max(0.05, min(0.95, float(opp.confidence)))
             implementation_cost = float(self._complexity_to_cost(opp.implementation_complexity))
             composability_score = self._composability_score(opp)
+            anchor_hint = self._extract_anchor_hint(opp)
             node = OpportunityNode(
                 opportunity_id=opp.opportunity_id or f"opportunity_{idx}",
                 title=opp.title or f"Opportunity {idx}",
@@ -848,6 +920,8 @@ class DeepCodeAnalysisAgent:
                     "diagnosis": opp.diagnosis,
                     "compiler_gap": opp.compiler_gap,
                     "category": opp.category,
+                    "anchor_hint": anchor_hint,
+                    "code_context": str(opp.code_context or "")[:1200],
                 },
             )
             nodes.append(node)
@@ -996,6 +1070,31 @@ class DeepCodeAnalysisAgent:
         if mechanism:
             return mechanism
         return "Reduce bottleneck in hotspot function with source-level restructuring."
+
+    def _extract_anchor_hint(self, opportunity: Any) -> str:
+        """Extract a patchable anchor hint (2-3 exact lines) from code context."""
+        raw = str(getattr(opportunity, "code_context", "") or "").strip()
+        if not raw:
+            raw = str(getattr(opportunity, "reference_code", "") or "").strip()
+        if not raw:
+            return ""
+        lines = [line.rstrip() for line in raw.splitlines()]
+        cleaned: List[str] = []
+        for line in lines:
+            text = line.strip()
+            if not text:
+                continue
+            if text.startswith("```"):
+                continue
+            if text.lower().startswith("code_context"):
+                continue
+            cleaned.append(line)
+            if len(cleaned) >= 3:
+                break
+        if not cleaned:
+            return ""
+        hint = "\n".join(cleaned)
+        return hint[:320]
 
     def _normalize_speedup(self, gain: float) -> float:
         if gain > 1.0:

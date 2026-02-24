@@ -83,7 +83,7 @@ def profile_job(
         artifacts_dir=artifacts_dir,
         launcher_cfg=launcher_cfg,
         profiling_cfg=profiling_cfg,
-        is_baseline=is_baseline,
+        is_profile_run=bool(profiling_cfg),
     )
     if xctrace_note:
         notes.append(xctrace_note)
@@ -144,16 +144,20 @@ def _maybe_run_xctrace(
     artifacts_dir: Path,
     launcher_cfg: Optional[Dict[str, object]],
     profiling_cfg: Optional[Dict[str, object]],
-    is_baseline: bool,
+    is_profile_run: bool,
 ) -> Optional[str]:
     cfg = profiling_cfg.get("xctrace", {}) if isinstance(profiling_cfg, dict) else {}
     if not isinstance(cfg, dict):
         return None
     if not cfg.get("enabled", False):
         return None
-    # Default to baseline-only profiling to avoid exploding phase-1 cost.
-    # Users can explicitly set baseline_only: false when they want full tracing.
-    if cfg.get("baseline_only", True) and not is_baseline:
+    # Run xctrace only on dedicated profile runs by default.
+    # Backward-compat: accept legacy key `baseline_only`.
+    profile_runs_only_raw = cfg.get("profile_runs_only")
+    if profile_runs_only_raw is None:
+        profile_runs_only_raw = cfg.get("baseline_only", True)
+    profile_runs_only = bool(profile_runs_only_raw)
+    if profile_runs_only and not is_profile_run:
         return None
     if platform.system().lower() != "darwin":
         return "xctrace skipped: non-macos"
@@ -166,11 +170,12 @@ def _maybe_run_xctrace(
         )
 
     template = str(cfg.get("template", "Time Profiler"))
-    timeout_seconds = cfg.get("timeout_seconds", 1800)
+    timeout_seconds = cfg.get("timeout_seconds", 0)
     try:
-        timeout_seconds = max(30, int(timeout_seconds))
+        parsed_timeout = float(timeout_seconds)
     except (TypeError, ValueError):
-        timeout_seconds = 1800
+        parsed_timeout = 0.0
+    timeout_seconds = parsed_timeout if parsed_timeout > 0 else None
 
     record_args = cfg.get("record_args", [])
     export_args = cfg.get("export_args", [])
@@ -280,7 +285,7 @@ def _resolve_xctrace_path() -> Optional[str]:
             capture_output=True,
             text=True,
             check=False,
-            timeout=10,
+            timeout=None,
         )
     except Exception:
         return None

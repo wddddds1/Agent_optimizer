@@ -11,13 +11,17 @@ defaults:
   chain_within_iteration: true
   simple_patch_loop:
     enabled: true
-    max_candidates_per_iteration: 5
+    max_candidates_per_iteration: 3
   evaluation:
     baseline_repeats: 1
     candidate_repeats_stage0: 1
     candidate_repeats_stage1: 1
     top1_validation_repeats: 0
     use_successive_halving: false
+  # If true, each source_patch run executes an extra baseline_check replay and
+  # verifier prefers that runtime as comparison base. Default false: compare
+  # directly against current best chain runtime (baseline_exp_for_verify).
+  source_patch_baseline_check_each_run: false
   fuse_rules:
     max_compile_fails: 2
     max_runtime_fails: 3
@@ -85,6 +89,13 @@ defaults:
     targets: ["run_config", "build_config"]
     max_candidates_per_family: 1
     max_total_candidates: 2
+  patch_exploration:
+    allow_repo_wide: true
+    max_repo_files: 1200
+    max_navigation_hints: 64
+    # Disabled by default: family-level exhaustion can prematurely stop
+    # source-patch iterations when deep analysis proposes one mechanism cluster.
+    exhaust_family_after_failures: 0
   memory:
     enabled: true
     min_gain_pct: 0.1
@@ -109,7 +120,7 @@ defaults:
     api_key_env: "DEEPSEEK_API_KEY"
     base_url: "https://api.deepseek.com"
     model: "deepseek-chat"
-    request_timeout_sec: 120
+    request_timeout_sec: 0
     api_timeout_retries: 2
     max_turns: 25
     max_tool_calls_per_turn: 5
@@ -118,7 +129,7 @@ defaults:
     api_key_env: "DEEPSEEK_API_KEY"
     base_url: "https://api.deepseek.com"
     model: "deepseek-chat"
-    request_timeout_sec: 120
+    request_timeout_sec: 0
     api_timeout_retries: 2
     temperature: 0.3
     max_tokens: 4096
@@ -146,20 +157,22 @@ defaults:
     deep_analysis:
       enabled: true
       strict_required: false
-      top_k: 8
-      max_context_retry: 1
+      top_k: 6
+      max_context_retry: 3
       discovery_timeout_sec: 0
       refresh_discovery_timeout_sec: 0
       refresh_each_iteration: true
+      skip_first_refresh: true
+      algorithm_preanalysis_on_refresh: false
       api_key_env: "DEEPSEEK_API_KEY"
       base_url: "https://api.deepseek.com"
       model: "deepseek-chat"
-      request_timeout_sec: 120
+      request_timeout_sec: 0
       api_timeout_retries: 2
       temperature: 0.3
       max_tokens: 4096
-      max_turns: 30
-      max_tool_calls_per_turn: 5
+      max_turns: 16
+      max_tool_calls_per_turn: 3
       selection_policy:
         cost_penalty_power: 0.65
         cost_penalty_weight: 0.7

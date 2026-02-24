@@ -154,7 +154,7 @@ class AgentConfig:
     max_invalid_tool_calls_total: int = 5
     max_invalid_tool_calls_per_tool: int = 2
     strict_availability: bool = True
-    request_timeout_sec: float = 120.0
+    request_timeout_sec: float = 0.0
     api_timeout_retries: int = 2
 
 
