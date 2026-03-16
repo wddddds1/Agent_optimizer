@@ -21,6 +21,7 @@ from orchestrator.agent_llm import (
     AgentSession,
     MAX_TURNS_SENTINEL,
 )
+from orchestrator.llm_client import _safe_json_loads as _llm_safe_json_loads
 from schemas.code_analysis_ir import DeepCodeAnalysisResult
 from schemas.opportunity_graph import (
     MACRO_MECHANISMS,
@@ -1276,6 +1277,16 @@ class DeepCodeAnalysisAgent:
         """Extract an analysis-like JSON object from free-form text."""
         if not text:
             return None
+
+        # First, try the robust JSON parser from llm_client (handles truncated
+        # responses via _repair_truncated_json_object, lone-backslash fix,
+        # invalid-escape sanitization, and thinking-trace stripping).
+        repaired = _llm_safe_json_loads(text)
+        if isinstance(repaired, dict) and self._is_analysis_like_payload(repaired):
+            return repaired
+
+        # Fall back to the sliding-window raw_decode approach which can extract
+        # individual complete sub-objects even from a truncated outer structure.
         payloads: List[Dict[str, Any]] = []
         candidates: List[str] = []
         for pattern in (

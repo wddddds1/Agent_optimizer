@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -50,13 +52,98 @@ def ensure_output_capture(
 # Drift detection
 # ---------------------------------------------------------------------------
 
+def _load_sam_stats(path: Path) -> Optional[Dict[str, object]]:
+    """Load SAM alignment statistics from a pre-extracted summary JSON or a SAM file.
+
+    Accepts either:
+    - ``*.sam_summary.json``: a JSON file produced by ``_bwa_shrink_capture_to_summary``
+      in graph.py, containing the already-computed stats dict.  This path is preferred
+      and avoids loading hundreds of gigabytes into memory.
+    - any other file: treated as a SAM file and stream-parsed line by line so the
+      full file is never loaded into RAM at once.
+    """
+    if not path.exists():
+        return None
+
+    if path.name.endswith(".sam_summary.json"):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return None
+            # Return with original types; all values are ints.
+            return {k: int(v) for k, v in raw.items() if isinstance(v, (int, float))}
+        except Exception:
+            return None
+
+    # Stream-parse the SAM file without loading it entirely into RAM.
+    total = mapped = unmapped = primary = secondary = supplementary = 0
+    nm_sum = mapq_sum = hash_xor = hash_sum = 0
+    mask64 = (1 << 64) - 1
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                line = raw_line.rstrip("\n")
+                if line.startswith("@"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 11:
+                    continue
+                try:
+                    flag = int(parts[1])
+                    pos = int(parts[3])
+                    mapq = int(parts[4])
+                except (TypeError, ValueError):
+                    continue
+                total += 1
+                mapq_sum += mapq
+                if flag & 0x4:
+                    unmapped += 1
+                else:
+                    mapped += 1
+                if flag & 0x100:
+                    secondary += 1
+                if flag & 0x800:
+                    supplementary += 1
+                if not (flag & 0x100) and not (flag & 0x800):
+                    primary += 1
+                for field in parts[11:]:
+                    if field.startswith("NM:i:"):
+                        try:
+                            nm_sum += int(field[5:])
+                        except ValueError:
+                            pass
+                        break
+                key = f"{parts[0]}\t{flag}\t{parts[2]}\t{pos}\t{parts[5]}\t{parts[9]}"
+                digest = hashlib.sha1(key.encode("utf-8", errors="replace")).digest()
+                value = int.from_bytes(digest[:8], "big", signed=False)
+                hash_xor ^= value
+                hash_sum = (hash_sum + value) & mask64
+    except Exception:
+        return None
+
+    if total < 10:
+        return None
+    return {
+        "total": total,
+        "mapped": mapped,
+        "unmapped": unmapped,
+        "primary": primary,
+        "secondary": secondary,
+        "supplementary": supplementary,
+        "mapq_sum": mapq_sum,
+        "nm_sum": nm_sum,
+        "hash_xor": hash_xor,
+        "hash_sum": hash_sum,
+    }
+
+
 def compute_drift(
     baseline_path: str,
     candidate_path: str,
     thresholds: Dict[str, object],
 ) -> "DriftReport":
     """Compute BWA output drift by comparing SAM summary statistics."""
-    from skills.verify import DriftReport, _sam_summary
+    from skills.verify import DriftReport
 
     bp = Path(baseline_path)
     cp = Path(candidate_path)
@@ -74,10 +161,8 @@ def compute_drift(
             thresholds_used=thresholds,
         )
 
-    base_lines = bp.read_text(encoding="utf-8", errors="replace").splitlines()
-    cand_lines = cp.read_text(encoding="utf-8", errors="replace").splitlines()
-    base_sam = _sam_summary(base_lines)
-    cand_sam = _sam_summary(cand_lines)
+    base_sam = _load_sam_stats(bp)
+    cand_sam = _load_sam_stats(cp)
 
     if not base_sam or not cand_sam:
         return DriftReport(

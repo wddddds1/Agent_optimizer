@@ -172,7 +172,7 @@ defaults:
       temperature: 0.3
       max_tokens: 4096
       max_turns: 16
-      max_tool_calls_per_turn: 3
+      max_tool_calls_per_turn: 10
       selection_policy:
         cost_penalty_power: 0.65
         cost_penalty_weight: 0.7

@@ -11,6 +11,8 @@ from schemas.job_ir import JobIR
 from schemas.profile_report import ProfileReport
 from skills.applications import parse_timing_breakdown as app_parse_timing_breakdown
 from skills.metrics_parse import (
+    parse_perf_report_stdio,
+    parse_perf_stat,
     parse_tau_profile,
     parse_time_output,
     parse_xctrace_report,
@@ -73,6 +75,41 @@ def profile_job(
         tau_hotspots = parse_tau_profile(str(tau_dir))
         if not tau_hotspots:
             notes.append(tau_empty_note)
+
+    # perf stat: parse hardware counters (instructions, cycles, cache/branch misses)
+    # Written by perf_wrapper.sh alongside perf.data.
+    perf_stat_file = artifacts_dir / "perf" / "perf_stat.txt"
+    if perf_stat_file.is_file():
+        try:
+            stat_text = perf_stat_file.read_text(encoding="utf-8", errors="replace")
+            stat_metrics = parse_perf_stat(stat_text)
+            # Only merge keys not already provided by a higher-priority source
+            for k, v in stat_metrics.items():
+                system_metrics.setdefault(k, v)
+        except Exception:
+            pass
+
+    # perf profiling: run "perf report --stdio" on perf.data if present
+    perf_data = artifacts_dir / "perf" / "perf.data"
+    if perf_data.is_file() and not tau_hotspots:
+        try:
+            result = subprocess.run(
+                [
+                    "perf", "report",
+                    "-i", str(perf_data),
+                    "--stdio", "--no-children", "-n",
+                    "--percent-limit", "0.1",
+                ],
+                capture_output=True, text=True, check=False, timeout=60,
+            )
+            perf_hotspots = parse_perf_report_stdio(result.stdout, top_n=30)
+            if perf_hotspots:
+                tau_hotspots = perf_hotspots
+                if tau_empty_note in notes:
+                    notes = [n for n in notes if n != tau_empty_note]
+                notes.append("hotspots_source=perf")
+        except Exception as exc:
+            notes.append(f"perf report failed: {exc}")
 
     xctrace_hotspots: List[Dict[str, object]] = []
     xctrace_note = _maybe_run_xctrace(

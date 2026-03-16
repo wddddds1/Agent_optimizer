@@ -38,6 +38,13 @@ _LLM_BACKEND_PRESETS = {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-5",
     },
+    "kimi": {
+        "provider": "kimi",
+        "api_key_env": "KIMI_API_KEY",
+        "base_url": "https://api.moonshot.cn/v1",
+        "model": "kimi-k2.5",
+        "temperature": 1,  # kimi-k2.5 only supports temperature=1
+    },
 }
 
 
@@ -364,6 +371,13 @@ def main() -> None:
         help="Fix OMP thread count and skip thread sweep if set",
     )
     parser.add_argument(
+        "--optimize-parallelism",
+        action="store_true",
+        default=False,
+        help="Allow the optimizer to sweep thread counts.  Off by default; "
+             "set this flag to enable parallel-scaling candidates (e.g. 128t, 64t).",
+    )
+    parser.add_argument(
         "--validate-top1-repeats",
         type=int,
         default=None,
@@ -371,15 +385,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        choices=["deepseek", "openai"],
+        choices=["deepseek", "openai", "kimi"],
         default=None,
-        help="Simple provider preset: deepseek or openai (maps to gpt-5).",
+        help="Simple provider preset: deepseek, openai (maps to gpt-5), or kimi (kimi-k2.5).",
     )
     parser.add_argument(
         "--llm-backend",
-        choices=["deepseek", "openai", "codex", "custom"],
+        choices=["deepseek", "openai", "codex", "kimi", "custom"],
         default="deepseek",
-        help="LLM backend preset (default: deepseek). 'codex' is an alias of openai; use custom for full manual config.",
+        help="LLM backend preset (default: deepseek). 'codex' is an alias of openai; 'kimi' uses Moonshot API; use custom for full manual config.",
     )
     parser.add_argument(
         "--llm-model",
@@ -746,6 +760,7 @@ def main() -> None:
         min_improvement_pct=float(env_cfg.get("experiment", {}).get("min_improvement_pct", 0.0)),
         resume_state=resume_state,
         fixed_threads=args.fixed_threads,
+        optimize_parallelism=args.optimize_parallelism,
         skip_baseline=skip_baseline,
         drift_verify_mode=args.drift_verify_mode,
         split_drift_test=args.split_drift_test,

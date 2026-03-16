@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import openai
 
 from orchestrator.errors import LLMUnavailableError
+from orchestrator.llm_client import _safe_json_loads as _llm_safe_json_loads
 
 MAX_TURNS_SENTINEL = "[Max turns reached]"
 TOOL_REPAIR_EXHAUSTED_SENTINEL = "[Tool call repair exhausted]"
@@ -57,10 +58,12 @@ def _promote_max_completion_tokens(payload: Dict[str, Any]) -> None:
 
 def _needs_default_temperature(exc: Exception) -> bool:
     text = str(exc).lower()
+    if "temperature" not in text:
+        return False
     return (
-        "temperature" in text
-        and "unsupported" in text
-        and "default (1)" in text
+        ("unsupported" in text and "default (1)" in text)
+        or "only 1 is allowed" in text
+        or "invalid temperature" in text
     )
 
 
@@ -115,12 +118,15 @@ class Message:
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None  # For tool response messages
     name: Optional[str] = None  # Tool name for tool responses
+    reasoning_content: Optional[str] = None  # Extended thinking (Kimi K2.5, o1, etc.)
 
     def to_api_format(self) -> Dict[str, Any]:
         """Convert to OpenAI API format."""
         msg: Dict[str, Any] = {"role": self.role}
         if self.content is not None:
             msg["content"] = self.content
+        if self.reasoning_content is not None and self.role == "assistant":
+            msg["reasoning_content"] = self.reasoning_content
         if self.tool_calls:
             msg["tool_calls"] = [
                 {
@@ -180,13 +186,15 @@ class AgentSession:
     def add_assistant_message(
         self,
         content: Optional[str] = None,
-        tool_calls: Optional[List[ToolCall]] = None
+        tool_calls: Optional[List[ToolCall]] = None,
+        reasoning_content: Optional[str] = None,
     ) -> None:
         """Add an assistant message."""
         self.messages.append(Message(
             role="assistant",
             content=content,
-            tool_calls=tool_calls
+            tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
         ))
 
     def add_tool_result(self, tool_call_id: str, tool_name: str, result: str) -> None:
@@ -457,14 +465,22 @@ class AgentLLMClient:
                         parse_error=parse_error,
                     ))
 
+                # Truncate to the calls we will actually respond to.
+                # The assistant message must only contain tool_calls that have
+                # corresponding tool-result messages; any extras would cause
+                # strict providers (e.g. Kimi) to reject the history with
+                # "tool_call_id did not have response messages".
+                effective_tool_calls = tool_calls[:self.config.max_tool_calls_per_turn]
+
                 # Add assistant message with tool calls
                 session.add_assistant_message(
                     content=message.content,
-                    tool_calls=tool_calls,
+                    tool_calls=effective_tool_calls,
+                    reasoning_content=getattr(message, "reasoning_content", None),
                 )
 
                 # Execute tools and add results
-                for tc in tool_calls[:self.config.max_tool_calls_per_turn]:
+                for tc in effective_tool_calls:
                     tool = session.tools.get(tc.name)
                     is_invalid_call = False
                     if tool:
@@ -506,7 +522,10 @@ class AgentLLMClient:
 
             # No tool calls - we have a final response
             content = message.content or ""
-            session.add_assistant_message(content=content)
+            session.add_assistant_message(
+                content=content,
+                reasoning_content=getattr(message, "reasoning_content", None),
+            )
             return content
 
         return MAX_TURNS_SENTINEL
@@ -545,6 +564,12 @@ class AgentLLMClient:
                     return json.loads(content[start:end + 1])
                 except json.JSONDecodeError:
                     pass
+
+        # Robust fallback: use the shared repair logic (handles truncated
+        # responses, invalid escape sequences, thinking traces, embedded fences).
+        result = _llm_safe_json_loads(content)
+        if isinstance(result, dict):
+            return result
         return None
 
 

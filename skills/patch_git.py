@@ -216,14 +216,50 @@ class GitPatchContext(AbstractContextManager):
             return parts[2]
         return None
 
+    def _submodule_relevant(self, sub_path: Path) -> bool:
+        """Return True if sub_path overlaps with the current patch_root scope.
+
+        When patch_root is set we only need the submodule whose tree is actually
+        being patched.  All other submodules are irrelevant and must be skipped —
+        attempting to create worktrees for them is wasteful and will hard-fail
+        when their pinned commit is absent from a shallow local clone.
+        """
+        if self.patch_root is None:
+            return True
+        sub_str = str(sub_path)
+        root_str = str(self.patch_root)
+        # relevant when: exact match, patch_root is inside sub_path, or sub_path is inside patch_root
+        return (
+            root_str == sub_str
+            or root_str.startswith(sub_str + "/")
+            or sub_str.startswith(root_str + "/")
+        )
+
+    def _submodule_commit_exists(self, source_repo: Path, commit: str) -> bool:
+        """Return True if *commit* is present in the submodule's local object store."""
+        result = subprocess.run(
+            ["git", "-C", str(source_repo), "cat-file", "-t", commit],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
     def _init_submodule_worktrees(self) -> None:
         for sub_path in self._submodule_paths():
+            # Skip submodules that are outside the patch scope entirely.
+            if not self._submodule_relevant(sub_path):
+                continue
             commit = self._submodule_commit(sub_path)
             if not commit:
                 continue
             source_repo = (self.repo_root / sub_path).resolve()
             if not source_repo.exists():
                 raise RuntimeError(f"Submodule not initialized: {sub_path}")
+            # Safety net: if the pinned commit is absent (shallow clone etc.) skip
+            # rather than letting git worktree add fail with a cryptic exit-128.
+            if not self._submodule_commit_exists(source_repo, commit):
+                continue
             target = (self.worktree_dir / sub_path).resolve()
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)

@@ -6189,6 +6189,7 @@ def _prepare_actions(
     adapter_cfg: Optional[Dict[str, object]],
     job: JobIR,
     fixed_threads: Optional[int] = None,
+    optimize_parallelism: bool = False,
 ) -> List[ActionIR]:
     selected_policy = _select_candidate_policy(candidate_policy, job.case_id)
     actions = _expand_dynamic_actions(
@@ -6197,6 +6198,7 @@ def _prepare_actions(
         system_caps,
         experiments,
         fixed_threads=fixed_threads,
+        optimize_parallelism=optimize_parallelism,
     )
     actions = _filter_fixed_threads(actions, fixed_threads)
     actions = _apply_adapter(actions, adapter_cfg, job)
@@ -6243,6 +6245,7 @@ def _expand_dynamic_actions(
     system_caps: Dict[str, object],
     experiments: List[ExperimentIR],
     fixed_threads: Optional[int] = None,
+    optimize_parallelism: bool = False,
 ) -> List[ActionIR]:
     policy = candidate_policy or {}
     families_cfg = policy.get("families", {}) if isinstance(policy, dict) else {}
@@ -6252,6 +6255,7 @@ def _expand_dynamic_actions(
         system_caps,
         experiments,
         fixed_threads=fixed_threads,
+        optimize_parallelism=optimize_parallelism,
     )
     allowed_templates = _allowed_templates(threads_cfg)
     if not thread_candidates:
@@ -6274,9 +6278,12 @@ def _thread_candidates(
     system_caps: Dict[str, object],
     experiments: List[ExperimentIR],
     fixed_threads: Optional[int] = None,
+    optimize_parallelism: bool = False,
 ) -> List[int]:
     if fixed_threads is not None:
         return [int(fixed_threads)]
+    if not optimize_parallelism:
+        return []
     if not cfg:
         return []
     stop_on_peak = bool(cfg.get("stop_on_peak", False))
@@ -6907,6 +6914,7 @@ def run_optimization(
     min_improvement_pct: float = 0.0,
     resume_state: Optional[Dict[str, object]] = None,
     fixed_threads: Optional[int] = None,
+    optimize_parallelism: bool = False,
     skip_baseline: bool = False,
     drift_verify_mode: str = "inline",
     split_drift_test: str = "off",
@@ -8618,6 +8626,7 @@ def run_optimization(
             adapter_cfg=adapter_cfg,
             job=job,
             fixed_threads=fixed_threads,
+            optimize_parallelism=optimize_parallelism,
         )
         phase_targets = _phase_targets(phase)
         iteration_actions = _filter_actions_by_targets(all_actions, phase_targets)
@@ -12999,6 +13008,7 @@ def run_optimization(
             adapter_cfg=adapter_cfg,
             job=job,
             fixed_threads=fixed_threads,
+            optimize_parallelism=optimize_parallelism,
         )
         review_actions = _filter_actions_by_targets(refreshed_actions, _phase_targets(phase))
         if not review_actions:
@@ -13849,7 +13859,14 @@ def _run_experiment(
                 patch_path = str(ctx.patch_path)
                 git_before = ctx.git_commit_before
                 git_after = ctx.git_commit_after
-                workdir = ctx.map_to_worktree(Path(base_job_snapshot.workdir))
+                _orig_workdir_path = Path(base_job_snapshot.workdir)
+                try:
+                    workdir = ctx.map_to_worktree(_orig_workdir_path)
+                except ValueError:
+                    # workdir is outside the repo (e.g. a data directory like S1/).
+                    # It doesn't live inside the worktree — keep the original path so
+                    # the process can still resolve relative input-file arguments.
+                    workdir = _orig_workdir_path
                 input_script = ctx.map_to_worktree(input_script)
                 job_snapshot.workdir = str(workdir)
                 job_snapshot.input_script = str(input_script)
@@ -14182,6 +14199,18 @@ def _run_experiment(
                 run_output, profile, baseline_runtime, runtime_agg, prior_samples
             )
             if capture_paths:
+                _write_capture_paths(run_dir, capture_paths)
+            # For BWA: immediately convert output.sam to a tiny summary JSON and
+            # delete the large SAM file so it doesn't accumulate across runs.
+            # The summary JSON (~1 KB) is sufficient for drift comparison.
+            if (
+                str(job_snapshot.app or "").strip().lower() == "bwa"
+                and capture_paths
+                and int(run_output.exit_code) == 0
+            ):
+                capture_paths = _bwa_shrink_capture_to_summary(
+                    capture_paths, trace_events, run_id, iteration
+                )
                 _write_capture_paths(run_dir, capture_paths)
             base_runtime_for_verify = None
             if (
@@ -14636,11 +14665,13 @@ def _resolve_wrappers(
         env.setdefault("TAU_PROFILE", "1")
         env.setdefault("TAU_TRACE", "0")
         env.setdefault("TAU_PROFILE_FORMAT", "profile")
-        env.setdefault("TAU_PROFILEDIR", str(wrapper_dir))
+        env.setdefault("PROFILEDIR", str(wrapper_dir))
         env.setdefault("TAU_SAMPLING", "1")
         env.setdefault("TAU_EBS_SOURCE", "itimer")
         env.setdefault("TAU_EBS_PERIOD", "100000")
         env.setdefault("TAU_EBS_UNWIND", "0")
+    elif selected.get("id") == "perf":
+        env.setdefault("PERF_DATA_FILE", str(wrapper_dir / "perf.data"))
 
     allowed_exit_codes: List[int] = []
     raw_codes = selected.get("allowed_exit_codes")
@@ -15583,6 +15614,136 @@ def _extract_runtime_improvement_pct(exp: Optional[ExperimentIR]) -> Optional[fl
     except (TypeError, ValueError):
         pass
     return None
+
+
+def _bwa_shrink_capture_to_summary(
+    capture_paths: List[str],
+    trace_events: Optional[List[Dict[str, object]]],
+    run_id: Optional[str],
+    iteration: Optional[int],
+) -> List[str]:
+    """Convert BWA output.sam files to tiny summary JSONs immediately after a run.
+
+    Stream-reads each ``.sam`` file in *capture_paths*, extracts alignment
+    statistics (total, mapped, NM, MAPQ, hash fingerprint), writes them to a
+    ``*.sam_summary.json`` sidecar, then deletes the full SAM.  The returned
+    list replaces the original paths with the summary paths so that
+    ``capture_paths.json`` points to the small files and drift comparison in
+    ``bwa_app.compute_drift`` loads from JSON instead of re-reading the SAM.
+
+    This keeps at most the current run's SAM on disk during the BWA process;
+    once the run finishes the multi-hundred-GB file is immediately reclaimed.
+    """
+    import hashlib as _hashlib
+
+    new_paths: List[str] = []
+    for path_str in capture_paths:
+        p = Path(path_str)
+        if p.suffix != ".sam" or not p.is_file():
+            new_paths.append(path_str)
+            continue
+
+        # Stream-parse the SAM — never load the full file into RAM.
+        total = mapped = unmapped = primary = secondary = supplementary = 0
+        nm_sum = mapq_sum = hash_xor = hash_sum = 0
+        mask64 = (1 << 64) - 1
+        parse_ok = True
+        try:
+            with p.open("r", encoding="utf-8", errors="replace") as fh:
+                for raw_line in fh:
+                    line = raw_line.rstrip("\n")
+                    if line.startswith("@"):
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) < 11:
+                        continue
+                    try:
+                        flag = int(parts[1])
+                        pos = int(parts[3])
+                        mapq = int(parts[4])
+                    except (TypeError, ValueError):
+                        continue
+                    total += 1
+                    mapq_sum += mapq
+                    if flag & 0x4:
+                        unmapped += 1
+                    else:
+                        mapped += 1
+                    if flag & 0x100:
+                        secondary += 1
+                    if flag & 0x800:
+                        supplementary += 1
+                    if not (flag & 0x100) and not (flag & 0x800):
+                        primary += 1
+                    for field in parts[11:]:
+                        if field.startswith("NM:i:"):
+                            try:
+                                nm_sum += int(field[5:])
+                            except ValueError:
+                                pass
+                            break
+                    key = f"{parts[0]}\t{flag}\t{parts[2]}\t{pos}\t{parts[5]}\t{parts[9]}"
+                    digest = _hashlib.sha1(key.encode("utf-8", errors="replace")).digest()
+                    value = int.from_bytes(digest[:8], "big", signed=False)
+                    hash_xor ^= value
+                    hash_sum = (hash_sum + value) & mask64
+        except Exception as exc:
+            parse_ok = False
+            if trace_events is not None:
+                trace_events.append({
+                    "event": "bwa_sam_shrink_parse_error",
+                    "agent": "Orchestrator",
+                    "run_id": run_id,
+                    "iteration": iteration,
+                    "path": path_str,
+                    "error": str(exc),
+                })
+
+        if not parse_ok or total < 10:
+            # Keep the original SAM path so drift checker can still attempt to use it.
+            new_paths.append(path_str)
+            continue
+
+        sam_stats = {
+            "total": total,
+            "mapped": mapped,
+            "unmapped": unmapped,
+            "primary": primary,
+            "secondary": secondary,
+            "supplementary": supplementary,
+            "mapq_sum": mapq_sum,
+            "nm_sum": nm_sum,
+            "hash_xor": hash_xor,
+            "hash_sum": hash_sum,
+        }
+        summary_path = p.with_name(p.stem + ".sam_summary.json")
+        try:
+            summary_path.write_text(json.dumps(sam_stats), encoding="utf-8")
+            p.unlink()
+            if trace_events is not None:
+                trace_events.append({
+                    "event": "bwa_sam_shrunk_to_summary",
+                    "agent": "Orchestrator",
+                    "run_id": run_id,
+                    "iteration": iteration,
+                    "original_path": path_str,
+                    "summary_path": str(summary_path),
+                    "total_reads": total,
+                })
+            new_paths.append(str(summary_path))
+        except Exception as exc:
+            if trace_events is not None:
+                trace_events.append({
+                    "event": "bwa_sam_shrink_write_error",
+                    "agent": "Orchestrator",
+                    "run_id": run_id,
+                    "iteration": iteration,
+                    "path": path_str,
+                    "error": str(exc),
+                })
+            new_paths.append(path_str)
+
+    return new_paths
 
 
 def _write_capture_paths(run_dir: Path, capture_paths: List[str]) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -116,6 +117,21 @@ class LLMClient:
                 ],
             )
         except Exception as exc:
+            if _needs_default_temperature(exc):
+                try:
+                    self._chat_create(
+                        model=self.config.model,
+                        temperature=1,
+                        max_tokens=1,
+                        messages=[
+                            {"role": "system", "content": "Reply with OK."},
+                            {"role": "user", "content": "OK"},
+                        ],
+                    )
+                    self._prefer_default_temperature = True
+                    return
+                except Exception:
+                    pass
             hint = _chat_api_compat_hint(exc, self.config.model)
             raise LLMUnavailableError(
                 f"Model preflight failed for {self.config.model}: {hint}"
@@ -346,11 +362,63 @@ class LLMClient:
         return data
 
 
+# ---------------------------------------------------------------------------
+# Compiled regexes used by the JSON-recovery helpers below.
+# ---------------------------------------------------------------------------
+
+# Strips <think>/<thinking> blocks that some reasoning models (e.g. kimi-k2.5)
+# embed in message.content rather than a separate reasoning_content field.
+_THINK_BLOCK_RE = re.compile(
+    r"<think(?:ing)?>.*?</think(?:ing)?>",
+    re.DOTALL | re.IGNORECASE,
+)
+_THINK_OPEN_RE = re.compile(r"<think(?:ing)?>", re.IGNORECASE)
+
+# Matches invalid JSON escape sequences: \X where X is not one of the eight
+# characters that JSON allows after a backslash (" \ / b f n r t u).
+_INVALID_ESCAPE_RE = re.compile(r'\\([^"\\/bfnrtu])')
+
+
+def _strip_thinking_traces(text: str) -> str:
+    """Remove <think>/<thinking> blocks embedded by reasoning models.
+
+    Some providers put chain-of-thought inside message.content rather than a
+    separate reasoning_content field.  These blocks contain prose and code
+    with braces/brackets that break JSON extraction.
+    """
+    text = _THINK_BLOCK_RE.sub("", text).strip()
+    # If an unclosed opening tag remains (truncated response), drop everything
+    # from that tag onward — there is no usable JSON after it.
+    m = _THINK_OPEN_RE.search(text)
+    if m:
+        text = text[: m.start()].strip()
+    return text
+
+
+def _sanitize_json_escapes(text: str) -> str:
+    r"""Replace invalid JSON escape sequences with their escaped form.
+
+    JSON only allows \", \\, \/, \b, \f, \n, \r, \t, \uXXXX after a
+    backslash.  When an LLM truncates its output inside a C/shell code string,
+    sequences like \q (printf format), \a (alert), \v (vertical tab), \x41
+    (hex), or \0 (octal) can appear.  We replace \X → \\X so json.loads can
+    at least parse the structure; the string value will be slightly different
+    but the JSON dict becomes available to the caller.
+    """
+    return _INVALID_ESCAPE_RE.sub(r"\\\\\1", text)
+
+
 def _safe_json_loads(content: str) -> Optional[object]:
     text = (content or "").strip()
     if not text:
         return None
-    # Common case: fenced JSON.
+
+    # Strip thinking/reasoning traces (e.g. kimi-k2.5 extended thinking).
+    # Fall back to original text when stripping removes everything.
+    stripped = _strip_thinking_traces(text)
+    text = stripped if stripped else text
+
+    # Common case: response starts with a fenced code block.
     if text.startswith("```"):
         lines = text.splitlines()
         if lines and lines[0].startswith("```"):
@@ -362,6 +430,15 @@ def _safe_json_loads(content: str) -> Optional[object]:
     parsed = _json_load_with_fallback(text)
     if parsed is not None:
         return parsed
+
+    # Also handle fenced blocks embedded after preamble text (e.g.
+    # "Here is the JSON:\n```json\n{...}\n```").
+    fence_m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if fence_m:
+        inner = fence_m.group(1).strip()
+        parsed = _json_load_with_fallback(inner)
+        if parsed is not None:
+            return parsed
 
     snippet = _extract_balanced_object(text)
     if snippet:
@@ -386,6 +463,14 @@ def _json_load_with_fallback(text: str) -> Optional[object]:
     try:
         return json.loads(text, strict=False)
     except json.JSONDecodeError:
+        pass
+    # Final attempt: sanitize invalid JSON escape sequences that arise when
+    # LLM output is truncated inside C/shell code strings (e.g. \q, \a, \v,
+    # \x41, \0nn).  Replace \X (where X is not a valid JSON escape char) with
+    # \\X so the resulting text is parseable.
+    try:
+        return json.loads(_sanitize_json_escapes(text), strict=False)
+    except (json.JSONDecodeError, ValueError):
         return None
 
 
@@ -483,7 +568,15 @@ def _auto_close_json_fragment(fragment: str) -> str:
             continue
     out = fragment
     if in_string:
-        out += '"'
+        if escape:
+            # Fragment ends with a lone backslash inside a string (truncated
+            # mid-escape-sequence, e.g. "value\").  Simply appending '"' would
+            # produce '\"' which is an escaped quote — the string would remain
+            # open and all closing brackets would land inside it.  Instead,
+            # drop the stray backslash, then close the string cleanly.
+            out = out[:-1] + '"'
+        else:
+            out += '"'
     while stack:
         out += stack.pop()
     return out
@@ -573,10 +666,12 @@ def _promote_max_completion_tokens(payload: Dict[str, Any]) -> None:
 
 def _needs_default_temperature(exc: Exception) -> bool:
     text = str(exc).lower()
+    if "temperature" not in text:
+        return False
     return (
-        "temperature" in text
-        and "unsupported" in text
-        and "default (1)" in text
+        ("unsupported" in text and "default (1)" in text)
+        or "only 1 is allowed" in text
+        or "invalid temperature" in text
     )
 
 

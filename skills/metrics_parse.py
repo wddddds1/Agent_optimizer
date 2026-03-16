@@ -469,6 +469,110 @@ def parse_xctrace_time_profile_xml(text: str, top_n: int = 30) -> List[Dict]:
     return entries
 
 
+def parse_perf_report_stdio(report_text: str, top_n: int = 30) -> List[Dict]:
+    """Parse ``perf report --stdio`` output into hotspot entries.
+
+    Expected input lines (from ``perf report --stdio --no-children -n``):
+
+        15.23%  bwa  bwa  [.] bwt_occ
+         8.41%  bwa  bwa  [.] bwt_extend
+
+    Returns a list of dicts sorted by overhead descending::
+
+        {name, file, line, exclusive_us, inclusive_us, calls}
+
+    ``exclusive_us`` is set to the overhead percentage (×1000) so it is
+    compatible with the existing TAU hotspot schema used downstream.
+    """
+    entries: List[Dict] = []
+    for raw_line in report_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Match: "  15.23%  [count]  cmd  dso  [.] symbol"
+        # The number of whitespace-separated fields before [.] can vary.
+        m = re.match(
+            r"(\d+\.?\d*)\%\s+.+?\[.\]\s+(.+)", line
+        )
+        if not m:
+            continue
+        pct = float(m.group(1))
+        raw_sym = m.group(2).strip()
+        # Strip inline assembly markers like "+0x1a2"
+        name = re.sub(r"\s*\+0x[0-9a-fA-F]+.*$", "", raw_sym).strip()
+        if not name:
+            continue
+        entries.append(
+            {
+                "name": name,
+                "file": "",
+                "line": 0,
+                "exclusive_us": pct * 1000.0,
+                "inclusive_us": pct * 1000.0,
+                "calls": 1,
+                "source": "perf",
+            }
+        )
+    entries.sort(key=lambda e: float(e["exclusive_us"]), reverse=True)
+    if top_n and len(entries) > top_n:
+        entries = entries[:top_n]
+    return entries
+
+
 def extract_error_lines(log_text: str, error_regex: str) -> List[str]:
     pattern = re.compile(error_regex)
     return [line for line in log_text.splitlines() if pattern.search(line)]
+
+
+def parse_perf_stat(stat_text: str) -> Dict[str, float]:
+    """Parse ``perf stat --output`` text into a metrics dict.
+
+    Extracts hardware counters written by:
+        perf stat -e instructions,cycles,cache-misses,... --output FILE -- CMD
+
+    Returns keys compatible with ``system_metrics`` expected by profile_features:
+        instructions_retired, cycles_elapsed,
+        cache_misses, cache_references,
+        branch_misses, branches,
+        time_real_sec, time_user_sec, time_sys_sec
+    """
+    _EVENT_MAP = {
+        "instructions": "instructions_retired",
+        "cycles": "cycles_elapsed",
+        "cache-misses": "cache_misses",
+        "cache-references": "cache_references",
+        "branch-misses": "branch_misses",
+        "branches": "branches",
+    }
+    metrics: Dict[str, float] = {}
+    for line in stat_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Counter lines: "  1,234,567,890   event-name   # optional annotation"
+        m = re.match(r"^([\d,]+)\s+(\S+)", line)
+        if m:
+            raw_count = m.group(1).replace(",", "")
+            event = m.group(2).rstrip(":").lower()
+            dest = _EVENT_MAP.get(event)
+            if dest:
+                try:
+                    metrics[dest] = float(raw_count)
+                except ValueError:
+                    pass
+            continue
+        # Time lines: "  123.456789  seconds time elapsed / user / sys"
+        t = re.match(r"^([0-9]+\.[0-9]+)\s+seconds\s+(.+)$", line)
+        if t:
+            try:
+                val = float(t.group(1))
+            except ValueError:
+                continue
+            label = t.group(2).strip().lower()
+            if "time elapsed" in label:
+                metrics["time_real_sec"] = val
+            elif label.startswith("user"):
+                metrics["time_user_sec"] = val
+            elif label.startswith("sys"):
+                metrics["time_sys_sec"] = val
+    return metrics
